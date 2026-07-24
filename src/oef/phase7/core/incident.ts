@@ -189,10 +189,8 @@ export function parseIncident(input: unknown): Incident {
 }
 
 export function appendIncidentRevision(currentInput: Incident, patch: IncidentRevisionPatch, options: AppendIncidentRevisionOptions): Incident {
-  assertPlainPatch(patch, "INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD");
-  const allowed = new Set(["title", "status", "stage", "reproduction", "containment", "severity", "priority", "confidence", "owner"]);
-  if (Reflect.ownKeys(patch).some(key => typeof key !== "string" || !allowed.has(key))) throw new Error("INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD");
-  return appendIncidentRevisionInternal(currentInput, patch, options, false);
+  const snapshot = snapshotIncidentRevisionPatch(patch);
+  return appendIncidentRevisionInternal(currentInput, snapshot, options, false);
 }
 
 function appendIncidentRevisionInternal(currentInput: Incident, patch: InternalIncidentRevisionPatch, options: AppendIncidentRevisionOptions, rootCauseGatePassed: boolean): Incident {
@@ -445,10 +443,16 @@ function assertIncidentSecretSafe(value: unknown): void {
   }
 }
 
-function assertPlainPatch(value: unknown, code: string): asserts value is Record<string, unknown> {
+function snapshotIncidentRevisionPatch(value: unknown): Readonly<IncidentRevisionPatch> {
+  const code = "INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD";
   if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) throw new Error(code);
+  const allowed = new Set(["title", "status", "stage", "reproduction", "containment", "severity", "priority", "confidence", "owner"]);
+  const snapshot: Record<string, unknown> = {};
   for (const key of Reflect.ownKeys(value)) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (typeof key !== "string" || !descriptor?.enumerable || !("value" in descriptor)) throw new Error(code);
+    if (typeof key !== "string" || !allowed.has(key)) throw new Error(code);
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) throw new Error(code);
+    Object.defineProperty(snapshot, key, { value: descriptor.value, enumerable: true, writable: false, configurable: false });
   }
+  return Object.freeze(snapshot) as IncidentRevisionPatch;
 }

@@ -362,6 +362,38 @@ describe("Phase 7 incident revisions and authority", () => {
     expect(() => appendIncidentRevision(current, hiddenPatch, options)).toThrow("INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD");
   });
 
+  test("never rereads a malicious Proxy that forges root cause after validation", () => {
+    const active = addIncidentHypothesis(incident(), { hypothesis_id: "hypothesis:proxy-root", statement: "Proxy root cause", causal_mechanism: "Proxy root mechanism changes startup", falsifiable_prediction: "Removing it starts runtime", disproof_conditions: ["Runtime still fails"], proposed_by: { type: "agent", id: "agent:proxy-root" } }, { expected_revision: 1, actor: human, at: "2026-07-24T10:10:00.000Z" });
+    const supported = resolveIncidentHypothesis(active, "hypothesis:proxy-root", "SUPPORTED", { expected_revision: 2, actor: verifier, at: "2026-07-24T10:11:00.000Z", evidence_refs: ["artifact:repo:makima:support"] });
+    const complete = ROOT_CAUSE_CONFIRMATION_CONDITIONS.map(condition => ({ condition, evidence_refs: [`artifact:repo:makima:${condition}`] }));
+    const confirmed = confirmIncidentRootCause(supported, { hypothesis_id: "hypothesis:proxy-root", statement: "Proxy root cause", mechanism: "Proxy root mechanism changes startup", conditions: complete, authority: { kind: "INDEPENDENT_REVIEW", actor: verifier } }, { expected_revision: 3, at: "2026-07-24T10:20:00.000Z" });
+    const forgedRootCause = { ...confirmed.root_cause, statement: "Forged root cause", mechanism: "Forged mechanism" };
+    const maliciousPatch = new Proxy({} as IncidentRevisionPatch, {
+      ownKeys: () => [],
+      getPrototypeOf: () => Object.prototype,
+      get: (_target, key) => key === "root_cause" ? forgedRootCause : undefined,
+    });
+    const revised = appendIncidentRevision(confirmed, maliciousPatch, { expected_revision: 4, reason: "proxy bypass", actor: human, at: "2026-07-24T10:21:00.000Z" });
+    expect(revised.root_cause).toEqual(confirmed.root_cause);
+    expect(confirmed.root_cause.statement).toBe("Proxy root cause");
+  });
+
+  test("never rereads a malicious Proxy that forges incident collections after validation", () => {
+    const current = addIncidentHypothesis(incident(), { hypothesis_id: "hypothesis:proxy-collections", statement: "Proxy collection cause", causal_mechanism: "Proxy collection mechanism changes startup", falsifiable_prediction: "Removing it starts runtime", disproof_conditions: ["Runtime still fails"], proposed_by: { type: "agent", id: "agent:proxy-collections" } }, { expected_revision: 1, actor: human, at: "2026-07-24T10:10:00.000Z" });
+    const maliciousPatch = new Proxy({} as IncidentRevisionPatch, {
+      ownKeys: () => [],
+      getPrototypeOf: () => Object.prototype,
+      get: (_target, key) => {
+        if (key === "hypotheses") return [];
+        if (key === "observation_ids") return ["observation-revision:forged"];
+        return undefined;
+      },
+    });
+    const revised = appendIncidentRevision(current, maliciousPatch, { expected_revision: 2, reason: "proxy collection bypass", actor: human, at: "2026-07-24T10:11:00.000Z" });
+    expect(revised.hypotheses).toEqual(current.hypotheses);
+    expect(revised.observation_ids).toEqual(current.observation_ids);
+  });
+
   test("allows explicitly accepted probable external causes without claiming confirmation", () => {
     const external = appendIncidentRevision(incident(), { reproduction: { state: "NON_REPRODUCIBLE", evidence_refs: ["artifact:attempts"] } }, { expected_revision: 1, reason: "external incident cannot be replayed", actor: human, at: "2026-07-24T10:10:00.000Z" });
     expect(() => markIncidentRootCauseProbable(external, { statement: "External provider outage", mechanism: "The provider dropped startup requests", external_dependency: true, evidence_refs: ["artifact:repo:foreign:provider-status"], acceptance: { accepted_by: human, rationale: "Provider telemetry and timing align" } }, { expected_revision: 2, at: "2026-07-24T10:20:00.000Z" })).toThrow("ROOT_CAUSE_EVIDENCE_SCOPE_MISMATCH");
