@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^runtime-event:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "sequence": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "execution_id": {
+      "type": "string",
+      "pattern": "^execution:"
+    },
+    "attempt_id": {
+      "type": "string",
+      "pattern": "^attempt:"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "execution.started",
+        "runtime.session.created",
+        "assistant.message.delta",
+        "tool.started",
+        "tool.completed",
+        "command.started",
+        "command.completed",
+        "file.observed",
+        "usage.reported",
+        "checkpoint.created",
+        "runtime.warning",
+        "runtime.observation",
+        "execution.completed",
+        "execution.failed"
+      ]
+    },
+    "correlation": {
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "call_id"
+      ],
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {}
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapter": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "runtime",
+        "adapter"
+      ],
+      "additionalProperties": false
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "AUTHORITATIVE",
+        "PARSED",
+        "INFERRED",
+        "UNKNOWN"
+      ]
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "event_id",
+    "sequence",
+    "execution_id",
+    "attempt_id",
+    "type",
+    "correlation",
+    "payload",
+    "source",
+    "confidence",
+    "occurred_at"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/normalized-runtime-event-v1.schema.json"
+}

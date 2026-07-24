@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "binding_set_id": {
+      "type": "string",
+      "pattern": "^binding-set:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "routing_plan_id": {
+      "type": "string",
+      "pattern": "^routing-plan:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "routing_plan_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "revision": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "previous_revision_hash": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ACTIVE",
+        "SUPERSEDED"
+      ]
+    },
+    "routing_constraints": {
+      "type": "object",
+      "properties": {
+        "task_risk": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "task_privacy": {
+          "type": "string",
+          "enum": [
+            "public",
+            "internal",
+            "confidential",
+            "restricted"
+          ]
+        },
+        "task_modalities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_context_tokens": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "budget_multiplier": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 3
+        }
+      },
+      "required": [
+        "task_risk",
+        "task_privacy",
+        "task_modalities",
+        "required_capabilities",
+        "required_context_tokens",
+        "budget_multiplier"
+      ],
+      "additionalProperties": false
+    },
+    "bindings": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "binding_id": {
+            "type": "string",
+            "pattern": "^binding:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "role_node_id": {
+            "type": "string",
+            "pattern": "^role-node:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "role_id": {
+            "type": "string"
+          },
+          "candidate_id": {
+            "type": "string",
+            "pattern": "^candidate:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "agent_profile_id": {
+            "type": "string",
+            "pattern": "^agent-profile:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "agent_profile_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "agent_profile_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "execution_config_id": {
+            "type": "string",
+            "pattern": "^execution-config:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "execution_config_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "provider_id": {
+            "type": "string",
+            "pattern": "^provider:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "model_version_id": {
+            "type": "string",
+            "pattern": "^model-version:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "runtime_id": {
+            "type": "string",
+            "pattern": "^runtime:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "runtime_adapter_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "deployment_id": {
+            "type": "string",
+            "pattern": "^deployment:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "account_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "attempt": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+          }
+        },
+        "required": [
+          "binding_id",
+          "role_node_id",
+          "role_id",
+          "candidate_id",
+          "agent_profile_id",
+          "agent_profile_version",
+          "agent_profile_hash",
+          "execution_config_id",
+          "execution_config_hash",
+          "provider_id",
+          "model_version_id",
+          "runtime_id",
+          "runtime_adapter_version",
+          "deployment_id",
+          "account_id",
+          "attempt",
+          "created_at"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "rebind_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role_node_id": {
+            "type": "string",
+            "pattern": "^role-node:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "from_candidate_id": {
+            "type": "string",
+            "pattern": "^candidate:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "to_candidate_id": {
+            "type": "string",
+            "pattern": "^candidate:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "from_account_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "to_account_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "RUNTIME_UNHEALTHY",
+              "PROVIDER_UNAVAILABLE",
+              "RATE_LIMIT",
+              "ACCOUNT_UNAVAILABLE",
+              "CONTEXT_INSUFFICIENT",
+              "TOOL_MISSING",
+              "MODEL_BEHAVIOR_FAILURE",
+              "POLICY_CHANGE",
+              "HUMAN_OVERRIDE",
+              "QUALIFICATION_INVALIDATED"
+            ]
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+          }
+        },
+        "required": [
+          "role_node_id",
+          "from_candidate_id",
+          "to_candidate_id",
+          "from_account_id",
+          "to_account_id",
+          "reason",
+          "occurred_at"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "binding_set_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "binding_set_id",
+    "routing_plan_id",
+    "routing_plan_hash",
+    "revision",
+    "previous_revision_hash",
+    "status",
+    "routing_constraints",
+    "bindings",
+    "rebind_history",
+    "binding_set_hash"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase5/execution-binding-set-v1.schema.json"
+}

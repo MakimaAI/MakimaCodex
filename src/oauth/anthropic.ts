@@ -2,6 +2,7 @@
 import { OAuthCallbackFlow } from "./callback-server";
 import { generatePKCE } from "./pkce";
 import type { LocalTokenImportMode, OAuthController, OAuthCredentials } from "./types";
+import { oauthRequestSignal } from "./request-signal";
 
 const CLIENT_ID = atob("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl");
 const AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
@@ -34,12 +35,12 @@ interface AnthropicTokenResponse {
   account?: { uuid?: string; email_address?: string };
 }
 
-async function postJson(url: string, body: Record<string, string | number>): Promise<string> {
+async function postJson(url: string, body: Record<string, string | number>, signal?: AbortSignal): Promise<string> {
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000),
+    signal: oauthRequestSignal(signal),
   });
   const responseBody = await response.text();
   if (!response.ok) {
@@ -111,7 +112,7 @@ export class AnthropicOAuthFlow extends OAuthCallbackFlow {
       state: exchangeState,
       redirect_uri: redirectUri,
       code_verifier: this.#verifier,
-    });
+    }, this.ctrl.signal);
     return credsFrom(parseTokenResponse(responseBody));
   }
 }
@@ -128,7 +129,7 @@ export async function loginAnthropic(
       ctrl.onProgress?.("Found Claude Code token, importing automatically");
       if (local.expires >= Date.now() + 60_000) return local;
       try {
-        return { ...(await refreshAnthropicToken(local.refresh)), source: "local-cli" };
+        return { ...(await refreshAnthropicToken(local.refresh, ctrl.signal)), source: "local-cli" };
       } catch (error) {
         if (importLocal === "only") {
           throw new Error(`Claude Code token expired and could not be refreshed: ${error instanceof Error ? error.message : String(error)}`);
@@ -145,11 +146,11 @@ export async function loginAnthropic(
   return new AnthropicOAuthFlow(ctrl).login();
 }
 
-export async function refreshAnthropicToken(refreshToken: string): Promise<OAuthCredentials> {
+export async function refreshAnthropicToken(refreshToken: string, signal?: AbortSignal): Promise<OAuthCredentials> {
   const responseBody = await postJson(TOKEN_URL, {
     grant_type: "refresh_token",
     client_id: CLIENT_ID,
     refresh_token: refreshToken,
-  });
+  }, signal);
   return credsFrom(parseTokenResponse(responseBody), refreshToken);
 }

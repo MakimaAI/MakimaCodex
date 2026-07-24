@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "opencodex-subagent-bridge": {
+      "command": "ocx",
+      "args": ["__subagent-bridge-mcp"]
+    }
+  }
+}

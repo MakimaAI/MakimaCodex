@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { parseRequest } from "../src/responses/parser";
+import { createOpenAIChatAdapter } from "../src/adapters/openai-chat";
+import { decodeReasoningEnvelope } from "../src/responses/reasoning-envelope";
 import { planWebSearch, shouldResolveOpenAiWebSearchSidecar, webSearchStallTimeoutSec } from "../src/web-search";
 import { runWithWebSearch } from "../src/web-search/loop";
 import { headersForCodexAuthContext } from "../src/codex/auth-context";
@@ -202,6 +204,69 @@ function scriptedAdapter(firstPass: AdapterEvent[]): ProviderAdapter {
   };
 }
 
+async function runRawReasoningSearchLoop(visible: boolean): Promise<{
+  frames: Awaited<ReturnType<typeof collectSse>>;
+  requestBodies: Array<{ messages: Record<string, unknown>[] }>;
+}> {
+  globalThis.fetch = ((input) => {
+    const url = String(input);
+    if (url.startsWith("https://routed.test/")) return Promise.resolve(new Response("{}", { status: 200 }));
+    return Promise.resolve(new Response(
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"docs say X"}\n\n'
+        + 'event: response.completed\ndata: {"type":"response.completed"}\n\n',
+      { headers: { "Content-Type": "text/event-stream" } },
+    ));
+  }) as typeof fetch;
+
+  const base = createOpenAIChatAdapter({
+    adapter: "openai-chat",
+    baseUrl: "https://routed.test/v1",
+    apiKey: "test-key",
+    preserveReasoningContentModels: ["routed/model"],
+  });
+  const requestBodies: Array<{ messages: Record<string, unknown>[] }> = [];
+  let pass = 0;
+  const adapter: ProviderAdapter = {
+    ...base,
+    async buildRequest(parsed, options) {
+      const request = await base.buildRequest(parsed, options);
+      requestBodies.push(JSON.parse(request.body) as { messages: Record<string, unknown>[] });
+      return request;
+    },
+    async *parseStream() {
+      if (pass++ === 0) {
+        yield { type: "reasoning_raw_delta", text: "search plan" };
+        yield { type: "tool_call_start", id: "call_search", name: "web_search" };
+        yield { type: "tool_call_delta", arguments: JSON.stringify({ query: "current docs" }) };
+        yield { type: "tool_call_end" };
+        yield { type: "done" };
+        return;
+      }
+      yield { type: "text_delta", text: "final answer" };
+      yield { type: "done" };
+    },
+  };
+
+  const response = await runWithWebSearch({
+    parsed: parseRequest({
+      model: "routed/model",
+      input: "Search for current docs",
+      stream: true,
+      reasoning: { summary: visible ? "auto" : "none" },
+      tools: [{ type: "web_search" }],
+    }),
+    adapter,
+    forwardProvider,
+    hostedTool: { type: "web_search" },
+    selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+    settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+    maxSearches: 1,
+    promoteRawReasoningToSummary: visible,
+    hideRawReasoningSummary: !visible,
+  });
+  return { frames: await collectSse(response.body!), requestBodies };
+}
+
 describe("BUG-R86 routed web-search timeout semantics", () => {
   test("routed iterations use upstream streaming and never call parseResponse", async () => {
     const seenStream: boolean[] = [];
@@ -352,6 +417,50 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
 });
 
 describe("web-search sidecar native web_search_call emission", () => {
+  test("sensitive eager HTTP and adapter failures expose only generic status metadata", async () => {
+    const plaintext = "RECOVERED_WEB_SEARCH_NONCE_7f44";
+    const ciphertext = "gAAAAABlSensitiveCiphertextThatMustNotEscape_123456789012345678901234567890";
+    const base = {
+      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
+      forwardProvider,
+      hostedTool: { type: "web_search" },
+      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      maxSearches: 1,
+      sensitiveHandoff: true,
+    } as const;
+
+    const echoing: ProviderAdapter = {
+      name: "sensitive-echoing-error",
+      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
+      fetchResponse: async () => new Response(JSON.stringify({ error: `${plaintext} ${ciphertext}` }), { status: 400 }),
+      formatErrorBody: (_status, _headers, body) => body,
+      async *parseStream() { /* unreachable */ },
+      async parseResponse() { return [{ type: "done" }] as AdapterEvent[]; },
+    };
+    const echoed = await runWithWebSearch({ ...base, adapter: echoing });
+    const echoedText = await echoed.text();
+    expect(echoed.status).toBe(400);
+    expect(echoedText).toContain("Provider error 400");
+    expect(echoedText).toContain("upstream_error");
+    expect(echoedText).not.toContain(plaintext);
+    expect(echoedText).not.toContain(ciphertext);
+
+    const throwing: ProviderAdapter = {
+      name: "sensitive-thrown-error",
+      buildRequest: () => { throw new Error(`adapter echoed ${plaintext} ${ciphertext}`); },
+      async *parseStream() { /* unreachable */ },
+      async parseResponse() { return [{ type: "done" }] as AdapterEvent[]; },
+    };
+    const thrown = await runWithWebSearch({ ...base, adapter: throwing });
+    const thrownText = await thrown.text();
+    expect(thrown.status).toBe(502);
+    expect(thrownText).toContain("Provider error 502");
+    expect(thrownText).toContain("upstream_error");
+    expect(thrownText).not.toContain(plaintext);
+    expect(thrownText).not.toContain(ciphertext);
+  });
+
   test("loop 429 triggers on429 rotation and succeeds with the rebuilt adapter", async () => {
     globalThis.fetch = (() => Promise.resolve(new Response(
       'event: response.completed\ndata: {"type":"response.completed"}\n\n',
@@ -398,6 +507,48 @@ describe("web-search sidecar native web_search_call emission", () => {
     const output = completed.output as { type: string; content?: { text?: string }[] }[];
     expect(output.find(o => o.type === "message")?.content?.[0]?.text).toBe("answer from rotated key");
     expect(rotations).toBe(1);
+  });
+
+  test("loop supports async 402 quota recovery and commits only after the rotated stream succeeds", async () => {
+    const firstAdapter: ProviderAdapter = {
+      name: "mock-402",
+      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
+      fetchResponse: async () => new Response("subscription exhausted", { status: 402 }),
+      async *parseStream() { /* unused */ },
+      async parseResponse() { return [{ type: "done" }] as AdapterEvent[]; },
+    };
+    const rotatedAdapter: ProviderAdapter = {
+      name: "mock-402-rotated",
+      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
+      fetchResponse: async () => new Response("{}", { status: 200 }),
+      async *parseStream() {
+        yield { type: "text_delta", text: "subscription recovered" };
+        yield { type: "done" };
+      },
+      async parseResponse() { throw new Error("parseResponse must be unreachable"); },
+    };
+    let selected = 0;
+    let committed = 0;
+    const response = await runWithWebSearch({
+      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
+      adapter: firstAdapter,
+      forwardProvider,
+      hostedTool: { type: "web_search" },
+      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      maxSearches: 1,
+      onQuota: async (status, retryAfter) => {
+        selected++;
+        expect(status).toBe(402);
+        expect(retryAfter).toBeNull();
+        return rotatedAdapter;
+      },
+      onQuotaRecovered: async () => { committed++; },
+    });
+    expect(selected).toBe(1);
+    expect(committed).toBe(0);
+    await collectSse(response.body!);
+    expect(committed).toBe(1);
   });
 
   test("loop 429 with exhausted pool (on429 null) surfaces the provider error", async () => {
@@ -581,6 +732,38 @@ describe("web-search sidecar native web_search_call emission", () => {
     expect(content[0].thinking).toBe("I should search");
     expect(content[0].signature).toBe("RealSig1234567890==");
     expect(content[1].type).toBe("toolCall");
+  });
+
+  test("a real web-search iteration promotes raw reasoning and replays it to the second request", async () => {
+    const { frames, requestBodies } = await runRawReasoningSearchLoop(true);
+
+    expect(frames.some(frame => frame.event === "response.reasoning_summary_text.delta"
+      && frame.data.delta === "search plan")).toBe(true);
+    expect(frames.some(frame => frame.event === "response.reasoning_text.delta")).toBe(false);
+    const completed = frames.find(frame => frame.event === "response.completed")?.data.response as Record<string, unknown>;
+    expect((completed.output as Record<string, unknown>[]).map(item => item.type))
+      .toEqual(["reasoning", "web_search_call", "message"]);
+
+    const secondRequest = requestBodies.at(-1)!;
+    const assistant = secondRequest.messages.find(message => message.role === "assistant"
+      && message.reasoning_content !== undefined);
+    expect(assistant).toMatchObject({
+      reasoning_content: "search plan",
+      tool_calls: [{ id: "call_search", function: { name: "web_search" } }],
+    });
+  });
+
+  test("summary:none hides real web-search reasoning while preserving second-request replay", async () => {
+    const { frames, requestBodies } = await runRawReasoningSearchLoop(false);
+
+    expect(frames.some(frame => frame.event === "response.reasoning_summary_text.delta")).toBe(false);
+    expect(frames.some(frame => frame.event === "response.reasoning_text.delta")).toBe(false);
+    const completed = frames.find(frame => frame.event === "response.completed")?.data.response as Record<string, unknown>;
+    const reasoning = (completed.output as Record<string, unknown>[]).find(item => item.type === "reasoning")!;
+    expect(decodeReasoningEnvelope(reasoning.encrypted_content as string)?.txt).toBe("search plan");
+    const assistant = requestBodies.at(-1)!.messages.find(message => message.role === "assistant"
+      && message.reasoning_content !== undefined);
+    expect(assistant?.reasoning_content).toBe("search plan");
   });
 
   test("an executed search emits a web_search_call item ahead of the assistant message", async () => {
@@ -999,6 +1182,29 @@ describe("web-search sources -> url_citation annotations", () => {
     const message = output.find(item => item.type === "message") as Record<string, unknown>;
     const part = (message.content as Record<string, unknown>[])[0];
     expect(part.annotations).toEqual([]);
+  });
+
+  test("web-search loop forwards raw reasoning promotion to its Responses bridge", async () => {
+    globalThis.fetch = (() => Promise.resolve(new Response("{}", { status: 200 }))) as typeof fetch;
+    const response = await runWithWebSearch({
+      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
+      adapter: scriptedAdapter([
+        { type: "reasoning_raw_delta", text: "loop plan" },
+        { type: "text_delta", text: "no search needed" },
+        { type: "done" },
+      ]),
+      forwardProvider,
+      hostedTool: { type: "web_search" },
+      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      maxSearches: 1,
+      promoteRawReasoningToSummary: true,
+    });
+
+    const frames = await collectSse(response.body!);
+    expect(frames.some(frame => frame.event === "response.reasoning_summary_text.delta"
+      && frame.data.delta === "loop plan")).toBe(true);
+    expect(frames.some(frame => frame.event === "response.reasoning_text.delta")).toBe(false);
   });
 });
 

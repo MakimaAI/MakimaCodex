@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencodex.local/schemas/oef/task-v1.schema.json",
+  "title": "OEF Task v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "title", "status", "stage", "active_contract_revision_id", "workflow_ref", "policy_pack_ref", "risk", "created_by", "created_at", "updated_at", "aggregate_version"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "task_id": { "type": "string", "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "status": { "enum": ["DRAFT", "OPEN", "BLOCKED", "COMPLETED", "CANCELLED"] },
+    "stage": { "type": "string", "minLength": 1 },
+    "active_contract_revision_id": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+    "workflow_ref": { "$ref": "#/$defs/versioned_definition_ref" },
+    "policy_pack_ref": { "$ref": "#/$defs/versioned_definition_ref" },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "reasons"],
+      "properties": {
+        "level": { "enum": ["low", "medium", "high", "critical"] },
+        "reasons": { "type": "array", "maxItems": 64, "items": { "type": "string", "minLength": 1, "maxLength": 160 } }
+      }
+    },
+    "created_by": { "$ref": "actor-v1.schema.json" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "aggregate_version": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "versioned_definition_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "hash"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

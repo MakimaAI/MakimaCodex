@@ -67,6 +67,8 @@ export default function ProviderAuthPanel({
     <section className="pwi-section pwi-auth-section" aria-label={isOauth ? t("pws.availableAccounts") : t("pws.apiKeys")}>
       <h3 className="pwi-section-title">{isOauth ? t("pws.availableAccounts") : t("pws.apiKeys")}</h3>
       <div className="pwi-auth-body">
+        {item.name === "cline" && <div className="muted text-label">{t("pws.clineAccountHint")}</div>}
+        {item.name === "cline-pass" && <div className="muted text-label">{t("pws.clinePassHint")}</div>}
         {isOauth && (
           <>
             <div className="pwi-auth-status-row">

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencodex.local/schemas/oef/workflow-definition-v1.schema.json",
+  "title": "OEF Workflow Definition v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "workflow_id", "version", "stages", "transitions"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "workflow_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,98}$" },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "stages": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": { "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,79}$" }, "terminal": { "type": "boolean" } }
+      }
+    },
+    "transitions": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from", "to"],
+        "properties": {
+          "from": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,79}$" },
+          "to": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,79}$" },
+          "guards": { "type": "array", "maxItems": 64, "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z][a-z0-9-]*)+$" } }
+        }
+      }
+    }
+  }
+}

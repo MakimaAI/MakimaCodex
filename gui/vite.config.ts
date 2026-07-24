@@ -1,11 +1,32 @@
 import { readFileSync } from 'node:fs'
-import { defineConfig } from 'vite'
+import { defineConfig, type ProxyOptions } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // Bake the parent package version into the bundle as a fallback for moments when the runtime
 // `/healthz` version is not reachable yet.
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const proxyTarget = process.env.OPENCODEX_PROXY_TARGET
+
+function sameOriginDevProxy(target: string): ProxyOptions {
+  const targetOrigin = new URL(target).origin
+  return {
+    target,
+    changeOrigin: true,
+    configure(proxy) {
+      proxy.on('proxyReq', (proxyReq, request) => {
+        const origin = request.headers.origin
+        const host = request.headers.host
+        if (!origin || !host) return
+        try {
+          // Only trust a browser request that was same-origin from Vite's perspective. A foreign
+          // page must keep its original Origin so the backend management guard can reject it.
+          if (new URL(origin).host !== host) return
+          proxyReq.setHeader("Origin", targetOrigin)
+        } catch { /* malformed origins stay unchanged and fail closed at the backend */ }
+      })
+    },
+  }
+}
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -18,8 +39,8 @@ export default defineConfig({
   */
   server: proxyTarget ? {
     proxy: {
-      '/api': { target: proxyTarget, changeOrigin: true },
-      '/healthz': { target: proxyTarget, changeOrigin: true },
+      '/api': sameOriginDevProxy(proxyTarget),
+      '/healthz': sameOriginDevProxy(proxyTarget),
     },
   } : undefined,
 })

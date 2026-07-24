@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "policy_pack_id": "safe-default",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "id": "approved-contract-before-planning",
+      "when": { "operation": "transition", "transition_to": "planning" },
+      "require": { "contract_status": "APPROVED" }
+    },
+    {
+      "id": "high-risk-human-review",
+      "when": {
+        "operation": "transition",
+        "transition_to": "planning",
+        "risk_levels": ["high", "critical"]
+      },
+      "require": { "human_approvals": 1 }
+    },
+    {
+      "id": "all-contract-evidence-before-accept",
+      "when": { "operation": "verdict", "verdict": "ACCEPT" },
+      "require": { "all_contract_evidence": true }
+    },
+    {
+      "id": "credential-security-review",
+      "when": {
+        "operation": "verdict",
+        "verdict": "ACCEPT",
+        "risk_reasons": ["credentials"]
+      },
+      "require": {
+        "evidence_types": ["opencodex.security-scan", "opencodex.security-review"]
+      }
+    }
+  ]
+}

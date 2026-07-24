@@ -34,6 +34,18 @@ describe("redactSecretString", () => {
   test("preserves non-secret diagnostic text", () => {
     expect(redactSecretString("status=429 model=gpt-5.5")).toBe("status=429 model=gpt-5.5");
   });
+
+  test("masks Cline WorkOS bearer and standalone access tokens", () => {
+    const secret = "workos:cline-access-token-value-123456";
+    const redacted = redactSecretString([
+      `Authorization: Bearer ${secret}`,
+      `upstream echoed ${secret}`,
+    ].join("\n"));
+
+    expect(redacted).not.toContain(secret);
+    expect(redacted).toContain(`Bearer ${REDACTED_SECRET}`);
+    expect(redacted).toContain(`upstream echoed ${REDACTED_SECRET}`);
+  });
 });
 
 describe("redactSecrets", () => {

@@ -4,12 +4,29 @@
  * the Proactive delegation prompt when they arrive with the synthetic top tier.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { injectDeveloperMessage, multiAgentGuidanceText, sanitizeEncryptedContentInPlace } from "../src/server/responses";
+import { handleResponses, injectDeveloperMessage, multiAgentGuidanceText, sanitizeEncryptedContentInPlace } from "../src/server/responses";
+import { recoverSelectedRoutedSubagentRequest } from "../src/subagent-bridge/recovery";
+import { HANDOFF_MAX_MESSAGE_BYTES, SubagentHandoffStore, subagentHandoffStore } from "../src/subagent-bridge/handoff-store";
+import { handleSubagentHandoffRequest } from "../src/subagent-bridge/http";
+import {
+  createSubagentBridgeRequestSignature,
+  sealSubagentBridgeRequestBody,
+  SUBAGENT_BRIDGE_ISSUED_AT_HEADER,
+  SUBAGENT_BRIDGE_INSTANCE_HEADER,
+  SUBAGENT_BRIDGE_REQUEST_ID_HEADER,
+  SUBAGENT_BRIDGE_SIGNATURE_HEADER,
+  SUBAGENT_BRIDGE_STAGING_PATH,
+  SubagentBridgeReplayGuard,
+} from "../src/subagent-bridge/auth";
+import { SUBAGENT_BRIDGE_HEALTH_PROTOCOL } from "../src/subagent-bridge/runtime";
 import { parseRequest } from "../src/responses/parser";
 import type { OcxParsedRequest } from "../src/types";
+import { clearResponseStateForTests, flushResponseState, rememberResponseState } from "../src/responses/state";
+import { responseWithDeferredRequestLog } from "../src/server/relay";
+import { clearRequestLogsForTests, getRequestLogEntries, type RequestLogContext } from "../src/server/request-log";
 
 const savedCodexHome = process.env.CODEX_HOME;
 
@@ -27,11 +44,12 @@ function codexHomeFixture(configToml: string): string {
 }
 
 /** Write an injected-catalog fixture into the active CODEX_HOME. */
-function catalogFixture(dir: string, models: Array<{ slug: string; efforts: string[] }>): void {
+function catalogFixture(dir: string, models: Array<{ slug: string; efforts: string[]; multiAgentVersion?: string }>): void {
   writeFileSync(join(dir, "opencodex-catalog.json"), JSON.stringify({
     models: models.map(m => ({
       slug: m.slug,
       display_name: m.slug,
+      multi_agent_version: m.multiAgentVersion ?? "v2",
       supported_reasoning_levels: m.efforts.map(effort => ({ effort, description: effort })),
     })),
   }));
@@ -39,6 +57,35 @@ function catalogFixture(dir: string, models: Array<{ slug: string; efforts: stri
 
 const V2_ON = "[features.multi_agent_v2]\nenabled = true\n";
 const V2_OFF = "[features]\nmulti_agent = true\n";
+const REAL_FERNET = "gAAAAABnX6DqvQfLy4CIvIQp9x1G7m2JXjvXgWIBu8VG6OKoyHDyEwE6Q9H9YfdwWlQF-Qj3Hb_RkPBMFa9_k54XfOpfK0S7Ng==";
+
+function agentMessage(recipient: string, messageType: "NEW_TASK" | "MESSAGE" = "MESSAGE") {
+  return { type: "agent_message", recipient, content: [
+    { type: "input_text", text: `Message Type: ${messageType}\nTask name: ${recipient}\nSender: /root\nPayload:\n` },
+    { type: "encrypted_content", encrypted_content: REAL_FERNET },
+  ] };
+}
+
+function routedBridgeConfig(overrides: Record<string, unknown> = {}) {
+  return {
+    port: 10100,
+    defaultProvider: "vendor",
+    providers: { vendor: { adapter: "openai-chat", baseUrl: "https://example.test/v1" } },
+    subagentModels: ["vendor/model"],
+    subagentBridge: { enabled: true },
+    ...overrides,
+  } as never;
+}
+
+function chatSuccess(): Response {
+  return Response.json({
+    id: "chatcmpl-bridge",
+    object: "chat.completion",
+    model: "model",
+    choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+  });
+}
 
 function parsedFixture(over: {
   reasoning?: string;
@@ -200,6 +247,637 @@ describe("multiAgentGuidanceText", () => {
     expect(unset).not.toContain("Available models");
     // an UNRESOLVED roster does not fire guidance on v2 either
     expect(await multiAgentGuidanceText(parsedFixture({ tools: [{ name: "spawn_agent" }] }), undefined, undefined, ["nope/none"])).toBeNull();
+  });
+
+  test("roster excludes catalog rows that Codex cannot accept as V2 subagents", async () => {
+    const dir = codexHomeFixture(V2_ON);
+    catalogFixture(dir, [
+      { slug: "vendor/eligible", efforts: ["low", "high"], multiAgentVersion: "v2" },
+      { slug: "vendor/v1-only", efforts: ["low", "high"], multiAgentVersion: "v1" },
+      { slug: "vendor/no-efforts", efforts: [], multiAgentVersion: "v2" },
+      { slug: "vendor/bad-effort", efforts: ["banana"], multiAgentVersion: "v2" },
+    ]);
+    const text = await multiAgentGuidanceText(
+      parsedFixture({ tools: [{ name: "spawn_agent" }] }),
+      undefined,
+      undefined,
+      ["vendor/eligible", "vendor/v1-only", "vendor/no-efforts", "vendor/bad-effort", "vendor/unknown"],
+    );
+    expect(text).toContain("vendor/eligible");
+    expect(text).not.toContain("vendor/v1-only");
+    expect(text).not.toContain("vendor/no-efforts");
+    expect(text).not.toContain("vendor/bad-effort");
+    expect(text).not.toContain("vendor/unknown");
+  });
+
+  test("recovers a real Fernet V2 child payload only for a selected routed model", () => {
+    const token = "gAAAAABnX6DqvQfLy4CIvIQp9x1G7m2JXjvXgWIBu8VG6OKoyHDyEwE6Q9H9YfdwWlQF-Qj3Hb_RkPBMFa9_k54XfOpfK0S7Ng==";
+    const body = {
+      model: "vendor/model",
+      input: [{
+        type: "agent_message",
+        author: "/root",
+        recipient: "/root/worker_001122334455",
+        content: [
+          { type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/worker_001122334455\nSender: /root\nPayload:\n" },
+          { type: "encrypted_content", encrypted_content: token },
+        ],
+      }],
+    };
+    const store = new SubagentHandoffStore({ randomHex: () => "001122334455" });
+    store.stageSpawn({ taskName: "worker", model: "vendor/model", message: "plain staged task" });
+
+    expect(recoverSelectedRoutedSubagentRequest(body, { enabled: true, selectedModels: ["vendor/model"], store })).toEqual({ status: "recovered", count: 1 });
+    expect(body.input[0].content[0]).toEqual({ type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/worker_001122334455\nSender: /root\nPayload:\n" });
+    expect(body.input[0].content[1]).toEqual({ type: "input_text", text: "plain staged task" });
+    expect(sanitizeEncryptedContentInPlace(body.input)).toBe(0);
+    const parsedContent = parseRequest(body).context.messages[0]?.content;
+    expect(JSON.stringify(parsedContent)).toContain("plain staged task");
+  });
+
+  test("recovers exact-limit base64-like and embedded-Fernet plaintext byte-for-byte as input_text", () => {
+    const payloads = [
+      "A".repeat(HANDOFF_MAX_MESSAGE_BYTES),
+      `literal before ${REAL_FERNET} literal after`,
+    ];
+
+    for (const [index, payload] of payloads.entries()) {
+      const recipient = `/root/exact_${(index + 1).toString(16).padStart(12, "0")}`;
+      const body = { model: "vendor/model", input: [agentMessage(recipient)] };
+      const store = new SubagentHandoffStore();
+      store.stageMessage({ kind: "message", target: recipient, message: payload });
+
+      expect(recoverSelectedRoutedSubagentRequest(body, { enabled: true, selectedModels: ["vendor/model"], store }))
+        .toEqual({ status: "recovered", count: 1 });
+      expect(body.input[0].content[1]).toEqual({ type: "input_text", text: payload });
+      expect((body.input[0].content[1] as { text: string }).text).toBe(payload);
+      expect(sanitizeEncryptedContentInPlace(body.input)).toBe(0);
+      const parsed = parseRequest(body).context.messages[0]?.content;
+      expect(parsed).toEqual([
+        { type: "text", text: body.input[0].content[0].text },
+        { type: "text", text: payload },
+      ]);
+    }
+  });
+
+  test("multiple Fernet payload parts fail closed and do not consume", () => {
+    const recipient = "/root/multiple_000000000001";
+    const body = { model: "vendor/model", input: [agentMessage(recipient)] };
+    body.input[0].content.push({ type: "encrypted_content", encrypted_content: REAL_FERNET });
+    const before = structuredClone(body);
+    const store = new SubagentHandoffStore();
+    store.stageMessage({ kind: "message", target: recipient, message: "must remain staged" });
+
+    expect(recoverSelectedRoutedSubagentRequest(body, { enabled: true, selectedModels: ["vendor/model"], store }))
+      .toEqual({ status: "invalid", reason: "multiple_envelopes" });
+    expect(body).toEqual(before);
+    expect(store.consume(recipient, "MESSAGE")?.message).toBe("must remain staged");
+  });
+
+  test("malformed and future-version routed handoff envelopes fail closed without consuming", () => {
+    const futureBytes = Buffer.from(REAL_FERNET, "base64url");
+    futureBytes[0] = 0x81;
+    const envelopes = [
+      { value: "gAAAA-not-a-complete-fernet-token", reason: "malformed_envelope" },
+      { value: futureBytes.toString("base64url"), reason: "unsupported_envelope_version" },
+    ] as const;
+
+    for (const [index, envelope] of envelopes.entries()) {
+      const recipient = `/root/invalid_${(index + 1).toString(16).padStart(12, "0")}`;
+      const body = { model: "vendor/model", input: [agentMessage(recipient)] };
+      body.input[0].content[1] = { type: "encrypted_content", encrypted_content: envelope.value };
+      const before = structuredClone(body);
+      const store = new SubagentHandoffStore();
+      store.stageMessage({ kind: "message", target: recipient, message: "must remain staged" });
+
+      expect(recoverSelectedRoutedSubagentRequest(body, { enabled: true, selectedModels: ["vendor/model"], store }))
+        .toEqual({ status: "invalid", reason: envelope.reason });
+      expect(body).toEqual(before);
+      expect(store.consume(recipient, "MESSAGE")?.message).toBe("must remain staged");
+    }
+  });
+
+  test("a valid handoff envelope with an invalid request sibling does not consume", async () => {
+    const target = "/root/preflight_000000000001";
+    const plaintext = "MUST_SURVIVE_REQUEST_PREFLIGHT_4a11d8";
+    subagentHandoffStore.clear();
+    subagentHandoffStore.stageMessage({ kind: "message", target, message: plaintext });
+    try {
+      const response = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "vendor/model",
+          stream: "not-a-boolean",
+          input: [agentMessage(target)],
+        }),
+      }), routedBridgeConfig(), {} as never);
+
+      expect(response.status).toBe(400);
+      expect(subagentHandoffStore.consume(target, "MESSAGE")?.message).toBe(plaintext);
+    } finally {
+      subagentHandoffStore.clear();
+    }
+  });
+
+  test("invalid routed handoff envelopes stop before provider dispatch while non-candidates still dispatch", async () => {
+    const futureBytes = Buffer.from(REAL_FERNET, "base64url");
+    futureBytes[0] = 0x81;
+    const invalidContents = [
+      [{ type: "encrypted_content", encrypted_content: "gAAAA-truncated" }],
+      [{ type: "encrypted_content", encrypted_content: futureBytes.toString("base64url") }],
+      [
+        { type: "encrypted_content", encrypted_content: REAL_FERNET },
+        { type: "encrypted_content", encrypted_content: REAL_FERNET },
+      ],
+    ];
+    const originalFetch = globalThis.fetch;
+    let providerCalls = 0;
+    globalThis.fetch = (async () => {
+      providerCalls += 1;
+      return chatSuccess();
+    }) as typeof fetch;
+    const send = (model: string, content: unknown[]) => handleResponses(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        store: false,
+        input: [{
+          type: "agent_message",
+          recipient: "/root/invalid_000000000001",
+          content: [
+            { type: "input_text", text: "Message Type: MESSAGE\nTask name: /root/invalid_000000000001\nSender: /root\nPayload:\n" },
+            ...content,
+          ],
+        }],
+      }),
+    }), routedBridgeConfig(), {} as never);
+
+    try {
+      for (const content of invalidContents) {
+        const response = await send("vendor/model", content);
+        const responseText = await response.text();
+        expect(response.status).toBe(400);
+        expect((JSON.parse(responseText) as { error: { code: string } }).error.code).toBe("subagent_handoff_invalid");
+        expect(responseText).not.toContain("encrypted_content");
+      }
+      expect(providerCalls).toBe(0);
+
+      expect((await send("vendor/other", invalidContents[0]!)).status).toBe(200);
+      expect(providerCalls).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("spawn recovery requires routed-model equivalence and a mismatch does not consume", () => {
+    const store = new SubagentHandoffStore({ randomHex: () => "001122334455" });
+    const { taskName } = store.stageSpawn({
+      taskName: "model bound",
+      model: "vendor/native/path",
+      message: "model-bound task",
+    });
+    const mismatched = { model: "vendor/other", input: [agentMessage(`/root/${taskName}`, "NEW_TASK")] };
+    const equivalent = { model: "vendor/native-path", input: [agentMessage(`/root/${taskName}`, "NEW_TASK")] };
+
+    expect(recoverSelectedRoutedSubagentRequest(mismatched, {
+      enabled: true,
+      selectedModels: ["vendor/other", "vendor/native-path"],
+      store,
+    })).toEqual({ status: "missing" });
+    expect(mismatched.input[0].content[1]).toEqual({ type: "encrypted_content", encrypted_content: REAL_FERNET });
+    expect(recoverSelectedRoutedSubagentRequest(equivalent, {
+      enabled: true,
+      selectedModels: ["vendor/other", "vendor/native-path"],
+      store,
+    })).toEqual({ status: "recovered", count: 1 });
+    expect(equivalent.input[0].content[1]).toEqual({ type: "input_text", text: "model-bound task" });
+  });
+
+  test("fails closed when selected routed child has no staged match and preserves native ciphertext", () => {
+    const token = "gAAAAABnX6DqvQfLy4CIvIQp9x1G7m2JXjvXgWIBu8VG6OKoyHDyEwE6Q9H9YfdwWlQF-Qj3Hb_RkPBMFa9_k54XfOpfK0S7Ng==";
+    const makeBody = (model: string) => ({
+      model,
+      input: [{ type: "agent_message", recipient: "/root/worker", content: [
+        { type: "input_text", text: "Message Type: MESSAGE\nTask name: /root/worker\nSender: /root\nPayload:\n" },
+        { type: "encrypted_content", encrypted_content: token },
+      ] }],
+    });
+    const routed = makeBody("vendor/model");
+    expect(recoverSelectedRoutedSubagentRequest(routed, { enabled: true, selectedModels: ["vendor/model"], store: new SubagentHandoffStore() }))
+      .toEqual({ status: "missing" });
+    expect(routed.input[0].content[1].encrypted_content).toBe(token);
+
+    const native = makeBody("gpt-5.6-sol");
+    expect(recoverSelectedRoutedSubagentRequest(native, { enabled: true, selectedModels: ["gpt-5.6-sol"], store: new SubagentHandoffStore() }))
+      .toEqual({ status: "unchanged" });
+    expect(native.input[0].content[1].encrypted_content).toBe(token);
+  });
+
+  test("request boundary returns content-free 409 subagent_handoff_missing", async () => {
+    subagentHandoffStore.clear();
+    const token = "gAAAAABnX6DqvQfLy4CIvIQp9x1G7m2JXjvXgWIBu8VG6OKoyHDyEwE6Q9H9YfdwWlQF-Qj3Hb_RkPBMFa9_k54XfOpfK0S7Ng==";
+    const response = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "vendor/model",
+        stream: false,
+        input: [{ type: "agent_message", recipient: "/root/worker", content: [
+          { type: "input_text", text: "Message Type: MESSAGE\nTask name: /root/worker\nSender: /root\nPayload:\n" },
+          { type: "encrypted_content", encrypted_content: token },
+        ] }],
+      }),
+    }), {
+      port: 10100,
+      defaultProvider: "vendor",
+      providers: { vendor: { adapter: "openai-chat", baseUrl: "https://example.test/v1" } },
+      subagentModels: ["vendor/model"],
+      subagentBridge: { enabled: true },
+    }, {} as never);
+    expect(response.status).toBe(409);
+    const payload = await response.json() as { error: { code: string; message: string } };
+    expect(payload.error.code).toBe("subagent_handoff_missing");
+    expect(payload.error.message).not.toContain(token);
+  });
+
+  test("spawn routed-model mismatch returns content-free 409 and leaves the handoff for its model", async () => {
+    subagentHandoffStore.clear();
+    const plaintext = "MODEL_BOUND_PLAINTEXT_8f37c6";
+    const spawn = subagentHandoffStore.stageSpawn({ taskName: "bound request", model: "vendor/model", message: plaintext });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => chatSuccess()) as typeof fetch;
+    try {
+      const send = (model: string) => handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model, stream: false, store: false, input: [agentMessage(`/root/${spawn.taskName}`, "NEW_TASK")] }),
+      }), routedBridgeConfig({ subagentModels: ["vendor/model", "vendor/other"] }), {} as never);
+
+      const mismatch = await send("vendor/other");
+      const mismatchText = await mismatch.text();
+      expect(mismatch.status).toBe(409);
+      expect(mismatchText).toContain("subagent_handoff_missing");
+      expect(mismatchText).not.toContain(plaintext);
+      expect(mismatchText).not.toContain(REAL_FERNET);
+
+      const matched = await send("vendor/model");
+      expect(matched.status).toBe(200);
+    } finally {
+      globalThis.fetch = originalFetch;
+      subagentHandoffStore.clear();
+    }
+  });
+
+  test("request-boundary spawn, send_message, and followup_task handoffs recover exact nonce plaintext once in FIFO/type order", async () => {
+    const staged = {
+      spawn: "spawn-nonce-4d24e9c1",
+      message: "message-nonce-09a3f6bd",
+      followup: "followup-nonce-e1872a45",
+    };
+    const token = Buffer.alloc(32, 41).toString("base64url");
+    const instanceId = Buffer.alloc(32, 42).toString("base64url");
+    const now = 4_000_000;
+    const replayGuard = new SubagentBridgeReplayGuard({ now: () => now });
+    let requestSequence = 0;
+    subagentHandoffStore.clear();
+    const post = (body: unknown) => {
+      const plaintext = JSON.stringify(body);
+      const requestId = Buffer.alloc(32, ++requestSequence).toString("base64url");
+      const encoded = sealSubagentBridgeRequestBody({
+        token,
+        protocol: SUBAGENT_BRIDGE_HEALTH_PROTOCOL,
+        method: "POST",
+        path: SUBAGENT_BRIDGE_STAGING_PATH,
+        instanceId,
+        requestId,
+        issuedAtMs: now,
+        body: plaintext,
+        randomBytesFn: () => Buffer.from(requestId, "base64url").subarray(0, 12),
+      });
+      expect(encoded).not.toBeNull();
+      const signature = createSubagentBridgeRequestSignature({
+        token,
+        protocol: SUBAGENT_BRIDGE_HEALTH_PROTOCOL,
+        method: "POST",
+        path: SUBAGENT_BRIDGE_STAGING_PATH,
+        instanceId,
+        requestId,
+        issuedAtMs: now,
+        body: encoded!,
+      });
+      expect(signature).not.toBeNull();
+      return handleSubagentHandoffRequest(new Request(`http://127.0.0.1${SUBAGENT_BRIDGE_STAGING_PATH}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          [SUBAGENT_BRIDGE_INSTANCE_HEADER]: instanceId,
+          [SUBAGENT_BRIDGE_REQUEST_ID_HEADER]: requestId,
+          [SUBAGENT_BRIDGE_ISSUED_AT_HEADER]: String(now),
+          [SUBAGENT_BRIDGE_SIGNATURE_HEADER]: signature!,
+        },
+        body: encoded!,
+      }), {
+        readToken: () => token,
+        runtimeEligible: true,
+        store: subagentHandoffStore,
+        instanceId,
+        replayGuard,
+        now: () => now,
+      });
+    };
+
+    const spawn = await post({ kind: "spawn", task_name: "boundary", model: "vendor/model", message: staged.spawn });
+    const spawnText = await spawn.text();
+    const taskName = (JSON.parse(spawnText) as { task_name: string }).task_name;
+    const message = await post({ kind: "message", target: `/root/${taskName}`, message: staged.message });
+    const messageText = await message.text();
+    const followup = await post({ kind: "followup", target: taskName, message: staged.followup });
+    const followupText = await followup.text();
+    expect([spawn.status, message.status, followup.status]).toEqual([200, 200, 200]);
+    expect(`${spawnText}${messageText}${followupText}`).not.toContain("nonce-");
+
+    const seenBodies: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input, init) => {
+      seenBodies.push(String(init?.body ?? ""));
+      return chatSuccess();
+    }) as typeof fetch;
+    const send = (messageType: "NEW_TASK" | "MESSAGE") => handleResponses(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "vendor/model",
+        stream: false,
+        store: false,
+        input: [agentMessage(`/root/${taskName}`, messageType)],
+      }),
+    }), routedBridgeConfig(), {} as never);
+
+    try {
+      // MESSAGE skips the earlier NEW_TASK record; NEW_TASK records then remain FIFO.
+      expect((await send("MESSAGE")).status).toBe(200);
+      expect((await send("NEW_TASK")).status).toBe(200);
+      expect((await send("NEW_TASK")).status).toBe(200);
+      expect(seenBodies).toHaveLength(3);
+      expect(seenBodies[0]).toContain(staged.message);
+      expect(seenBodies[0]).not.toContain(staged.spawn);
+      expect(seenBodies[1]).toContain(staged.spawn);
+      expect(seenBodies[1]).not.toContain(staged.followup);
+      expect(seenBodies[2]).toContain(staged.followup);
+
+      const consumed = await send("MESSAGE");
+      const consumedText = await consumed.text();
+      expect(consumed.status).toBe(409);
+      expect(consumedText).toContain("subagent_handoff_missing");
+      expect(consumedText).not.toContain(REAL_FERNET);
+      for (const nonce of Object.values(staged)) expect(consumedText).not.toContain(nonce);
+      expect(seenBodies).toHaveLength(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+      subagentHandoffStore.clear();
+    }
+  });
+
+  test("recovers only the newest encrypted agent_message, not ciphertext in child history", () => {
+    const token = "gAAAAABnX6DqvQfLy4CIvIQp9x1G7m2JXjvXgWIBu8VG6OKoyHDyEwE6Q9H9YfdwWlQF-Qj3Hb_RkPBMFa9_k54XfOpfK0S7Ng==";
+    const agentMessage = (recipient: string) => ({ type: "agent_message", recipient, content: [
+      { type: "input_text", text: `Message Type: MESSAGE\nTask name: ${recipient}\nSender: /root\nPayload:\n` },
+      { type: "encrypted_content", encrypted_content: token },
+    ] });
+    const body = { model: "vendor/model", input: [agentMessage("/root/historical_000000000001"), agentMessage("/root/current_000000000002")] };
+    const store = new SubagentHandoffStore();
+    store.stageMessage({ kind: "message", target: "/root/current_000000000002", message: "new payload" });
+
+    expect(recoverSelectedRoutedSubagentRequest(body, { enabled: true, selectedModels: ["vendor/model"], store }))
+      .toEqual({ status: "recovered", count: 1 });
+    expect(body.input[0].content[1].encrypted_content).toBe(token);
+    expect(body.input[1].content[1]).toEqual({ type: "input_text", text: "new payload" });
+  });
+
+  test("historical ciphertext followed by newer non-agent input stays unchanged and unconsumed", () => {
+    const body = {
+      model: "vendor/model",
+      input: [agentMessage("/root/historical_000000000001"), { type: "message", role: "user", content: [{ type: "input_text", text: "continue normally" }] }],
+    };
+    const store = new SubagentHandoffStore();
+    store.stageMessage({ kind: "message", target: "/root/historical_000000000001", message: "must stay staged" });
+
+    expect(recoverSelectedRoutedSubagentRequest(body, { enabled: true, selectedModels: ["vendor/model"], store }))
+      .toEqual({ status: "unchanged" });
+    expect(body.input[0].content[1].encrypted_content).toBe(REAL_FERNET);
+    expect(store.consume("/root/historical_000000000001", "MESSAGE")?.message).toBe("must stay staged");
+  });
+
+  test("bridge-enabled ordinary requests do not clone unless a handoff candidate is present", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalStructuredClone = globalThis.structuredClone;
+    let cloneCalls = 0;
+    globalThis.fetch = (async () => chatSuccess()) as typeof fetch;
+    globalThis.structuredClone = ((value: unknown, options?: StructuredSerializeOptions) => {
+      cloneCalls += 1;
+      return originalStructuredClone(value, options);
+    }) as typeof structuredClone;
+    try {
+      const response = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "vendor/model",
+          stream: false,
+          store: false,
+          input: "ordinary parent request",
+        }),
+      }), routedBridgeConfig(), {} as never);
+
+      expect(response.status).toBe(200);
+      expect(cloneCalls).toBe(0);
+    } finally {
+      globalThis.structuredClone = originalStructuredClone;
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("previous-response continuation does not consume a handoff from replayed history", async () => {
+    const priorHome = process.env.OPENCODEX_HOME;
+    const home = mkdtempSync(join(tmpdir(), "ocx-bridge-continuation-"));
+    process.env.OPENCODEX_HOME = home;
+    clearResponseStateForTests();
+    const previous = { id: "resp_bridge_history", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "prior" }] }] };
+    rememberResponseState({ model: "vendor/model", input: [agentMessage("/root/historical_000000000001")] }, previous);
+    const storeMessage = "must remain queued";
+    subagentHandoffStore.clear();
+    subagentHandoffStore.stageMessage({ kind: "message", target: "/root/historical_000000000001", message: storeMessage });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => chatSuccess()) as typeof fetch;
+    try {
+      const response = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "vendor/model", previous_response_id: previous.id, stream: false, store: false, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "next" }] }] }),
+      }), routedBridgeConfig(), {} as never);
+      expect(response.status).toBe(200);
+      expect(subagentHandoffStore.consume("/root/historical_000000000001", "MESSAGE")?.message).toBe(storeMessage);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearResponseStateForTests();
+      if (priorHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = priorHome;
+      rmSync(home, { recursive: true, force: true });
+      subagentHandoffStore.clear();
+    }
+  });
+
+  test("explicit V1 mode bypasses recovery and leaves the staged handoff untouched", async () => {
+    subagentHandoffStore.clear();
+    subagentHandoffStore.stageMessage({ kind: "message", target: "/root/worker_000000000003", message: "v1 staged" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => chatSuccess()) as typeof fetch;
+    try {
+      const response = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "vendor/model", stream: false, store: false, input: [agentMessage("/root/worker_000000000003")] }),
+      }), routedBridgeConfig({ multiAgentMode: "v1" }), {} as never);
+      expect(response.status).toBe(200);
+      expect(subagentHandoffStore.consume("/root/worker_000000000003", "MESSAGE")?.message).toBe("v1 staged");
+    } finally {
+      globalThis.fetch = originalFetch;
+      subagentHandoffStore.clear();
+    }
+  });
+
+  test("recovered plaintext never reaches the response-state disk snapshot", async () => {
+    const priorHome = process.env.OPENCODEX_HOME;
+    const home = mkdtempSync(join(tmpdir(), "ocx-bridge-state-"));
+    process.env.OPENCODEX_HOME = home;
+    clearResponseStateForTests();
+    subagentHandoffStore.clear();
+    subagentHandoffStore.stageMessage({ kind: "message", target: "/root/worker_000000000003", message: "NEVER_PERSIST_THIS_HANDOFF" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => chatSuccess()) as typeof fetch;
+    try {
+      const response = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "vendor/model", stream: false, store: true, input: [agentMessage("/root/worker_000000000003")] }),
+      }), routedBridgeConfig(), {} as never);
+      expect(response.status).toBe(200);
+      flushResponseState();
+      const snapshotPath = join(home, "responses-state.json");
+      expect(existsSync(snapshotPath)).toBe(true);
+      const snapshot = readFileSync(snapshotPath, "utf8");
+      expect(snapshot).not.toContain("NEVER_PERSIST_THIS_HANDOFF");
+      expect(snapshot).toContain(REAL_FERNET);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearResponseStateForTests();
+      if (priorHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = priorHome;
+      rmSync(home, { recursive: true, force: true });
+      subagentHandoffStore.clear();
+    }
+  });
+
+  test("selected routed combo recovers before dispatch and consumes exactly once", async () => {
+    subagentHandoffStore.clear();
+    subagentHandoffStore.stageMessage({ kind: "message", target: "/root/worker_000000000003", message: "combo plaintext" });
+    const seenBodies: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input, init) => {
+      seenBodies.push(String(init?.body ?? ""));
+      return chatSuccess();
+    }) as typeof fetch;
+    try {
+      const config = routedBridgeConfig({
+        subagentModels: ["combo/free"],
+        combos: { free: { strategy: "failover", targets: [{ provider: "vendor", model: "model" }] } },
+      });
+      const response = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "combo/free", stream: false, store: false, input: [agentMessage("/root/worker_000000000003")] }),
+      }), config, {} as never);
+      expect(response.status).toBe(200);
+      expect(seenBodies.join("\n")).toContain("combo plaintext");
+      expect(subagentHandoffStore.consume("/root/worker_000000000003", "MESSAGE")).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+      subagentHandoffStore.clear();
+    }
+  });
+
+  test("an unselected combo never lets its selected member consume at an inner attempt", async () => {
+    const target = "/root/outer_only_000000000001";
+    const plaintext = "OUTER_BOUNDARY_ONLY_61d8b4";
+    subagentHandoffStore.clear();
+    subagentHandoffStore.stageMessage({ kind: "message", target, message: plaintext });
+    const seenBodies: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input, init) => {
+      seenBodies.push(String(init?.body ?? ""));
+      return chatSuccess();
+    }) as typeof fetch;
+    try {
+      const config = routedBridgeConfig({
+        subagentModels: ["vendor/model"],
+        combos: { free: { strategy: "failover", targets: [{ provider: "vendor", model: "model" }] } },
+      });
+      const response = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "combo/free", stream: false, store: false, input: [agentMessage(target)] }),
+      }), config, {} as never);
+
+      expect(response.status).toBe(200);
+      expect(seenBodies.join("\n")).not.toContain(plaintext);
+      expect(subagentHandoffStore.consume(target, "MESSAGE")?.message).toBe(plaintext);
+    } finally {
+      globalThis.fetch = originalFetch;
+      subagentHandoffStore.clear();
+    }
+  });
+
+  test("recovered upstream 4xx and 5xx failures are generic and content-free in response and request logs", async () => {
+    const originalFetch = globalThis.fetch;
+    clearRequestLogsForTests();
+    try {
+      for (const [index, status] of [400, 503].entries()) {
+        const target = `/root/privacy_${(index + 1).toString(16).padStart(12, "0")}`;
+        const plaintext = `SENSITIVE_HANDOFF_${status}_c7a9e2`;
+        subagentHandoffStore.clear();
+        subagentHandoffStore.stageMessage({ kind: "message", target, message: plaintext });
+        globalThis.fetch = (async () => Response.json({
+          error: { message: `provider echoed ${plaintext} and ${REAL_FERNET}` },
+        }, { status })) as typeof fetch;
+        const logCtx: RequestLogContext = { model: "", provider: "" };
+        const started = Date.now();
+        const raw = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "vendor/model", stream: false, store: false, input: [agentMessage(target)] }),
+        }), routedBridgeConfig(), logCtx);
+        const response = responseWithDeferredRequestLog(raw, `sensitive-${status}`, started, logCtx);
+        const responseText = await response.text();
+        const logText = JSON.stringify(getRequestLogEntries().at(-1));
+
+        expect(response.status).toBe(status);
+        expect((JSON.parse(responseText) as { error: { message: string; code: string } }).error)
+          .toMatchObject({ message: `Provider error ${status}` });
+        expect(responseText).not.toContain(plaintext);
+        expect(responseText).not.toContain(REAL_FERNET);
+        expect(logText).not.toContain(plaintext);
+        expect(logText).not.toContain(REAL_FERNET);
+      }
+
+      const ordinaryDetail = "ordinary provider detail remains visible";
+      globalThis.fetch = (async () => Response.json({ error: { message: ordinaryDetail } }, { status: 503 })) as typeof fetch;
+      const ordinary = await handleResponses(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "vendor/model", stream: false, store: false, input: "ordinary request" }),
+      }), routedBridgeConfig(), { model: "", provider: "" });
+      expect(await ordinary.text()).toContain(ordinaryDetail);
+    } finally {
+      globalThis.fetch = originalFetch;
+      subagentHandoffStore.clear();
+      clearRequestLogsForTests();
+    }
   });
 
   test("v2 surface + injectionModel + injectionEffort names both", async () => {

@@ -1,0 +1,501 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "review_plan_id": {
+      "type": "string",
+      "pattern": "^review-plan:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "revision": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "previous_revision_hash": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "review_request_id": {
+      "type": "string",
+      "pattern": "^review-request:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "snapshot": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "number",
+          "const": 1
+        },
+        "review_snapshot_id": {
+          "type": "string",
+          "pattern": "^review-snapshot:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+        },
+        "contract": {
+          "type": "object",
+          "properties": {
+            "revision_id": {
+              "type": "string",
+              "pattern": "^contract-revision:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+            },
+            "revision": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            }
+          },
+          "required": [
+            "revision_id",
+            "revision",
+            "hash"
+          ],
+          "additionalProperties": false
+        },
+        "source": {
+          "type": "object",
+          "properties": {
+            "base_commit": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "result_tree_hash": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            },
+            "diff_hash": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            }
+          },
+          "required": [
+            "base_commit",
+            "result_tree_hash",
+            "diff_hash"
+          ],
+          "additionalProperties": false
+        },
+        "evidence": {
+          "type": "object",
+          "properties": {
+            "package_id": {
+              "type": "string",
+              "pattern": "^evidence-package:[a-f0-9]{64}$"
+            },
+            "package_hash": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            }
+          },
+          "required": [
+            "package_id",
+            "package_hash"
+          ],
+          "additionalProperties": false
+        },
+        "workflow": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300
+            },
+            "version": {
+              "type": "string",
+              "pattern": "^\\d+\\.\\d+\\.\\d+$"
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            }
+          },
+          "required": [
+            "id",
+            "version",
+            "hash"
+          ],
+          "additionalProperties": false
+        },
+        "policy": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300
+            },
+            "version": {
+              "type": "string",
+              "pattern": "^\\d+\\.\\d+\\.\\d+$"
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^sha256:[a-f0-9]{64}$"
+            }
+          },
+          "required": [
+            "id",
+            "version",
+            "hash"
+          ],
+          "additionalProperties": false
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+        },
+        "snapshot_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "schema_version",
+        "review_snapshot_id",
+        "contract",
+        "source",
+        "evidence",
+        "workflow",
+        "policy",
+        "created_at",
+        "snapshot_hash"
+      ],
+      "additionalProperties": false
+    },
+    "risk": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "reasons": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          }
+        }
+      },
+      "required": [
+        "level",
+        "reasons"
+      ],
+      "additionalProperties": false
+    },
+    "review_units": {
+      "minItems": 1,
+      "maxItems": 32,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "review_unit_id": {
+            "type": "string",
+            "pattern": "^review-unit:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "review_type": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*(?:\\.[a-z0-9][a-z0-9-]*)+$"
+          },
+          "profile_ref": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+$"
+              },
+              "hash": {
+                "type": "string",
+                "pattern": "^sha256:[a-f0-9]{64}$"
+              }
+            },
+            "required": [
+              "id",
+              "version",
+              "hash"
+            ],
+            "additionalProperties": false
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "required_capabilities": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "diff-analysis",
+                "repository-navigation",
+                "architecture-reasoning",
+                "security-analysis",
+                "multimodal-review",
+                "browser-observation",
+                "accessibility-analysis",
+                "performance-analysis",
+                "structured-findings",
+                "evidence-citation",
+                "contract-traceability"
+              ]
+            }
+          },
+          "preferred_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "diff-analysis",
+                "repository-navigation",
+                "architecture-reasoning",
+                "security-analysis",
+                "multimodal-review",
+                "browser-observation",
+                "accessibility-analysis",
+                "performance-analysis",
+                "structured-findings",
+                "evidence-citation",
+                "contract-traceability"
+              ]
+            }
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^review-unit:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+            }
+          },
+          "prerequisites": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9.-]*$"
+            }
+          }
+        },
+        "required": [
+          "review_unit_id",
+          "review_type",
+          "profile_ref",
+          "required",
+          "required_capabilities",
+          "preferred_capabilities",
+          "depends_on",
+          "prerequisites"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "execution_strategy": {
+      "type": "object",
+      "properties": {
+        "parallel_groups": {
+          "minItems": 1,
+          "maxItems": 32,
+          "type": "array",
+          "items": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^review-unit:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+            }
+          }
+        }
+      },
+      "required": [
+        "parallel_groups"
+      ],
+      "additionalProperties": false
+    },
+    "adjudication_policy_ref": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "hash"
+      ],
+      "additionalProperties": false
+    },
+    "quorum": {
+      "type": "object",
+      "properties": {
+        "required_review_types": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*(?:\\.[a-z0-9][a-z0-9-]*)+$"
+          }
+        },
+        "minimum_independent_providers": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 16
+        },
+        "minimum_independence_score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9
+        },
+        "human_approval": {
+          "type": "string",
+          "enum": [
+            "not-required",
+            "required"
+          ]
+        }
+      },
+      "required": [
+        "required_review_types",
+        "minimum_independent_providers",
+        "minimum_independence_score",
+        "human_approval"
+      ],
+      "additionalProperties": false
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "max_wall_time_seconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 604800
+        },
+        "max_total_output_tokens": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 10000000
+        },
+        "max_review_units": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 64
+        },
+        "max_parallel_units": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 32
+        }
+      },
+      "required": [
+        "max_wall_time_seconds",
+        "max_total_output_tokens",
+        "max_review_units",
+        "max_parallel_units"
+      ],
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "max_review_rounds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "max_repair_rounds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "max_evidence_requests": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "max_adjudication_rounds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "max_total_cost_units": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000
+        }
+      },
+      "required": [
+        "max_review_rounds",
+        "max_repair_rounds",
+        "max_evidence_requests",
+        "max_adjudication_rounds",
+        "max_total_cost_units"
+      ],
+      "additionalProperties": false
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "review_plan_id",
+    "revision",
+    "previous_revision_hash",
+    "review_request_id",
+    "task_id",
+    "snapshot",
+    "risk",
+    "review_units",
+    "execution_strategy",
+    "adjudication_policy_ref",
+    "quorum",
+    "budget",
+    "limits",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase3/review-plan-v1.schema.json"
+}

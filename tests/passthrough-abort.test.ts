@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { linkAbortSignal, relaySseWithHeartbeat, relayWithAbort } from "../src/server";
+import { relaySensitivePassthroughSse } from "../src/server/relay";
 
 const root = new URL("../", import.meta.url);
 
@@ -30,6 +31,54 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
 }
 
 describe("passthrough relayWithAbort (RC2, passthrough path)", () => {
+  test("sensitive named response.failed with empty data discards every upstream field", async () => {
+    const nonce = "EMPTY_FAILURE_PRIVATE_NONCE_a81f";
+    const input = [
+      `id: ${nonce}`,
+      `: private comment ${nonce}`,
+      `x-provider-debug: ${nonce}`,
+      "event: response.failed",
+      "data:",
+      "",
+      "",
+    ].join("\n");
+    const relayed = relaySensitivePassthroughSse(
+      streamFromChunks([new TextEncoder().encode(input)]),
+      new AbortController(),
+    );
+    const output = await readAll(relayed);
+    expect(output).not.toContain(nonce);
+    expect(output.trim().split("\n")[0]).toBe("event: response.failed");
+    expect(output).toContain('"type":"response.failed"');
+    expect(output).toContain('"message":"Provider error 502"');
+    expect(output).not.toContain("id:");
+    expect(output).not.toContain("x-provider-debug");
+  });
+
+  test("sensitive no-space response.failed with malformed data is still rebuilt", async () => {
+    const nonce = "MALFORMED_FAILURE_PRIVATE_NONCE_6bc2";
+    const input = [
+      `id:${nonce}`,
+      `:${nonce}`,
+      `x-provider-debug:${nonce}`,
+      "event:response.failed",
+      `data:{not-json-${nonce}}`,
+      "",
+      "",
+    ].join("\n");
+    const relayed = relaySensitivePassthroughSse(
+      streamFromChunks([new TextEncoder().encode(input)]),
+      new AbortController(),
+    );
+    const output = await readAll(relayed);
+    expect(output).not.toContain(nonce);
+    expect(output.trim().split("\n")[0]).toBe("event: response.failed");
+    expect(output).toContain('"type":"response.failed"');
+    expect(output).toContain('"code":"upstream_server_error"');
+    expect(output).not.toContain("id:");
+    expect(output).not.toContain("x-provider-debug");
+  });
+
   test("native passthrough SSE keeps win32 on the pure native relay (Bun#32111)", async () => {
     const source = await readSource("src/server/index.ts");
     const sseBranch = source.slice(

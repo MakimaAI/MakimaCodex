@@ -3,9 +3,9 @@
  *
  * On Windows, `chmod` only controls POSIX-style bits in the ACE list and does NOT remove
  * inherited permissions from other users. Real per-user isolation requires icacls to:
- *   1. Disable inheritance   (icacls path /inheritance:r)
- *   2. Strip broad explicit grants by SID (Everyone, Users, Authenticated Users)
- *   3. Grant the current user full control (icacls path /grant:r "CURRENTUSER:(F)")
+ *   1. Grant the current user full control (icacls path /grant:r "CURRENTUSER:(F)")
+ *   2. Disable inheritance   (icacls path /inheritance:r)
+ *   3. Strip broad explicit grants by SID (Everyone, Users, Authenticated Users)
  *
  * On non-Windows platforms the helpers fall through to the caller's existing chmod-based
  * behaviour: they return ok:true without invoking any external process.
@@ -23,7 +23,9 @@
  */
 
 import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { env, platform } from "node:process";
+import { fileURLToPath } from "node:url";
 
 const hardenedDirectories = new Set<string>();
 const hardenedPaths = new Set<string>();
@@ -35,8 +37,15 @@ export interface HardenResult {
   diagnostics?: string;
 }
 
+export interface AclInspectionResult {
+  secure: boolean | null;
+  diagnostics?: string;
+}
+
 export interface HardenOptions {
   required: boolean;
+  verifyIsolation?: boolean;
+  force?: boolean;
 }
 
 /**
@@ -67,6 +76,9 @@ export interface IcaclsResult {
 }
 
 type IcaclsRunner = (args: string[], timeoutMs: number) => IcaclsResult;
+type AclInspectorRunner = (args: string[], timeoutMs: number) => IcaclsResult;
+const ACL_INSPECT_MAX_BYTES = 1024 * 1024;
+const ACL_INSPECT_SCRIPT_PATH = fileURLToPath(new URL("./windows-acl-inspect.ps1", import.meta.url));
 
 function defaultIcaclsRunner(args: string[], timeoutMs: number): IcaclsResult {
   // Bun.spawnSync with windowsHide: Node execFileSync has hung under the GUI/proxy even
@@ -87,12 +99,35 @@ function defaultIcaclsRunner(args: string[], timeoutMs: number): IcaclsResult {
 }
 
 let icaclsRunner: IcaclsRunner = defaultIcaclsRunner;
+function defaultAclInspectorRunner(args: string[], timeoutMs: number): IcaclsResult {
+  const result = spawnSync("powershell.exe", args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    windowsHide: true,
+    shell: false,
+    timeout: timeoutMs,
+    maxBuffer: ACL_INSPECT_MAX_BYTES,
+  });
+  return {
+    success: result.status === 0 && !result.error,
+    exitCode: result.status,
+    timedOut: (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT",
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+  };
+}
+
+let aclInspectorRunner: AclInspectorRunner = defaultAclInspectorRunner;
 let platformOverride: string | null = null;
 let nowFn: () => number = Date.now;
 
 /** Test seam: replace the icacls process runner. Pass null to restore the default. */
 export function setIcaclsRunnerForTests(runner: IcaclsRunner | null): void {
   icaclsRunner = runner ?? defaultIcaclsRunner;
+}
+
+/** Test seam: replace the read-only PowerShell/Get-Acl runner. */
+export function setAclInspectorRunnerForTests(runner: AclInspectorRunner | null): void {
+  aclInspectorRunner = runner ?? defaultAclInspectorRunner;
 }
 
 /** Test seam: force the platform gate (e.g. "win32") so CI on POSIX reaches the runner. */
@@ -149,7 +184,102 @@ function currentWindowsUser(): string | undefined {
  *
  * Throws the raw child_process error on failure (caller sanitizes).
  */
-const BROAD_SIDS = ["*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545"] as const;
+const BROAD_SIDS = ["*S-1-1-0", "*S-1-5-11", "*S-1-5-18", "*S-1-5-32-544", "*S-1-5-32-545"] as const;
+
+interface SerializedAclRule {
+  identitySid: string;
+  accessControlType: "Allow" | "Deny";
+  fileSystemRights: number;
+  isInherited: boolean;
+}
+
+const WINDOWS_FULL_CONTROL = 2_032_127;
+const WINDOWS_SID_RE = /^S-\d+(?:-\d+)+$/i;
+
+function aclInspectorArgs(targetPath: string): string[] {
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    ACL_INSPECT_SCRIPT_PATH,
+    "-TargetPath",
+    targetPath,
+  ];
+}
+
+function aclVerificationError(): NodeJS.ErrnoException {
+  const error = new Error("ACL hardening verification failed") as NodeJS.ErrnoException;
+  error.code = "EACLVERIFY";
+  return error;
+}
+
+/** Inspect the complete Windows DACL through fixed-script, SID-stable Get-Acl output. */
+export function inspectSecretPathAcl(targetPath: string, timeoutMs = resolveHardenDeadlineMs()): AclInspectionResult {
+  if (!existsSync(targetPath)) return { secure: false, diagnostics: "secret path is missing" };
+  if (effectivePlatform() !== "win32") return { secure: null, diagnostics: "Windows ACL inspection is unavailable" };
+  const boundedTimeoutMs = Number.isSafeInteger(timeoutMs)
+    ? Math.min(HARDEN_DEADLINE_MAX_MS, Math.max(HARDEN_DEADLINE_MIN_MS, timeoutMs))
+    : HARDEN_DEADLINE_DEFAULT_MS;
+  let result: IcaclsResult;
+  try {
+    result = aclInspectorRunner(aclInspectorArgs(targetPath), boundedTimeoutMs);
+  } catch {
+    return { secure: null, diagnostics: "ACL inspection failed" };
+  }
+  if (!result.success) return { secure: null, diagnostics: result.timedOut ? "ACL inspection timed out" : "ACL inspection failed" };
+  if (Buffer.byteLength(result.stdout, "utf8") > ACL_INSPECT_MAX_BYTES) {
+    return { secure: null, diagnostics: "ACL inspection output exceeded its limit" };
+  }
+  try {
+    const parsed = JSON.parse(result.stdout) as {
+      protected?: unknown;
+      currentUserSid?: unknown;
+      ownerSid?: unknown;
+      rules?: unknown;
+    };
+    if (parsed.protected !== true) return { secure: false, diagnostics: "DACL inheritance is not protected" };
+    if (typeof parsed.currentUserSid !== "string" || !WINDOWS_SID_RE.test(parsed.currentUserSid)) {
+      return { secure: null, diagnostics: "current-user SID is unavailable" };
+    }
+    if (typeof parsed.ownerSid !== "string" || !WINDOWS_SID_RE.test(parsed.ownerSid)) {
+      return { secure: null, diagnostics: "secret owner SID is unavailable" };
+    }
+    if (parsed.ownerSid.toUpperCase() !== parsed.currentUserSid.toUpperCase()) {
+      return { secure: false, diagnostics: "secret owner is not the current user" };
+    }
+    if (!Array.isArray(parsed.rules) || parsed.rules.length === 0) {
+      return { secure: false, diagnostics: "DACL has no explicit current-user grant" };
+    }
+    let currentUserRights = 0;
+    for (const value of parsed.rules) {
+      const rule = value as Partial<SerializedAclRule>;
+      if (typeof rule.identitySid !== "string" || !WINDOWS_SID_RE.test(rule.identitySid)
+        || !["Allow", "Deny"].includes(String(rule.accessControlType))
+        || typeof rule.fileSystemRights !== "number"
+        || !Number.isSafeInteger(rule.fileSystemRights)
+        || typeof rule.isInherited !== "boolean") {
+        return { secure: null, diagnostics: "DACL rule output is invalid" };
+      }
+      if (rule.isInherited) return { secure: false, diagnostics: "inherited DACL rule detected" };
+      if (rule.identitySid.toUpperCase() !== parsed.currentUserSid.toUpperCase()) {
+        return { secure: false, diagnostics: "foreign DACL rule detected" };
+      }
+      if (rule.accessControlType === "Allow") {
+        currentUserRights |= rule.fileSystemRights;
+      } else {
+        return { secure: false, diagnostics: "current-user DACL deny rule detected" };
+      }
+    }
+    if ((currentUserRights & WINDOWS_FULL_CONTROL) !== WINDOWS_FULL_CONTROL) {
+      return { secure: false, diagnostics: "current-user full-control DACL is missing" };
+    }
+    return { secure: true };
+  } catch {
+    return { secure: null, diagnostics: "ACL inspection output is invalid" };
+  }
+}
 
 function runIcacls(targetPath: string, directory: boolean, deadline: number): void {
   const user = currentWindowsUser();
@@ -170,10 +300,15 @@ function runIcacls(targetPath: string, directory: boolean, deadline: number): vo
     if (!result.success) throw icaclsError(step, result);
   };
 
-  // Step 1: disable inheritance and remove inherited ACEs
+  // Grant first so an interruption can never strand an entry with no usable owner ACE.
+  // Atomic secret writes harden an empty temp before adding sensitive bytes.
+  const grant = directory ? `${user}:(OI)(CI)(F)` : `${user}:(F)`;
+  runOrThrow("/grant:r", [targetPath, "/grant:r", grant]);
+
+  // Step 2: disable inheritance and remove inherited ACEs.
   runOrThrow("/inheritance:r", [targetPath, "/inheritance:r"]);
 
-  // Step 2: remove broad explicit grants using stable SIDs (not localized names).
+  // Step 3: remove broad explicit grants using stable SIDs (not localized names).
   // Missing ACEs can yield a non-zero exit; verify with locale-independent /findsid
   // before accepting the failure as harmless — a swallowed real failure would leave
   // Everyone/Users/Authenticated Users grants while reporting hardened.
@@ -191,10 +326,6 @@ function runIcacls(targetPath: string, directory: boolean, deadline: number): vo
       }
     }
   }
-
-  // Step 3: grant current user full control.
-  const grant = directory ? `${user}:(OI)(CI)(F)` : `${user}:(F)`;
-  runOrThrow("/grant:r", [targetPath, "/grant:r", grant]);
 }
 
 /**
@@ -215,6 +346,8 @@ function sanitizeDiagnostics(error: unknown): string {
       return `ACL hardening failed (${code}) — permission denied running icacls`;
     case "EICACLS":
       return "ACL hardening failed (EICACLS) — icacls command error; filesystem may not support per-user NTFS ACLs";
+    case "EACLVERIFY":
+      return "ACL hardening verification failed (EACLVERIFY) — the resulting DACL is not isolated to the current user";
     default:
       return `ACL hardening failed${code ? ` (${code})` : ""} — filesystem may not support per-user NTFS ACLs`;
   }
@@ -260,9 +393,20 @@ function hardenEntry(
 ): HardenResult {
   if (!existsSync(targetPath)) return { ok: true };
   if (effectivePlatform() !== "win32") return { ok: true };
-  if (cache.has(targetPath)) return { ok: true };
+  if (!opts.force && cache.has(targetPath)) return { ok: true };
   if (timedOutPaths.has(targetPath)) {
     return { ok: false, diagnostics: "ACL hardening skipped — previous attempt timed out" };
+  }
+
+  // Re-applying inheritable directory ACEs updates child ctime on NTFS even when the DACL is
+  // already correct. A read-only preflight prevents fresh processes from invalidating child
+  // identity attestations while retaining the mutation path for unknown or insecure state.
+  if (directory && !opts.force) {
+    const inspected = inspectSecretPathAcl(targetPath);
+    if (inspected.secure === true) {
+      cache.add(targetPath);
+      return { ok: true };
+    }
   }
 
   const deadline = nowFn() + resolveHardenDeadlineMs();
@@ -271,6 +415,14 @@ function hardenEntry(
     if (attempt > 0 && deadline - nowFn() <= 0) break; // retry only while budget remains
     try {
       runIcacls(targetPath, directory, deadline);
+      if (opts.required && opts.verifyIsolation) {
+        const inspection = inspectSecretPathAcl(targetPath);
+        if (inspection.secure !== true) {
+          const verificationError = new Error("ACL hardening verification failed") as NodeJS.ErrnoException;
+          verificationError.code = "EACLVERIFY";
+          throw verificationError;
+        }
+      }
       cache.add(targetPath);
       return { ok: true };
     } catch (err) {

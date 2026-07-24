@@ -113,6 +113,7 @@ describe("/healthz identity fields", () => {
   test("healthz advertises service identity, pid, and port", () => {
     expect(serverSource).toContain('service: "opencodex"');
     expect(serverSource).toContain("pid: process.pid");
-    expect(serverSource).toContain("port: listenPort");
+    expect(serverSource).toContain("port: healthPort");
+    expect(serverSource).toContain("SUBAGENT_BRIDGE_HEALTH_PROTOCOL");
   });
 });

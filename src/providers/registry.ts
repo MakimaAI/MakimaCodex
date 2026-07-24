@@ -43,6 +43,7 @@ export interface ProviderRegistryEntry {
   /** Static headers merged into every upstream request for this provider. */
   staticHeaders?: Record<string, string>;
   modelSuffixBracketStrip?: boolean;
+  modelIdPrefix?: string;
   featured?: boolean;
   dashboardPreset?: boolean;
   note?: string;
@@ -83,7 +84,7 @@ export interface ProviderRegistryEntry {
 
 export type ProviderConfigSeed = Pick<
   OcxProviderConfig,
-  "adapter" | "baseUrl" | "authMode" | "keyOptional" | "freeTier" | "modelSuffixBracketStrip" | "defaultModel" | "models"
+  "adapter" | "baseUrl" | "authMode" | "keyOptional" | "freeTier" | "modelSuffixBracketStrip" | "modelIdPrefix" | "defaultModel" | "models"
   | "liveModels" | "contextWindow" | "modelContextWindows" | "modelInputModalities"
   | "modelMaxInputTokens"
   | "reasoningEfforts" | "modelReasoningEfforts" | "modelDefaultReasoningEfforts" | "reasoningEffortMap" | "modelReasoningEffortMap"
@@ -316,6 +317,20 @@ const UMANS_MODEL_INPUT_MODALITIES: Record<string, string[]> = Object.fromEntrie
   UMANS_MODELS.map(id => [id, UMANS_TEXT_ONLY_MODELS.includes(id) ? ["text"] : ["text", "image"]]),
 );
 
+const CLINE_RECOMMENDED_MODELS = [
+  "anthropic/claude-opus-4.6",
+  "anthropic/claude-sonnet-4.6",
+  "google/gemini-3.1-pro-preview",
+  "openai/gpt-5.3-codex",
+  "kwaipilot/kat-coder-pro",
+  "arcee-ai/trinity-large-preview:free",
+];
+const CLINE_PASS_MODELS = [
+  "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6",
+  "deepseek-v4-pro", "deepseek-v4-flash", "mimo-v2.5",
+  "mimo-v2.5-pro", "minimax-m3", "qwen3.7-max", "qwen3.7-plus",
+];
+
 export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
   {
     id: "openai",
@@ -335,7 +350,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     authKind: "oauth",
     featured: false,
     dashboardPreset: true,
-    note: "Experimental Cursor bridge. Live transport and live model discovery are enabled after a standalone PKCE browser login via 'ocx login cursor'; native read/write/delete/shell/fetch execution defaults to codex-sandbox mode (auto-enabled when the request declares Codex danger-full-access sandbox); override with \"nativeLocalExec\": \"on\" (always), \"off\" (never), or \"codex-sandbox\" (only for requests declaring the Codex danger-full-access sandbox; the declaration is caller-controlled prose the proxy cannot verify, and the auth-free loopback bind admits any process on this host, including other local users — enable only where every data-plane client is trusted) — legacy \"unsafeAllowNativeLocalExec\": true still means \"on\" — on providers.cursor in ~/.opencodex/config.json (dashboard: Providers → Cursor → Edit JSON) for a trusted local experiment.",
+    note: "Experimental Cursor bridge. Live transport and live model discovery are enabled after a standalone PKCE browser login via 'ocx login cursor'. Native read/write/delete/shell/fetch execution defaults to \"off\"; opt in with \"nativeLocalExec\": \"on\" (always) or \"codex-sandbox\" (only when the request declares Codex danger-full-access). That declaration is caller-controlled prose the proxy cannot verify, and the auth-free loopback bind admits other local processes, so enable either mode only where every data-plane client is trusted. Legacy \"unsafeAllowNativeLocalExec\": true still means \"on\". Configure providers.cursor in ~/.opencodex/config.json (dashboard: Providers → Cursor → Edit JSON).",
     models: cursorModelIds(CURSOR_STATIC_MODELS),
     liveModels: true,
     defaultModel: "auto",
@@ -347,6 +362,32 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // upstream model could natively do. Live-discovered models outside the static list fall back
     // to the same marker until they appear here.
     noVisionModels: cursorModelIds(CURSOR_STATIC_MODELS),
+  },
+  {
+    id: "cline",
+    label: "Cline",
+    adapter: "openai-chat",
+    baseUrl: "https://api.cline.bot/api/v1",
+    authKind: "oauth",
+    oauthId: "cline",
+    featured: true,
+    dashboardUrl: "https://app.cline.bot",
+    defaultModel: CLINE_RECOMMENDED_MODELS[0],
+    models: CLINE_RECOMMENDED_MODELS,
+    liveModels: true,
+  },
+  {
+    id: "cline-pass",
+    label: "ClinePass",
+    adapter: "openai-chat",
+    baseUrl: "https://api.cline.bot/api/v1",
+    authKind: "key",
+    featured: true,
+    dashboardUrl: "https://app.cline.bot/settings/api-keys",
+    defaultModel: "kimi-k2.7-code",
+    models: CLINE_PASS_MODELS,
+    liveModels: true,
+    modelIdPrefix: "cline-pass/",
   },
   {
     id: "xai",

@@ -55,7 +55,7 @@ no-replace 方式创建 `config.json.pre-openai-tiers-v2.bak`，并把已知旧 
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | 开启 | 网络搜索 sidecar 选项（见下文）。 |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | 开启 | 视觉 sidecar 选项（见下文）。 |
 | `tokenGuardian?` | `OcxTokenGuardianConfig` | 关闭 | 可选的 proactive OAuth 刷新和 Codex account warmup 策略；字段见下文。 |
-| `corsAllowOrigins?` | `string[]` | `[]` | CORS 额外允许的精确 origin。loopback origin 始终允许。 |
+| `corsAllowOrigins?` | `string[]` | `[]` | CORS 额外允许的精确 origin。数据平面的 loopback origin 默认允许；跨 loopback origin 调用管理 API 时必须在此显式列出。 |
 
 `maxConcurrentThreadsPerSession` 是 `PUT /api/v2` 使用的 camel-case 字段，不是 `config.json` key。
 `ocx v2 threads <n>` 会把对应的 `max_concurrent_threads_per_session` 值写入 Codex

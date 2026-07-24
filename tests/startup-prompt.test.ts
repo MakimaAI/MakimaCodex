@@ -34,4 +34,17 @@ describe("startup star prompt", () => {
     expect(init).toContain("Install Codex autostart shim? [Y/n]");
     expect(init).toContain("installCodexShim");
   });
+
+  test("ocx start probes for an orphaned live proxy even when the pid file is missing", async () => {
+    const cli = await readText("src/cli/index.ts");
+    const startIndex = cli.indexOf("async function handleStart");
+    const pidIndex = cli.indexOf("const existingPid = readPid()", startIndex);
+    const liveProbeIndex = cli.indexOf("const live = await findLiveProxy()", pidIndex);
+    const pidGuardIndex = cli.indexOf("if (existingPid)", pidIndex);
+
+    expect(pidIndex).toBeGreaterThan(startIndex);
+    expect(liveProbeIndex).toBeGreaterThan(pidIndex);
+    expect(pidGuardIndex).toBeGreaterThan(pidIndex);
+    expect(liveProbeIndex).toBeLessThan(pidGuardIndex);
+  });
 });

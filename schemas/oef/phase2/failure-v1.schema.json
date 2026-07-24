@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "failure_id": {
+      "type": "string",
+      "pattern": "^failure:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "RUNTIME_MISSING",
+        "RUNTIME_INCOMPATIBLE",
+        "RUNTIME_STARTUP_FAILED",
+        "AUTHENTICATION_FAILED",
+        "AUTHORIZATION_FAILED",
+        "RATE_LIMITED",
+        "PROVIDER_UNAVAILABLE",
+        "NETWORK_FAILED",
+        "STARTUP_TIMEOUT",
+        "IDLE_TIMEOUT",
+        "TOTAL_TIMEOUT",
+        "OUTPUT_LIMIT_EXCEEDED",
+        "CONTEXT_LIMIT_EXCEEDED",
+        "PROTOCOL_ERROR",
+        "EVENT_STREAM_INCOMPLETE",
+        "TOOL_FAILED",
+        "COMMAND_FAILED",
+        "WORKSPACE_CONFLICT",
+        "PATH_POLICY_VIOLATION",
+        "SECRET_LEAK_DETECTED",
+        "MODEL_REFUSAL",
+        "MODEL_BEHAVIOR_ERROR",
+        "VERIFICATION_FAILED",
+        "CANCELLED_BY_USER",
+        "RUNNER_LOST",
+        "UNKNOWN"
+      ]
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "runtime",
+        "provider",
+        "runner",
+        "workspace",
+        "policy",
+        "verification",
+        "user",
+        "unknown"
+      ]
+    },
+    "retryability": {
+      "type": "string",
+      "enum": [
+        "never",
+        "conditional",
+        "retryable"
+      ]
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "runtime": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "boolean"
+        },
+        "account": {
+          "type": "boolean"
+        },
+        "task": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "runtime",
+        "model",
+        "account",
+        "task"
+      ],
+      "additionalProperties": false
+    },
+    "safe_actions": {
+      "maxItems": 64,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160
+      }
+    },
+    "unsafe_actions": {
+      "maxItems": 64,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 160
+      }
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "evidence_refs": {
+      "maxItems": 256,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^artifact:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "failure_id",
+    "type",
+    "category",
+    "retryability",
+    "scope",
+    "safe_actions",
+    "unsafe_actions",
+    "signature",
+    "evidence_refs"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/failure-v1.schema.json"
+}

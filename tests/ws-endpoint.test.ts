@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
+import { bridgeToResponsesSSE } from "../src/bridge";
 import {
   buildWarmupCompletionFrames,
   pumpResponsesSseToWebSocket,
@@ -11,6 +12,11 @@ import {
   type WsData,
 } from "../src/server/ws-bridge";
 import type { ServerWebSocket } from "bun";
+import type { AdapterEvent } from "../src/types";
+
+async function* replay(events: AdapterEvent[]): AsyncGenerator<AdapterEvent> {
+  for (const event of events) yield event;
+}
 
 function mockWs(sendResult = 1): { ws: ServerWebSocket<WsData>; sent: string[] } {
   const sent: string[] = [];
@@ -78,6 +84,24 @@ describe("WS endpoint re-framer (120/132)", () => {
       "response.completed",
     ]);
     expect(cancelled).toBe(true);
+  });
+
+  test("re-frames promoted raw reasoning as native summary WebSocket events", async () => {
+    const { ws, sent } = mockWs();
+    const stream = bridgeToResponsesSSE(replay([
+      { type: "reasoning_raw_delta", text: "websocket plan" },
+      { type: "text_delta", text: "answer" },
+      { type: "done" },
+    ]), "kimi/k3[1m]", undefined, undefined, undefined, undefined, undefined, {
+      promoteRawReasoningToSummary: true,
+    });
+
+    await pumpResponsesSseToWebSocket(ws, stream);
+    const frames = sent.map(frame => JSON.parse(frame) as Record<string, unknown>);
+    expect(frames.some(frame => frame.type === "response.reasoning_summary_text.delta"
+      && frame.delta === "websocket plan")).toBe(true);
+    expect(frames.some(frame => frame.type === "response.reasoning_text.delta")).toBe(false);
+    expect(frames.at(-1)?.type).toBe("response.completed");
   });
 
   test("reports failed terminal status exactly once while pumping SSE to WebSocket", async () => {

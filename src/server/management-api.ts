@@ -51,8 +51,14 @@ import { drainAndShutdown } from "./lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "./request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../usage/cost";
 import type { PersistedUsageAttempt } from "../usage/log";
-import { isAllowedRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "./auth-cors";
+import { isAllowedManagementRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "./auth-cors";
 import { applySystemEnvToggle } from "./system-env";
+import type { SubagentBridgeStatus } from "../subagent-bridge/lifecycle";
+import {
+  literalLoopbackEndpointHost,
+  normalizedActualBindHostname,
+  subagentBridgeRuntimeEligible,
+} from "../subagent-bridge/runtime";
 
 // Single source of truth = package.json (../ from src/), so /healthz + the GUI badge match the
 // installed npm version instead of a stale hardcode.
@@ -70,6 +76,9 @@ export interface ManagementApiDeps {
   clearThreadAccountMap?: () => void;
   clearProviderQuotaCache?: () => void;
   primeCodexPoolQuotas?: (config: OcxConfig, reason: string) => Promise<void> | void;
+  subagentBridgeStatus?: () => (Omit<SubagentBridgeStatus, "mcpReady"> & { mcpReady?: boolean })
+    | Promise<Omit<SubagentBridgeStatus, "mcpReady"> & { mcpReady?: boolean }>;
+  subagentV2Efforts?: (slugs: readonly string[]) => Map<string, string[]>;
 }
 
 /** Narrow an unknown JSON value to a plain (non-array) object for strict request-body validation. */
@@ -177,7 +186,7 @@ function requestLogDto(entry: RequestLogEntry): Record<string, unknown> {
 }
 
 export async function handleManagementAPI(req: Request, url: URL, config: OcxConfig, deps: ManagementApiDeps = {}): Promise<Response | null> {
-  if (!isAllowedRequestOrigin(req, config)) {
+  if (!isAllowedManagementRequestOrigin(req, config)) {
     return jsonResponse({ error: "cross-origin request blocked" }, 403, req, config);
   }
   // Management bodies are small JSON (provider names, key ids, settings). Reject oversized
@@ -196,6 +205,93 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
     } catch {
       /* catalog absent */
     }
+  }
+
+  async function currentSubagentBridgeStatus() {
+    const diskStatus = deps.subagentBridgeStatus
+      ? await deps.subagentBridgeStatus()
+      : await (await import("../subagent-bridge/status-inspector")).inspectSubagentBridgeStatusIsolated();
+    const activeEnabled = config.subagentBridge?.enabled === true;
+    const liveReady = diskStatus.ready && subagentBridgeRuntimeEligible(config);
+    const warnings = [...diskStatus.warnings];
+    if (activeEnabled && literalLoopbackEndpointHost(normalizedActualBindHostname(config.hostname)) === null) {
+      warnings.push("Subagent bridge requires a literal loopback proxy bind (127.0.0.1 or ::1).");
+    }
+    return {
+      ...diskStatus,
+      warnings,
+      installedReady: diskStatus.ready,
+      enabled: activeEnabled,
+      ready: liveReady,
+      liveReady,
+      restartRequired: diskStatus.enabled !== activeEnabled,
+    };
+  }
+
+  async function subagentMetadata(
+    available: string[],
+    models: CatalogModel[],
+    suppliedBridgeStatus?: Awaited<ReturnType<typeof currentSubagentBridgeStatus>>,
+  ) {
+    const bridgeStatus = suppliedBridgeStatus ?? await currentSubagentBridgeStatus();
+    const chosen = config.subagentModels ?? [];
+    const enabled = config.subagentBridge?.enabled === true;
+    const bridgeReady = enabled && bridgeStatus.liveReady;
+    const v2Efforts = deps.subagentV2Efforts
+      ? deps.subagentV2Efforts(available)
+      : (await import("../codex/catalog")).catalogV2ModelEfforts(available);
+    const rows = available.map(id => {
+      const routed = models.find(model => slugEquals(id, model.provider, model.id));
+      const reasoningEfforts = v2Efforts.get(id) ?? [];
+      if (!routed) {
+        const warnings = reasoningEfforts.length > 0 ? [] : ["Model is not V2-eligible in the active Codex catalog."];
+        const selected = chosen.includes(id);
+        const v2Eligible = reasoningEfforts.length > 0;
+        return {
+          id,
+          classification: "native" as const,
+          selected,
+          v2Eligible,
+          bridgeRequired: false,
+          bridgeReady: true,
+          ready: selected && v2Eligible,
+          reasoningEfforts,
+          warnings,
+        };
+      }
+      const selected = chosen.some(value => slugEquals(value, routed.provider, routed.id));
+      const warnings: string[] = [];
+      if (!selected) warnings.push("Routed model is not selected for the V2 subagent roster.");
+      if (!enabled) warnings.push("Subagent bridge is disabled.");
+      else if (!bridgeStatus.ready) warnings.push("Subagent bridge is not ready.");
+      if (reasoningEfforts.length === 0) warnings.push("Model is not V2-eligible in the active Codex catalog.");
+      return {
+        id,
+        classification: "routed" as const,
+        selected,
+        v2Eligible: reasoningEfforts.length > 0,
+        bridgeRequired: true,
+        bridgeReady,
+        ready: selected && bridgeReady && reasoningEfforts.length > 0,
+        reasoningEfforts,
+        warnings,
+      };
+    });
+    const warnings = [...bridgeStatus.warnings];
+    for (const row of rows) {
+      if (!row.selected) continue;
+      for (const warning of row.warnings) if (!warnings.includes(warning)) warnings.push(warning);
+    }
+    return {
+      bridge: {
+        ...bridgeStatus,
+        enabled,
+        ready: bridgeReady,
+        requiredForRoutedV2: true,
+      },
+      models: rows,
+      warnings,
+    };
   }
 
   async function syncClaudeAgentDefsBestEffort(): Promise<void> {
@@ -222,6 +318,10 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
 
   if (url.pathname === "/api/config" && req.method === "GET") {
     return jsonResponse(safeConfigDTO(config));
+  }
+
+  if (url.pathname === "/api/subagent-bridge" && req.method === "GET") {
+    return jsonResponse(await currentSubagentBridgeStatus());
   }
 
   if (url.pathname === "/api/config" && req.method === "PUT") {
@@ -524,6 +624,7 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
       name, adapter: p.adapter, baseUrl: publicProviderBaseUrl(p.baseUrl), defaultModel: p.defaultModel,
       hasApiKey: !!p.apiKey,
       allowPrivateNetwork: p.allowPrivateNetwork === true,
+      showRawReasoning: p.showRawReasoning === true,
       disabled: p.disabled === true,
       codexAccountMode: providerCodexAccountMode(name, p),
     })));
@@ -671,6 +772,12 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
      touched = true;
    }
 
+   if (Object.hasOwn(rawBody, "showRawReasoning")) {
+     if (typeof rawBody.showRawReasoning !== "boolean") return jsonResponse({ error: "showRawReasoning must be a boolean" }, 400);
+     next.showRawReasoning = rawBody.showRawReasoning;
+     touched = true;
+   }
+
     if (!touched) return jsonResponse({ error: "no recognized fields to update" }, 400);
 
     // A disabled-only toggle preserves the v2 fast lane: it changes routing eligibility,
@@ -696,6 +803,7 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
       success: true,
       name,
       disabled: config.providers[name]!.disabled === true,
+      showRawReasoning: config.providers[name]!.showRawReasoning === true,
       hasApiKey: !!config.providers[name]!.apiKey,
     });
   }
@@ -733,17 +841,24 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
     try {
       const res = await fetch(modelsUrl, { headers, signal: AbortSignal.timeout(8000) });
       const latencyMs = Date.now() - started;
+      const catalogLabel = name === "cline" || name === "cline-pass" ? "model catalog" : "/models";
       if (!res.ok) {
-        return jsonResponse({ ok: false, latencyMs, error: `upstream /models returned ${res.status}` });
+        return jsonResponse({ ok: false, latencyMs, error: `upstream ${catalogLabel} returned ${res.status}` });
       }
       const json = await res.json().catch(() => null) as { data?: unknown; models?: unknown } | null;
       // OpenAI-style lists use { data: [...] }; Google's /v1beta/models (the other shape
       // buildModelsRequest can produce) returns { models: [...] }.
-      const list = json && typeof json === "object" && !Array.isArray(json)
-        ? (Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : undefined)
-        : undefined;
+      let list: unknown[] | undefined;
+      if ((name === "cline" || name === "cline-pass") && json) {
+        const { normalizeClineCatalog } = await import("../providers/cline-catalog");
+        list = normalizeClineCatalog(json, name);
+      } else {
+        list = json && typeof json === "object" && !Array.isArray(json)
+          ? (Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : undefined)
+          : undefined;
+      }
       if (!Array.isArray(list)) {
-        return jsonResponse({ ok: false, latencyMs, error: "upstream /models returned an unexpected shape" });
+        return jsonResponse({ ok: false, latencyMs, error: `upstream ${catalogLabel} returned an unexpected shape` });
       }
       const models = list.length;
       return jsonResponse({
@@ -1067,7 +1182,11 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
       ...listCatalogNativeSlugs().filter(ns => !disabled.has(ns)),
       ...visibleRouted,
     ];
-    return jsonResponse({ chosen: config.subagentModels ?? [], available });
+    return jsonResponse({
+      chosen: config.subagentModels ?? [],
+      available,
+      ...await subagentMetadata(available, models),
+    });
   }
   if (url.pathname === "/api/subagent-models" && req.method === "PUT") {
     let body: { models?: unknown };
@@ -1078,7 +1197,12 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
     save(config);
     await refreshCodexCatalogBestEffort();
     await syncClaudeAgentDefsBestEffort();
-    return jsonResponse({ ok: true, applied: chosen });
+    const models = await fetchAllModels(config);
+    return jsonResponse({
+      ok: true,
+      applied: chosen,
+      ...await subagentMetadata(chosen, models),
+    });
   }
 
   // Claude Code inbound settings (GUI "Claude ON" toggle + Claude page).
@@ -1427,8 +1551,10 @@ export async function handleManagementAPI(req: Request, url: URL, config: OcxCon
   if (url.pathname === "/api/oauth/logout" && req.method === "POST") {
     const provider = (url.searchParams.get("provider") ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
-    await removeCredential(provider);
+    // Invalidate/abort the in-memory attempt before touching disk. A provider that finishes late
+    // must observe the abort fence instead of recreating the credential after logout.
     clearLoginState(provider);
+    await removeCredential(provider);
     // Drop cached/last-good quota rows tied to the removed credential.
     const { clearProviderQuotaCache } = await import("../providers/quota");
     clearProviderQuotaCache();

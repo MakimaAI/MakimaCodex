@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencodex.local/schemas/oef/policy-pack-v1.schema.json",
+  "title": "OEF Declarative Policy Pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "policy_pack_id", "version", "rules"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "policy_pack_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,98}$" },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "rules": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "when", "require"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,119}$" },
+          "when": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["operation"],
+            "properties": {
+              "operation": { "enum": ["transition", "verdict"] },
+              "transition_to": { "type": "string" },
+              "verdict": { "enum": ["ACCEPT", "REPAIR", "REDISPATCH", "ESCALATE_MODEL", "ESCALATE_ARCHITECTURE", "NEEDS_HUMAN", "BLOCK"] },
+              "risk_levels": { "type": "array", "items": { "enum": ["low", "medium", "high", "critical"] } },
+              "risk_reasons": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            }
+          },
+          "require": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "contract_status": { "enum": ["DRAFT", "PROPOSED", "APPROVED", "REJECTED", "SUPERSEDED"] },
+              "human_approvals": { "type": "integer", "minimum": 0 },
+              "evidence_types": { "type": "array", "items": { "type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9-]*(?:\\.[a-zA-Z0-9][a-zA-Z0-9-]*)+$" } },
+              "all_contract_evidence": { "type": "boolean" }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "when": { "type": "object", "properties": { "operation": { "const": "transition" } } } } },
+            "then": { "properties": { "when": { "type": "object", "not": { "properties": { "verdict": {} }, "required": ["verdict"] } } } }
+          },
+          {
+            "if": { "properties": { "when": { "type": "object", "properties": { "operation": { "const": "verdict" } } } } },
+            "then": { "properties": { "when": { "type": "object", "not": { "properties": { "transition_to": {} }, "required": ["transition_to"] } } } }
+          }
+        ]
+      }
+    }
+  }
+}

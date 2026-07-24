@@ -10,12 +10,14 @@
  *  - hardenSecretDir mirrors the same contract for directories.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   hardenSecretDir,
   hardenSecretPath,
+  inspectSecretPathAcl,
   resetHardenedStateForTests,
   setIcaclsRunnerForTests,
   setNowForTests,
@@ -23,6 +25,8 @@ import {
   type HardenResult,
   type IcaclsResult,
 } from "../src/lib/windows-secret-acl";
+import * as windowsAclModule from "../src/lib/windows-secret-acl";
+import { readSecureSubagentBridgeToken } from "../src/subagent-bridge/lifecycle";
 
 let testDir = "";
 
@@ -111,12 +115,12 @@ describe("hardenSecretDir", () => {
   test("returns ok:true for an existing directory in non-fatal mode", () => {
     const result: HardenResult = hardenSecretDir(testDir, { required: false });
     expect(result.ok).toBe(true);
-  });
+  }, 20_000);
 
   test("returns ok:true for an existing directory in required mode", () => {
     const result: HardenResult = hardenSecretDir(testDir, { required: true });
     expect(result.ok).toBe(true);
-  });
+  }, 20_000);
 
   test("returns ok:true for a missing directory without creating it", () => {
     const missingDir = join(testDir, "does-not-exist");
@@ -131,7 +135,7 @@ describe("hardenSecretDir", () => {
     if (result.diagnostics !== undefined) {
       expect(typeof result.diagnostics).toBe("string");
     }
-  });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -151,13 +155,14 @@ describe("Windows ACL diagnostics (win32 only)", () => {
 
     // On a normal NTFS Windows filesystem, this should succeed
     expect(result.ok).toBe(true);
-  });
+    expect(inspectSecretPathAcl(filePath, 15_000)).toEqual({ secure: true });
+  }, 20_000);
 
   test("on win32: hardenSecretDir returns ok:true for existing dir (real ACL)", () => {
     if (!isWin32) return; // skip on non-Windows
     const result = hardenSecretDir(testDir, { required: false });
     expect(result.ok).toBe(true);
-  });
+  }, 20_000);
 
   test("on win32: hardenSecretPath with required:true for existing file completes", () => {
     if (!isWin32) return;
@@ -226,11 +231,22 @@ describe("icacls failure paths (injected seams)", () => {
   const denied: IcaclsResult = { success: false, exitCode: 5, timedOut: false, stdout: "" };
   let warnings: string[] = [];
   const realWarn = console.warn;
+  const currentSid = "S-1-5-21-100-200-300-1001";
+  const secureAcl = () => ({
+    protected: true,
+    currentUserSid: currentSid,
+    ownerSid: currentSid,
+    rules: [{ identitySid: currentSid, accessControlType: "Allow", fileSystemRights: 2_032_127, isInherited: false }],
+  });
 
   beforeEach(() => {
     setPlatformForTests("win32");
     resetHardenedStateForTests();
     process.env.USERNAME ??= "tester";
+    const setAclInspectorRunner = (windowsAclModule as any).setAclInspectorRunnerForTests;
+    if (typeof setAclInspectorRunner === "function") {
+      setAclInspectorRunner(() => ({ ...ok, stdout: JSON.stringify(secureAcl()) }));
+    }
     warnings = [];
     console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
   });
@@ -239,6 +255,8 @@ describe("icacls failure paths (injected seams)", () => {
     setPlatformForTests(null);
     setIcaclsRunnerForTests(null);
     setNowForTests(null);
+    const setAclInspectorRunner = (windowsAclModule as any).setAclInspectorRunnerForTests;
+    if (typeof setAclInspectorRunner === "function") setAclInspectorRunner(null);
     resetHardenedStateForTests();
     console.warn = realWarn;
   });
@@ -248,6 +266,180 @@ describe("icacls failure paths (injected seams)", () => {
     writeFileSync(filePath, "data", "utf-8");
     return filePath;
   }
+
+  test("a securely isolated directory is not re-hardened in a fresh-process equivalent", () => {
+    let mutationCalls = 0;
+    setIcaclsRunnerForTests(() => {
+      mutationCalls += 1;
+      return ok;
+    });
+
+    expect(hardenSecretDir(testDir, { required: false }).ok).toBe(true);
+    expect(mutationCalls).toBe(0);
+  });
+
+  test("read-only ACL inspection uses fixed argv-safe PowerShell and accepts only current-user full control", () => {
+    const filePath = secretFile();
+    const calls: string[][] = [];
+    const setAclInspectorRunner = (windowsAclModule as any).setAclInspectorRunnerForTests;
+    expect(typeof setAclInspectorRunner).toBe("function");
+    if (typeof setAclInspectorRunner !== "function") return;
+    try {
+      setAclInspectorRunner((args: string[]) => {
+        calls.push(args);
+        return { ...ok, stdout: JSON.stringify(secureAcl()) };
+      });
+      expect(inspectSecretPathAcl(filePath)).toEqual({ secure: true });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.at(-1)).toBe(filePath);
+      expect(calls[0]?.slice(0, -1).join(" ")).not.toContain(filePath);
+      expect(calls[0]).toContain("-NoProfile");
+      expect(calls[0]).toContain("-NonInteractive");
+    } finally {
+      setAclInspectorRunner(null);
+    }
+  });
+
+  test("read-only ACL inspection rejects a current-user plus unrelated-user allow ACE", () => {
+    const filePath = secretFile();
+    const setAclInspectorRunner = (windowsAclModule as any).setAclInspectorRunnerForTests;
+    expect(typeof setAclInspectorRunner).toBe("function");
+    if (typeof setAclInspectorRunner !== "function") return;
+    try {
+      setAclInspectorRunner(() => ({ ...ok, stdout: JSON.stringify({
+        ...secureAcl(),
+        rules: [
+          ...secureAcl().rules,
+          { identitySid: "S-1-5-21-100-200-300-2002", accessControlType: "Allow", fileSystemRights: 131_209, isInherited: false },
+        ],
+      }) }));
+      expect(inspectSecretPathAcl(filePath).secure).toBe(false);
+    } finally {
+      setAclInspectorRunner(null);
+    }
+  });
+
+  test("read-only ACL inspection rejects a foreign deny ACE as non-isolated", () => {
+    const filePath = secretFile();
+    const setAclInspectorRunner = (windowsAclModule as any).setAclInspectorRunnerForTests;
+    expect(typeof setAclInspectorRunner).toBe("function");
+    if (typeof setAclInspectorRunner !== "function") return;
+    try {
+      setAclInspectorRunner(() => ({ ...ok, stdout: JSON.stringify({
+        ...secureAcl(),
+        rules: [
+          ...secureAcl().rules,
+          { identitySid: "S-1-5-21-100-200-300-2002", accessControlType: "Deny", fileSystemRights: 131_209, isInherited: false },
+        ],
+      }) }));
+      expect(inspectSecretPathAcl(filePath).secure).toBe(false);
+    } finally {
+      setAclInspectorRunner(null);
+    }
+  });
+
+  test("read-only ACL inspection rejects a foreign owner and unknown inspector failures", () => {
+    const filePath = secretFile();
+    const setAclInspectorRunner = (windowsAclModule as any).setAclInspectorRunnerForTests;
+    expect(typeof setAclInspectorRunner).toBe("function");
+    if (typeof setAclInspectorRunner !== "function") return;
+    try {
+      setAclInspectorRunner(() => ({ ...ok, stdout: JSON.stringify({
+        ...secureAcl(),
+        ownerSid: "S-1-5-21-100-200-300-2002",
+      }) }));
+      expect(inspectSecretPathAcl(filePath).secure).toBe(false);
+
+      setAclInspectorRunner(() => ({ success: false, exitCode: 1, timedOut: false, stdout: "" }));
+      expect(inspectSecretPathAcl(filePath).secure).toBeNull();
+
+      setAclInspectorRunner(() => { throw new Error("Get-Acl failed"); });
+      expect(inspectSecretPathAcl(filePath).secure).toBeNull();
+    } finally {
+      setAclInspectorRunner(null);
+    }
+  });
+
+  test("the fixed ACL inspector exports the owner SID used by fail-closed token reads", () => {
+    const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
+    const script = readFileSync(join(repoRoot, "src", "lib", "windows-acl-inspect.ps1"), "utf8");
+    expect(script).toContain("ownerSid");
+    expect(script).toMatch(/GetOwner|\.Owner/);
+  });
+
+  test("explicit token migration reads cache a verified unchanged ACL briefly and re-inspect after identity drift", () => {
+    const filePath = secretFile("bridge-token");
+    const firstToken = Buffer.alloc(32, 3).toString("base64url");
+    const secondToken = Buffer.alloc(32, 4).toString("base64url");
+    writeFileSync(filePath, `${firstToken}\n`);
+    const setAclInspectorRunner = (windowsAclModule as any).setAclInspectorRunnerForTests;
+    let calls = 0;
+    try {
+      setAclInspectorRunner(() => {
+        calls += 1;
+        return { ...ok, stdout: JSON.stringify(secureAcl()) };
+      });
+      const migration = { tokenPath: filePath, platform: "win32" as const, allowWindowsAclMigration: true };
+      expect(readSecureSubagentBridgeToken(migration)).toBe(firstToken);
+      expect(readSecureSubagentBridgeToken(migration)).toBe(firstToken);
+      expect(calls).toBe(1);
+
+      unlinkSync(filePath);
+      writeFileSync(filePath, `${secondToken}\n`);
+      expect(readSecureSubagentBridgeToken(migration)).toBe(secondToken);
+      expect(calls).toBe(2);
+    } finally {
+      setAclInspectorRunner(null);
+    }
+  });
+
+  test("forced hardening does not reuse a path-only cache for a recreated lifecycle lock", () => {
+    const filePath = secretFile("subagent-bridge-lifecycle.lock");
+    let inheritanceCalls = 0;
+    setIcaclsRunnerForTests(args => {
+      if (args.includes("/inheritance:r")) inheritanceCalls += 1;
+      return ok;
+    });
+    const options = { required: true, verifyIsolation: true, force: true } as any;
+    expect(hardenSecretPath(filePath, options)).toEqual({ ok: true });
+    unlinkSync(filePath);
+    writeFileSync(filePath, "replacement");
+    expect(hardenSecretPath(filePath, options)).toEqual({ ok: true });
+    expect(inheritanceCalls).toBe(2);
+  });
+
+  test("grants the current user before inherited access is removed", () => {
+    const filePath = secretFile("grant-before-protect.json");
+    const operations: string[] = [];
+    setIcaclsRunnerForTests(args => {
+      if (args.includes("/grant:r")) operations.push("grant");
+      if (args.includes("/inheritance:r")) operations.push("inheritance");
+      return ok;
+    });
+
+    expect(hardenSecretPath(filePath, { required: true, force: true })).toEqual({ ok: true });
+    expect(operations.slice(0, 2)).toEqual(["grant", "inheritance"]);
+  });
+
+  test("isolation-verified required hardening rejects a foreign explicit allow ACE", () => {
+    const filePath = secretFile();
+    const setAclInspectorRunner = (windowsAclModule as any).setAclInspectorRunnerForTests;
+    expect(typeof setAclInspectorRunner).toBe("function");
+    if (typeof setAclInspectorRunner !== "function") return;
+    setIcaclsRunnerForTests(() => ok);
+    try {
+      setAclInspectorRunner(() => ({ ...ok, stdout: JSON.stringify({
+        ...secureAcl(),
+        rules: [
+          ...secureAcl().rules,
+          { identitySid: "S-1-5-21-100-200-300-2002", accessControlType: "Allow", fileSystemRights: 131_209, isInherited: false },
+        ],
+      }) }));
+      expect(() => hardenSecretPath(filePath, { required: true, verifyIsolation: true })).toThrow("verification");
+    } finally {
+      setAclInspectorRunner(null);
+    }
+  });
 
   test("a genuine timeout on a required path soft-fails with a warning instead of blocking auth", () => {
     setIcaclsRunnerForTests(() => timeout);

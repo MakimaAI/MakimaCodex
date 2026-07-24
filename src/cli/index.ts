@@ -37,6 +37,7 @@ import { maybeShowStarPrompt } from "./star-prompt";
 import { maybeShowUpdatePrompt } from "../update/notify";
 import { syncModelsToCodex } from "../codex/sync";
 import { normalizeUpdateChannel, runGuiUpdateWorker } from "../update/job";
+import { subagentBridgeRuntimePortState } from "../subagent-bridge/runtime";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -133,14 +134,16 @@ async function handleStart(options: { block?: boolean } = {}) {
   const requestedPort = parsePortOption();
   reconcileJournal();
   const existingPid = readPid();
-  if (existingPid) {
-    const live = await findLiveProxy();
-    if (live) {
-      console.error(`⚠️  Proxy already running (PID ${live.pid ?? existingPid}, port ${live.port}). Use 'ocx stop' first.`);
-      process.exit(1);
-    }
-    removePid(existingPid);
+  // A proxy can outlive a missing/corrupt pid file. Probe the identity-checked runtime
+  // and configured endpoints before selecting a fallback port, otherwise a second proxy
+  // can shadow the real listener and split Codex/subagent traffic across two processes.
+  const live = await findLiveProxy();
+  if (live) {
+    const identity = live.pid ? `PID ${live.pid}, port ${live.port}` : `port ${live.port}`;
+    console.error(`⚠️  Proxy already running (${identity}). Use 'ocx stop' first.`);
+    process.exit(1);
   }
+  if (existingPid) removePid(existingPid);
 
   // Interactive-only update prompt. Must run BEFORE we bind a port / write a
   // PID: choosing "Update now" installs globally and exits, so we never want a
@@ -178,7 +181,7 @@ async function handleStart(options: { block?: boolean } = {}) {
   writePid(process.pid);
 
   const config = loadConfig();
-  writeRuntimePort({ pid: process.pid, port, hostname: config.hostname });
+  writeRuntimePort(subagentBridgeRuntimePortState(process.pid, port, config.hostname));
   writeJournal();
 
   // Background proactive token refresh. No-op unless config.tokenGuardian.enabled; timer is unref'd
@@ -541,9 +544,9 @@ switch (command) {
     break;
   }
   case "logout": {
-    const { removeCredential } = await import("../oauth/store");
+    const { logoutOAuthProvider } = await import("../oauth/logout-cli");
     const name = (args[1] ?? "").trim().toLowerCase();
-    await removeCredential(name);
+    await logoutOAuthProvider(name);
     console.log(`Logged out of ${name || "(none)"}.`);
     break;
   }
@@ -554,6 +557,62 @@ switch (command) {
   case "v2": {
     const { cmdV2 } = await import("./v2");
     process.exitCode = await cmdV2(args.slice(1), {}, async () => (await findLiveProxy())?.port);
+    break;
+  }
+  case "subagents": {
+    const { cmdSubagents } = await import("./subagents");
+    process.exitCode = cmdSubagents(args.slice(1));
+    break;
+  }
+  case "task":
+  case "contract":
+  case "evidence":
+  case "verdict":
+  case "integrity":
+  case "oef-demo": {
+    const { cmdOefDomain } = await import("./oef");
+    process.exitCode = await cmdOefDomain(command, args.slice(1));
+    break;
+  }
+  case "runtimes":
+  case "runner":
+  case "assignment":
+  case "execution":
+  case "workspace":
+  case "verify":
+  case "oef-phase2-demo": {
+    const { cmdOefPhase2 } = await import("./oef-phase2");
+    process.exitCode = await cmdOefPhase2(command, args.slice(1));
+    break;
+  }
+  case "review":
+  case "oef-phase3-demo": {
+    const { cmdOefPhase3 } = await import("./oef-phase3");
+    process.exitCode = await cmdOefPhase3(command, args.slice(1));
+    break;
+  }
+  case "benchmark":
+  case "oef-phase4-demo": {
+    const { cmdOefPhase4 } = await import("./oef-phase4");
+    process.exitCode = await cmdOefPhase4(command, args.slice(1));
+    break;
+  }
+  case "route":
+  case "team":
+  case "oef-phase5-demo": {
+    const { cmdOefPhase5 } = await import("./oef-phase5");
+    process.exitCode = await cmdOefPhase5(command, args.slice(1));
+    break;
+  }
+  case "memory":
+  case "oef-phase6-demo": {
+    const { cmdOefPhase6 } = await import("./oef-phase6");
+    process.exitCode = await cmdOefPhase6(command, args.slice(1));
+    break;
+  }
+  case "__subagent-bridge-mcp": {
+    const { runSubagentBridgeMcpServer } = await import("../subagent-bridge/mcp");
+    await runSubagentBridgeMcpServer();
     break;
   }
   case "sync-cache": {
@@ -670,6 +729,12 @@ switch (command) {
     break;
   }
   case "models": {
+    const modelLabCommands = new Set(["help", "scan", "list", "show", "aliases", "probe", "screen", "qualify", "compare", "scorecard", "recommend", "requalify", "quarantine"]);
+    if (modelLabCommands.has(args[1] ?? "")) {
+      const { cmdOefPhase4 } = await import("./oef-phase4");
+      process.exitCode = await cmdOefPhase4("models", args.slice(1));
+      break;
+    }
     const { handleModels } = await import("./models");
     handleModels(args.slice(1));
     break;

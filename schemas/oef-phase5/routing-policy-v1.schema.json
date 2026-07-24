@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "policy_id": {
+      "type": "string",
+      "pattern": "^routing-policy:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "profile": {
+      "type": "string",
+      "enum": [
+        "premium",
+        "balanced",
+        "economy",
+        "fast",
+        "private"
+      ]
+    },
+    "weights": {
+      "type": "object",
+      "properties": {
+        "quality": {
+          "type": "number"
+        },
+        "task_similarity": {
+          "type": "number"
+        },
+        "repository_affinity": {
+          "type": "number"
+        },
+        "reliability": {
+          "type": "number"
+        },
+        "availability": {
+          "type": "number"
+        },
+        "cost": {
+          "type": "number"
+        },
+        "latency": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "quality",
+        "task_similarity",
+        "repository_affinity",
+        "reliability",
+        "availability",
+        "cost",
+        "latency"
+      ],
+      "additionalProperties": false
+    },
+    "penalties": {
+      "type": "object",
+      "properties": {
+        "uncertainty": {
+          "type": "number",
+          "minimum": 0
+        },
+        "incident": {
+          "type": "number",
+          "minimum": 0
+        },
+        "staleness": {
+          "type": "number",
+          "minimum": 0
+        },
+        "provider_correlation": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "uncertainty",
+        "incident",
+        "staleness",
+        "provider_correlation"
+      ],
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "top_k_per_role": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "beam_width": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max_roles": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max_parallelism": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "budget_multiplier": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [
+        "top_k_per_role",
+        "beam_width",
+        "max_roles",
+        "max_parallelism",
+        "budget_multiplier"
+      ],
+      "additionalProperties": false
+    },
+    "valid_from": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    },
+    "valid_until": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    },
+    "policy_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "policy_id",
+    "version",
+    "profile",
+    "weights",
+    "penalties",
+    "limits",
+    "valid_from",
+    "valid_until",
+    "policy_hash"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase5/routing-policy-v1.schema.json"
+}

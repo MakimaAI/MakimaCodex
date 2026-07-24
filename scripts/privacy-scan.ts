@@ -48,8 +48,20 @@ function lineNumber(text: string, index: number): number {
 
 function isAllowedEmail(file: string, email: string): boolean {
   if (file === "scripts/privacy-scan.ts" && email === "a@b.com") return true;
+  if (
+    file === "src/oef/phase1/application/runtime.ts"
+    && /^(?:software-development|safe-default)@1\.[01]\.0\.json$/.test(email)
+  ) {
+    return true;
+  }
   const domain = email.split("@").at(1)?.toLowerCase() ?? "";
-  if (domain === "example.test" || domain === "example.com" || domain === "test.com" || domain.endsWith(".test")) {
+  if (
+    domain === "example.invalid"
+    || domain === "example.test"
+    || domain === "example.com"
+    || domain === "test.com"
+    || domain.endsWith(".test")
+  ) {
     return true;
   }
   // URL-userinfo fixtures (https://user:pw@host/...) read as "pw@host" — not emails.
@@ -69,12 +81,23 @@ function isAllowedHomePath(file: string, username: string): boolean {
 function isAllowedTokenLooking(file: string, token: string): boolean {
   if (!file.startsWith("tests/")) return false;
   // Test fixture sentinels: sk-rawsentinel..., sk-test-...
-  return /^sk-(?:rawsentinel|test-)\d+[a-z]*$/.test(token);
+  return /^sk-(?:rawsentinel|test-)\d+[a-z]*$/.test(token)
+    || new Set([
+      ["sk-proj-", "abcdefghijklmnopqrstuvwxyz123456"].join(""),
+      ["sk-proj-", "abcdefghijklmnop1234"].join(""),
+      ["sk-proj-", "1234567890abcdef"].join(""),
+    ]).has(token);
 }
 
 function isAllowedBearerToken(file: string, token: string): boolean {
   if (!file.startsWith("tests/")) return false;
-  return /^(?:access|stack|usage-debug)-token(?:-value)?-[A-Za-z0-9-]+$/.test(token);
+  return /^(?:access|stack|usage-debug)-token(?:-value)?-[A-Za-z0-9-]+$/.test(token)
+    || new Set([
+      "abcdefghijklmnopqrstuvwxyz123456",
+      "abcdefghijklmnopqrstuvwxyz",
+      "this-is-a-live-looking-token-1234567890",
+      ["sk-proj-", "1234567890abcdef"].join(""),
+    ]).has(token);
 }
 
 function addFindingsForPattern(

@@ -29,7 +29,7 @@ function nativeTemplate(): Record<string, unknown> {
 }
 
 const EXPECTED_KEY_PROVIDER_IDS = [
-  "anthropic-apikey", "openai-apikey", "umans", "opencode-go", "neuralwatt", "openrouter", "orcarouter", "groq", "google", "google-vertex", "azure-openai",
+  "cline-pass", "anthropic-apikey", "openai-apikey", "umans", "opencode-go", "neuralwatt", "openrouter", "orcarouter", "groq", "google", "google-vertex", "azure-openai",
   "deepseek", "cerebras", "together", "fireworks", "firepass", "moonshot",
   "huggingface", "nvidia", "venice", "zai", "nanogpt", "synthetic", "qwen-cloud",
   "qianfan", "alibaba", "alibaba-token-plan", "alibaba-token-plan-intl", "parallel", "zenmux", "litellm", "ollama-cloud", "mistral",
@@ -38,6 +38,32 @@ const EXPECTED_KEY_PROVIDER_IDS = [
 ];
 
 describe("provider registry parity", () => {
+  test("Cline account and ClinePass subscription are separate canonical providers", () => {
+    expect(PROVIDER_REGISTRY.find(entry => entry.id === "cline")).toMatchObject({
+      label: "Cline",
+      adapter: "openai-chat",
+      baseUrl: "https://api.cline.bot/api/v1",
+      authKind: "oauth",
+      oauthId: "cline",
+      featured: true,
+      defaultModel: "anthropic/claude-opus-4.6",
+    });
+    expect(PROVIDER_REGISTRY.find(entry => entry.id === "cline-pass")).toMatchObject({
+      label: "ClinePass",
+      adapter: "openai-chat",
+      baseUrl: "https://api.cline.bot/api/v1",
+      authKind: "key",
+      featured: true,
+      defaultModel: "kimi-k2.7-code",
+      models: [
+        "glm-5.2", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6",
+        "deepseek-v4-pro", "deepseek-v4-flash", "mimo-v2.5",
+        "mimo-v2.5-pro", "minimax-m3", "qwen3.7-max", "qwen3.7-plus",
+      ],
+    });
+    expect(OAUTH_PROVIDERS.cline.providerConfig.authMode).toBe("oauth");
+  });
+
   test("registry ids are unique", () => {
     const ids = PROVIDER_REGISTRY.map(entry => entry.id);
     expect(new Set(ids).size).toBe(ids.length);
@@ -556,7 +582,7 @@ describe("provider registry parity", () => {
   test("GUI preset projection preserves current featured set plus key catalog and custom", () => {
     const featured = deriveFeaturedProviderIds();
     expect(featured).toEqual([
-      "openai", "xai", "anthropic", "anthropic-apikey", "kimi", "openai-apikey", "umans", "opencode-go", "openrouter",
+      "openai", "cline", "cline-pass", "xai", "anthropic", "anthropic-apikey", "kimi", "openai-apikey", "umans", "opencode-go", "openrouter",
       "groq", "google", "azure-openai", "ollama", "vllm", "lm-studio", "opencode-free",
       "mimo-free",
     ]);

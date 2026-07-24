@@ -28,11 +28,13 @@ import {
   formatProviderDisplayName,
   isCatalogProviderId,
   providerBrandColor,
+  providerIconSrc,
 } from "../gui/src/provider-icons";
 import {
   bucketPresets,
   filterPresets,
   presetTier,
+  providerPresetDescriptionKey,
   sortPresets,
   type CatalogPreset,
 } from "../gui/src/components/provider-catalog/provider-presets";
@@ -455,6 +457,21 @@ describe("provider-icons", () => {
     expect(formatProviderDisplayName("openai")).toBe("OpenAI (Codex login)");
     expect(formatProviderDisplayName("openai-apikey")).toBe("OpenAI API");
     expect(formatProviderDisplayName("chatgpt")).toBe("ChatGPT");
+  });
+
+  test("Cline and ClinePass share the official Cline brand treatment", () => {
+    expect(formatProviderDisplayName("cline")).toBe("Cline");
+    expect(formatProviderDisplayName("cline-pass")).toBe("ClinePass");
+    expect(providerIconSrc("cline")).toBe("/provider-icons/cline.svg");
+    expect(providerIconSrc("cline-pass")).toBe("/provider-icons/cline.svg");
+    expect(providerBrandColor("cline")).toBe("#F26C4F");
+    expect(isCatalogProviderId("cline-pass")).toBe(true);
+  });
+
+  test("Cline catalog descriptions are localized by provider id", () => {
+    expect(providerPresetDescriptionKey({ id: "cline" })).toBe("prov.clineDesc");
+    expect(providerPresetDescriptionKey({ id: "cline-pass" })).toBe("prov.clinePassDesc");
+    expect(providerPresetDescriptionKey({ id: "custom" })).toBeNull();
   });
 
   test("unknown simple ids are title-cased; mixedCase custom names pass through", () => {

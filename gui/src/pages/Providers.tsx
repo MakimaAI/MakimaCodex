@@ -21,7 +21,7 @@ import { apiErrorMessage } from "../api-error";
 interface Config {
   port: number;
   defaultProvider: string;
-  providers: Record<string, { adapter: string; baseUrl: string; hasApiKey?: boolean; hasHeaders?: boolean; defaultModel?: string; models?: string[]; authMode?: string; keyOptional?: boolean; disabled?: boolean; note?: string; codexAccountMode?: "direct" | "pool" }>;
+  providers: Record<string, WorkspaceProvider & { codexAccountMode?: "direct" | "pool" }>;
 }
 
 interface OAuthStatus { loggedIn: boolean; email?: string; error?: string; done?: boolean; needsReauth?: boolean; activeAccountId?: string | null }
@@ -36,6 +36,7 @@ function resolvedOpenAiAccountMode(provider: Config["providers"][string]): OpenA
 
 // Friendly labels for the OAuth providers the proxy supports.
 const OAUTH_LABELS: Record<string, string> = {
+  cline: "Cline",
   xai: "xAI (Grok)",
   anthropic: "Anthropic (Claude)",
   kimi: "Kimi (Moonshot)",
@@ -830,7 +831,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
         && !oauthProviders.includes(name))
       .map(([name, prov]) => ({
         id: name,
-        label: name,
+        label: name === "cline-pass" ? formatProviderDisplayName(name) : name,
         kind: "key" as const,
         statusLabel: prov.keyOptional && !prov.hasApiKey ? t("modal.badge.free") : t("prov.hasApiKey"),
       })),
@@ -1046,7 +1047,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
               <div key={p} className="oauth-row">
                 <span className="oauth-name" title={oauthLabel(p)}>
                   <span className="provider-icon provider-icon-sm">{icon && <img src={icon} alt="" aria-hidden="true" />}</span>
-                  <span className="oauth-name-text">{p}</span>
+                  <span className="oauth-name-text">{oauthLabel(p)}</span>
                 </span>
                 <span className="oauth-status">
                   <span className={`dot ${st.loggedIn ? "dot-green" : "dot-muted"}`} />
@@ -1125,7 +1126,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
               <div key={name} className="oauth-row">
                 <span className="oauth-name" title={name}>
                   <span className="provider-icon provider-icon-sm">{icon && <img src={icon} alt="" aria-hidden="true" />}</span>
-                  <span className="oauth-name-text">{name}</span>
+                  <span className="oauth-name-text">{name === "cline-pass" ? formatProviderDisplayName(name) : name}</span>
                 </span>
                 <span className="oauth-status">
                   <span className={`dot ${missingOpenAiKey ? "dot-amber" : "dot-green"}`} />
@@ -1170,6 +1171,10 @@ export default function Providers({ apiBase }: { apiBase: string }) {
                 ? t("prov.openaiPoolDesc")
                 : name === "openai-apikey"
                   ? t("prov.openaiApiDesc")
+                  : name === "cline"
+                    ? t("prov.clineDesc")
+                    : name === "cline-pass"
+                      ? t("prov.clinePassDesc")
                   : prov.note;
             return (
               <div key={name} className={`card prov-card${isDisabled ? " prov-card-disabled" : ""}`}>

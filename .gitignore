@@ -10,6 +10,9 @@ devlog/
 # Local agent/session artifacts
 .codexclaw/
 .omo/
+.opencodex/
+.superpowers/
+/work/
 
 # Test-generated artifacts
 tests/.tmp-*/

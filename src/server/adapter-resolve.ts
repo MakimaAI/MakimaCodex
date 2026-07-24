@@ -6,21 +6,13 @@ import { createKiroAdapter } from "../adapters/kiro";
 import { createMimoFreeAdapter } from "../adapters/mimo-free";
 import { createOpenAIChatAdapter } from "../adapters/openai-chat";
 import { createResponsesPassthroughAdapter } from "../adapters/openai-responses";
+import { resolveWireAdapterName } from "../providers/wire-protocol";
 import type { OcxProviderConfig } from "../types";
-
-/** Providers whose listed model ids must be driven over the Anthropic wire even if the provider's
- *  configured adapter is something else (the upstream only speaks Anthropic for these models). */
-const ANTHROPIC_WIRE_MODELS: Record<string, Set<string>> = {
-  "opencode-go": new Set(["minimax-m2.5", "minimax-m2.7", "minimax-m3"]),
-};
 
 /** Return a provider config whose adapter is forced to "anthropic" when the model id is wire-pinned. */
 export function resolveWireProtocolOverride(providerName: string, modelId: string, providerConfig: OcxProviderConfig): OcxProviderConfig {
-  const overrideSet = ANTHROPIC_WIRE_MODELS[providerName];
-  if (overrideSet?.has(modelId) && providerConfig.adapter !== "anthropic") {
-    return { ...providerConfig, adapter: "anthropic" };
-  }
-  return providerConfig;
+  const adapter = resolveWireAdapterName(providerName, modelId, providerConfig.adapter);
+  return adapter === providerConfig.adapter ? providerConfig : { ...providerConfig, adapter };
 }
 
 /** Build the provider adapter for a resolved provider config. */

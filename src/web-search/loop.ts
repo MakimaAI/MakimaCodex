@@ -109,6 +109,7 @@ function extractIterationThinking(events: AdapterEvent[]): OcxThinkingContent | 
   const redacted: string[] = [];
   for (const e of events) {
     if (e.type === "thinking_delta") thinking += e.thinking;
+    else if (e.type === "reasoning_raw_delta") thinking += e.text;
     else if (e.type === "thinking_signature") signature = e.signature;
     else if (e.type === "redacted_thinking") redacted.push(e.data);
   }
@@ -188,11 +189,24 @@ export interface WebSearchLoopDeps {
   stallTimeoutSec?: number;
   /** One-shot TTFT callback: first non-empty model output observed (WP4). */
   onFirstOutput?: () => void;
+  /** Promote openai-chat raw reasoning into the native Responses summary channel. */
+  promoteRawReasoningToSummary?: boolean;
+  /** Keep raw reasoning envelope-only; explicit suppression wins over promotion. */
+  hideRawReasoningSummary?: boolean;
+  /** Recovered handoff content requires status-only provider/adapter failures. */
+  sensitiveHandoff?: boolean;
   /**
    * 429 key-failover hook: rotate the provider's active pool key and return a rebuilt adapter,
    * or null when the pool is exhausted (same semantics as the normal routed path).
    */
   on429?: (retryAfterHeader: string | null) => ProviderAdapter | null;
+  /** Async 402/429 recovery hook for OAuth accounts and tentative key candidates. */
+  onQuota?: (
+    status: 402 | 429,
+    retryAfterHeader: string | null,
+  ) => ProviderAdapter | null | Promise<ProviderAdapter | null>;
+  /** Called only after the recovered response stream completes successfully. */
+  onQuotaRecovered?: () => void | Promise<void>;
 }
 
 /**
@@ -239,6 +253,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
   interface IterationResponse {
     response: Response;
     responseAdapter: ProviderAdapter;
+    quotaRecovered?: boolean;
   }
   type IterationSplit = ReturnType<typeof scanEventsForWebSearch>;
 
@@ -292,10 +307,18 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       };
 
       let prepared = await fetchOnce(adapter);
+      let quotaRecovered = false;
       // 429 key-failover parity with the normal routed path: rotate pool keys until one responds
       // or the pool is exhausted (deps.on429 returns null — cooldown map guarantees termination).
-      while (prepared.response.status === 429 && deps.on429) {
-        const rotated = deps.on429(prepared.response.headers.get("retry-after"));
+      while (
+        (prepared.response.status === 402 || prepared.response.status === 429)
+        && (deps.onQuota || (prepared.response.status === 429 && deps.on429))
+      ) {
+        const status = prepared.response.status as 402 | 429;
+        const retryAfter = prepared.response.headers.get("retry-after");
+        const rotated = deps.onQuota
+          ? await deps.onQuota(status, retryAfter)
+          : deps.on429?.(retryAfter) ?? null;
         if (!rotated) break;
         // Never let a broken body's cancel promise outlive the cumulative header deadline. Observe
         // it, but proceed immediately to the rotated fetch under the SAME deadline signal.
@@ -304,6 +327,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         // Stall-watchdog seam between bounded retry fetches (audit 011 B3).
         yield { type: "heartbeat" };
         prepared = await fetchOnce(adapter);
+        quotaRecovered = true;
       }
 
       // Final headers have arrived. Clear only the deadline timer before ANY body read.
@@ -333,7 +357,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         const suffix = formatted ? `: ${formatted.slice(0, 400)}` : "";
         throw new LoopError(prepared.response.status, `Provider error ${prepared.response.status}${suffix}`);
       }
-      return prepared;
+      return quotaRecovered ? { ...prepared, quotaRecovered: true } : prepared;
     } catch (error) {
       if (headerDeadline.didExpire()) {
         throw new LoopError(504, `Provider response-header timeout after ${connectTimeoutMs}ms during web-search`);
@@ -479,7 +503,9 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
     firstPrepared = await prepareIterationDrained(false);
   } catch (e) {
     if (abortSignal) abortSignal.removeEventListener("abort", linkAbort);
-    if (e instanceof LoopError) return jsonError(e.status, e.message);
+    if (e instanceof LoopError) {
+      return jsonError(e.status, deps.sensitiveHandoff ? `Provider error ${e.status}` : e.message);
+    }
     throw e;
   }
 
@@ -508,6 +534,10 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           }
           // Raw-byte progress heartbeats reach the bridge; semantic events remain buffered.
           const split = yield* consumeIterationEvents(prepared);
+          if (prepared.quotaRecovered) {
+            await deps.onQuotaRecovered?.();
+            prepared.quotaRecovered = false;
+          }
 
           // Loop (search + re-ask) ONLY when the model's actionable output is purely web_search. A real
           // tool call (e.g. shell/apply_patch) means this turn is terminal for Codex — finalize so those
@@ -527,6 +557,12 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           }
           // The thinking that led to the search belongs to the FIRST call's assistant replay turn.
           const iterationThinking = extractIterationThinking(split.passthrough);
+          // Intermediate assistant text and its terminal event stay suppressed, but raw reasoning
+          // is part of the user-visible/hidden Responses contract. Send only those deltas through
+          // the bridge before the search cell; the bridge decides summary vs ocxr1 envelope.
+          for (const event of split.passthrough) {
+            if (event.type === "reasoning_raw_delta") yield event;
+          }
           for (const [callIndex, call] of split.calls.entries()) {
             yield* runSearchCall(call, callIndex === 0 ? iterationThinking : null);
           }
@@ -551,6 +587,9 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
     {
       ...(deps.forceEmptyResponseId ? { responseId: "" } : {}),
       hideThinkingSummary: parsed.options.hideThinkingSummary,
+      sensitiveHandoff: deps.sensitiveHandoff,
+      promoteRawReasoningToSummary: deps.promoteRawReasoningToSummary,
+      hideRawReasoningSummary: deps.hideRawReasoningSummary,
       ...(deps.stallTimeoutSec !== undefined ? { stallTimeoutSec: deps.stallTimeoutSec } : {}),
       ...(deps.onFirstOutput ? { onFirstOutput: deps.onFirstOutput } : {}),
     },

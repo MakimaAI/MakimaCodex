@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "finding_validation_id": {
+      "type": "string",
+      "pattern": "^finding-validation:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "finding_id": {
+      "type": "string",
+      "pattern": "^review-finding:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "review_plan_id": {
+      "type": "string",
+      "pattern": "^review-plan:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "snapshot_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "CONFIRMED",
+        "DISMISSED",
+        "DUPLICATE",
+        "STALE"
+      ]
+    },
+    "effective_severity": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW",
+            "INFO"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidence_strength": {
+      "type": "string",
+      "enum": [
+        "AUTHORITATIVE",
+        "STRONG",
+        "SUPPORTED",
+        "OPINION",
+        "UNSUPPORTED"
+      ]
+    },
+    "validated_by": {
+      "minItems": 1,
+      "maxItems": 32,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]*$"
+      }
+    },
+    "validator_binding_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^reviewer-binding:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "validation_artifact_ref": {
+      "type": "string",
+      "pattern": "^artifact:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "finding_validation_id",
+    "finding_id",
+    "review_plan_id",
+    "snapshot_hash",
+    "status",
+    "effective_severity",
+    "evidence_strength",
+    "validated_by",
+    "validator_binding_id",
+    "validation_artifact_ref",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase3/finding-validation-v1.schema.json"
+}

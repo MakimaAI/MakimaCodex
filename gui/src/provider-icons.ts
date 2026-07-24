@@ -1,4 +1,6 @@
 const PROVIDER_ICON_ALIASES: Record<string, string> = {
+  cline: "cline.svg",
+  "cline-pass": "cline.svg",
   anthropic: "claude-color.svg",
   "anthropic-apikey": "claude-color.svg",
   "azure-openai": "openai.svg",
@@ -46,6 +48,8 @@ const PROVIDER_ICON_ALIASES: Record<string, string> = {
 
 /** Brand colors for monochrome Simple-Icons SVGs (fill is black by default). */
 const PROVIDER_BRAND_COLORS: Record<string, string> = {
+  cline: "#F26C4F",
+  "cline-pass": "#F26C4F",
   nvidia: "#76B900",
   "mimo-free": "#FF6900",
   xiaomi: "#FF6900",
@@ -75,6 +79,8 @@ const PROVIDER_BRAND_COLORS: Record<string, string> = {
  * Current OpenAI ids follow the registry labels; legacy `chatgpt` keeps its historical label.
  */
 const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  cline: "Cline",
+  "cline-pass": "ClinePass",
   anthropic: "Anthropic Claude",
   "anthropic-apikey": "Anthropic Claude",
   chatgpt: "ChatGPT",

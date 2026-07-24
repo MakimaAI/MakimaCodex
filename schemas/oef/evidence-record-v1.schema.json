@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencodex.local/schemas/oef/evidence-record-v1.schema.json",
+  "title": "OEF Evidence Record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "evidence_id", "task_id", "contract_revision_id", "criterion_key", "type", "status", "producer", "summary", "artifacts", "environment", "created_at", "verified_at"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "evidence_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": "string", "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$" },
+    "contract_revision_id": { "type": "string", "minLength": 1 },
+    "criterion_key": { "type": "string", "minLength": 1 },
+    "type": { "type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9-]*(?:\\.[a-zA-Z0-9][a-zA-Z0-9-]*)+$" },
+    "status": { "enum": ["RECORDED", "VERIFIED", "REJECTED", "INVALIDATED", "STALE"] },
+    "producer": { "$ref": "actor-v1.schema.json" },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 10000 },
+    "artifacts": { "type": "array", "maxItems": 64, "items": { "$ref": "artifact-ref-v1.schema.json" } },
+    "environment": { "type": "object" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "verified_at": { "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] }
+  }
+}

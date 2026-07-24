@@ -4,11 +4,24 @@ import { IconArrowUp, IconArrowDown, IconX, IconCheck, IconSearch, IconBot, Icon
 import { useT } from "../i18n/shared";
 import { Trans } from "../i18n/provider";
 import { modelLabel } from "../model-display";
+import {
+  isRecord,
+  mergeSubagentModelRows,
+  normalizeBridge,
+  normalizeSubagentModelsResponse,
+  stringList,
+  type SubagentBridgeState,
+  type SubagentModelRow,
+} from "./subagent-view";
+import { SubagentBridgePresentation, SubagentCompatibilityBadge } from "./SubagentBridgePresentation";
 
 export default function Subagents({ apiBase }: { apiBase: string }) {
   const t = useT();
   const [available, setAvailable] = useState<string[]>([]);
   const [chosen, setChosen] = useState<string[]>([]);
+  const [models, setModels] = useState<SubagentModelRow[]>([]);
+  const [bridge, setBridge] = useState<SubagentBridgeState | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   const [ok, setOk] = useState(false);
@@ -19,10 +32,12 @@ export default function Subagents({ apiBase }: { apiBase: string }) {
   const load = useCallback(async () => {
     try {
       const r = await fetch(`${apiBase}/api/subagent-models`).then(res => res.json());
-      const avail: string[] = r.available ?? [];
-      const availSet = new Set(avail);
-      setAvailable(avail);
-      setChosen((r.chosen ?? []).filter((m: string) => availSet.has(m)));
+      const next = normalizeSubagentModelsResponse(r);
+      setAvailable(next.available);
+      setChosen(next.chosen);
+      setModels(next.models);
+      setBridge(next.bridge);
+      setWarnings(next.warnings);
     } catch {
       setOk(false);
       setStatus(t("sub.loadFail"));
@@ -61,9 +76,17 @@ export default function Subagents({ apiBase }: { apiBase: string }) {
       });
       const d = await r.json();
       setOk(r.ok);
+      if (r.ok) {
+        if (isRecord(d.bridge)) setBridge(normalizeBridge(d.bridge));
+        if (Array.isArray(d.models)) {
+          const updates = d.models.filter((row: unknown): row is SubagentModelRow => isRecord(row) && typeof row.id === "string");
+          setModels(prev => mergeSubagentModelRows(prev, updates));
+        }
+        setWarnings(stringList(d.warnings));
+      }
       setStatus(r.ok
         ? t("sub.saved", { n: d.applied?.length ?? 0, cmd: "ocx sync" })
-        : (d.error || t("sub.saveFailed")));
+        : t("sub.saveFailed"));
     } catch {
       setOk(false);
       setStatus(t("sub.networkError"));
@@ -74,6 +97,7 @@ export default function Subagents({ apiBase }: { apiBase: string }) {
     const q = query.trim().toLowerCase();
     return available.filter(m => !q || m.toLowerCase().includes(q));
   }, [available, query]);
+  const modelById = useMemo(() => new Map(models.map(model => [model.id, model])), [models]);
 
   if (loading) return <div className="muted" style={{ padding: 8 }}>{t("sub.loading")}</div>;
 
@@ -81,6 +105,8 @@ export default function Subagents({ apiBase }: { apiBase: string }) {
     <>
       <div className="page-head"><h2>{t("nav.subagents")}</h2></div>
       <p className="page-sub"><Trans k="sub.subtitle" cmd="spawn_agent" /></p>
+
+      <SubagentBridgePresentation bridge={bridge} warnings={warnings} />
 
       {status && <Notice tone={ok ? "ok" : "err"}>{status}</Notice>}
 
@@ -97,6 +123,7 @@ export default function Subagents({ apiBase }: { apiBase: string }) {
             <div key={m} className="card panel-accent row" style={{ padding: "8px 12px", gap: 10 }}>
               <span className="mono font-bold" style={{ width: 18, color: "var(--accent)" }}>{i + 1}</span>
               <code className="mono" style={{ flex: 1, color: "var(--text)" }}>{modelLabel(m)}</code>
+              <SubagentCompatibilityBadge row={modelById.get(m)} />
               <button type="button" className="btn btn-ghost btn-icon btn-sm" onClick={() => move(i, -1)} disabled={i === 0} aria-label={t("sub.moveUp", { m })}>
                 <IconArrowUp />
               </button>
@@ -145,7 +172,8 @@ export default function Subagents({ apiBase }: { apiBase: string }) {
                 {sel && <IconCheck style={{ width: 16, height: 16 }} />}
               </span>
               <IconBot style={{ width: 15, height: 15, color: "var(--faint)", flexShrink: 0 }} />
-              <code className="mono" style={{ color: "var(--text)" }}>{modelLabel(m)}</code>
+              <code className="mono" style={{ color: "var(--text)", flex: 1, textAlign: "left" }}>{modelLabel(m)}</code>
+              <SubagentCompatibilityBadge row={modelById.get(m)} />
             </button>
           );
         })}

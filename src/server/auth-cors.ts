@@ -52,23 +52,33 @@ export function isSameOriginAsRequest(req: Request, origin: string): boolean {
   }
 }
 
+function isExtraAllowedOrigin(origin: string, config: OcxConfig): boolean {
+  if (!config.corsAllowOrigins?.length) return false;
+  return config.corsAllowOrigins.some(allowed => {
+    try {
+      return new URL(allowed).origin === new URL(origin).origin;
+    } catch {
+      return allowed === origin;
+    }
+  });
+}
+
+/** Data-plane policy: preserve browser clients hosted on another loopback port. */
 export function isAllowedRequestOrigin(req: Request, config: OcxConfig): boolean {
-  function isExtraAllowedOrigin(origin: string, cfg: OcxConfig): boolean {
-    if (!cfg.corsAllowOrigins?.length) return false;
-    return cfg.corsAllowOrigins.some(allowed => {
-      try {
-        return new URL(allowed).origin === new URL(origin).origin;
-      } catch {
-        return allowed === origin;
-      }
-    });
-  }
   const origin = req.headers.get("Origin");
   if (!isApiAuthRequired(config)) {
     if (!isLoopbackRequestHost(req.headers.get("Host"))) return false;
     return !origin || isLoopbackOriginValue(origin) || isExtraAllowedOrigin(origin, config);
   }
   return !origin || isLoopbackOriginValue(origin) || isSameOriginAsRequest(req, origin) || isExtraAllowedOrigin(origin, config);
+}
+
+/** Management policy: originless local tools are allowed; browsers need exact origin/allowlist. */
+export function isAllowedManagementRequestOrigin(req: Request, config: OcxConfig): boolean {
+  const origin = req.headers.get("Origin");
+  if (!isApiAuthRequired(config) && !isLoopbackRequestHost(req.headers.get("Host"))) return false;
+  if (!origin) return true;
+  return isSameOriginAsRequest(req, origin) || isExtraAllowedOrigin(origin, config);
 }
 
 export function corsHeaders(req?: Request, config?: OcxConfig): Record<string, string> {
@@ -198,6 +208,9 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
     return "provider must be a plain object";
   }
   const raw = provider as Record<string, unknown>;
+  if (Object.hasOwn(raw, "showRawReasoning") && typeof raw.showRawReasoning !== "boolean") {
+    return `provider ${name} showRawReasoning must be a boolean`;
+  }
   for (const field of FORBIDDEN_PROVIDER_RUNTIME_FIELDS) {
     if (Object.hasOwn(raw, field)) return `provider ${name} must not include runtime field "${field}"`;
   }
@@ -283,6 +296,7 @@ export function safeConfigDTO(config: OcxConfig): unknown {
       "defaultModel",
       "disabled",
       "allowPrivateNetwork",
+      "showRawReasoning",
       "authMode",
       "keyOptional",
       "freeTier",

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IconX, IconLock, IconKey, IconExternal } from "../icons";
 import { useT } from "../i18n";
 import {
@@ -12,7 +12,7 @@ import { oauthTosRisk } from "../oauth-tos-risk";
 import OAuthTosWarningModal from "./OAuthTosWarningModal";
 import ProviderCatalog from "./provider-catalog/ProviderCatalog";
 import type { AccountLoginRow, AccountLoginStatus } from "./provider-catalog/ProviderCatalog";
-import type { CatalogPreset } from "./provider-catalog/provider-presets";
+import { providerPresetDescriptionKey, type CatalogPreset } from "./provider-catalog/provider-presets";
 import { baseUrlForChoice, matchChoiceId, resolvedBaseUrlForChoice } from "../base-url-choice";
 
 export type ProviderConfig = ProviderPayload;
@@ -72,7 +72,20 @@ export default function AddProviderModal({
   const aliveRef = useRef(true);
   const loadedPresetsRef = useRef(false);
   const previousFocusRef = useRef<HTMLElement | null>(null);
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  const closeModal = useCallback(() => {
+    onClose();
+  }, [onClose]);
+
+  const handleCancel = useCallback((event: React.SyntheticEvent<HTMLDialogElement>) => {
+    event.preventDefault();
+    closeModal();
+  }, [closeModal]);
+
+  const handleBackdropClick = useCallback((event: React.MouseEvent<HTMLDialogElement>) => {
+    if (event.target === event.currentTarget) closeModal();
+  }, [closeModal]);
 
   // Refresh OAuth status once when the modal opens (not when fetchOauth identity changes).
   useEffect(() => {
@@ -80,26 +93,14 @@ export default function AddProviderModal({
     previousFocusRef.current = document.activeElement as HTMLElement | null;
     onOpen?.();
     const dialog = dialogRef.current;
-    if (dialog) {
-      const focusable = dialog.querySelector<HTMLElement>(
-        "input:not([disabled]), button:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
-      );
-      if (focusable) focusable.focus();
-    }
+    if (dialog && !dialog.open) dialog.showModal();
     return () => {
       aliveRef.current = false;
+      if (dialog && dialog.open) dialog.close();
       previousFocusRef.current?.focus();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only open hook
   }, []);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      // Child ToS warning owns Escape while it is open.
-      if (e.key === "Escape" && !oauthTosPending) onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, oauthTosPending]);
   useEffect(() => {
     fetch(`${apiBase}/api/oauth/providers`).then(r => r.json()).then(d => setOauthSupported(d.providers ?? [])).catch(() => {});
   }, [apiBase]);
@@ -127,6 +128,8 @@ export default function AddProviderModal({
   }, [fallbackPresets]);
 
   const presetDescription = (candidate: Preset): string | undefined => {
+    const providerKey = providerPresetDescriptionKey(candidate);
+    if (providerKey) return t(providerKey);
     const key = codexPresetDescriptionKey(candidate);
     return key ? t(key) : candidate.note;
   };
@@ -304,11 +307,17 @@ export default function AddProviderModal({
 
   return (
     <>
-    <div role="dialog" aria-modal="true" aria-label={t("modal.add")} className="modal-overlay" onClick={onClose}>
-      <div ref={dialogRef} className="modal-card" onClick={e => e.stopPropagation()}>
+    <dialog
+      ref={dialogRef}
+      aria-label={t("modal.add")}
+      className="modal-overlay"
+      onCancel={handleCancel}
+      onClick={handleBackdropClick}
+    >
+      <div className="modal-card" onClick={e => e.stopPropagation()}>
         <div className="modal-head">
           <h3>{preset ? t("modal.addNamed", { label: preset.label }) : t("modal.add")}</h3>
-          <button className="btn btn-ghost btn-icon" aria-label={t("common.close")} onClick={onClose}><IconX /></button>
+          <button className="btn btn-ghost btn-icon" aria-label={t("common.close")} onClick={closeModal}><IconX /></button>
         </div>
 
         {!preset ? (
@@ -330,7 +339,7 @@ export default function AddProviderModal({
           preset.auth === "oauth" && form.authMode === "oauth" ? (
             // OAuth login pane
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <div className="muted text-control">{preset.note ?? t("modal.oauthDefaultNote")}</div>
+              <div className="muted text-control">{presetDescription(preset) ?? t("modal.oauthDefaultNote")}</div>
               {oauthSupported.includes(preset.oauthProvider ?? "") ? (
                 <button className="btn btn-primary" onClick={() => requestLoginOAuth(preset.oauthProvider!)} disabled={oauthBusy}
                   style={{ width: "100%", padding: "12px 16px" }}>
@@ -406,7 +415,7 @@ export default function AddProviderModal({
           ) : (
             // API key / Codex-forward / free-tier form
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {!isReservedForward && !isCustom && !isLocal && !preset.keyOptional && preset.note && (
+              {!isReservedForward && !isCustom && !isLocal && !preset.keyOptional && presetDescription(preset) && (
                 <details className="setup-guide">
                   <summary>{t("modal.setupGuide")}</summary>
                   <ol className="text-label leading-relaxed" style={{ margin: "8px 0 0", paddingLeft: 18, color: "var(--muted)" }}>
@@ -420,7 +429,7 @@ export default function AddProviderModal({
                     <li>{t("modal.setupStep2")}</li>
                     <li>{t("modal.setupStep3")}</li>
                   </ol>
-                 {preset.note && <div className="text-label" style={{ color: "var(--muted)", marginTop: 6, fontStyle: "italic" }}>{preset.note}</div>}
+                 {presetDescription(preset) && <div className="text-label" style={{ color: "var(--muted)", marginTop: 6, fontStyle: "italic" }}>{presetDescription(preset)}</div>}
                   {/\{[^}]*\}/.test(form.baseUrl) && (<div className="text-label" style={{ color: "var(--amber)", marginTop: 6 }}>{t("modal.baseUrlPlaceholderHint")}</div>)}
                 </details>
               )}
@@ -520,7 +529,7 @@ export default function AddProviderModal({
           )
         )}
       </div>
-    </div>
+    </dialog>
     {oauthTosPending && (
       <OAuthTosWarningModal
         key={oauthTosPending}

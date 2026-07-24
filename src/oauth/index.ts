@@ -3,7 +3,7 @@ import { parseCallbackInput } from "./callback-server";
 import type { OcxConfig, OcxProviderConfig, RefreshPolicy } from "../types";
 import { loadConfig, resolveEnvValue, saveConfig } from "../config";
 import { maskEmail } from "../lib/privacy";
-import { getAccountCredential, getAccountSet, saveAccountCredential, saveCredential, markAccountNeedsReauth, getCredential, credentialGeneration, createOAuthRefreshIntentLock, mergeAccountCredential, markAccountNeedsReauthIfGeneration } from "./store";
+import { getAccountCredential, getAccountSet, saveAccountCredential, saveCredential, markAccountNeedsReauth, getCredential, credentialGeneration, createOAuthRefreshIntentLock, mergeAccountCredential, markAccountNeedsReauthIfGeneration, nextAccountAfterFailure, setActiveAccountIfCurrent, snapshotLoginFenceGeneration } from "./store";
 import { loginXai, refreshXaiToken, XAI_LOCAL_CLI_DETACH_WARNING, XaiTokenRequestError } from "./xai";
 import { ANTHROPIC_OAUTH_BETA, loginAnthropic, refreshAnthropicToken } from "./anthropic";
 import { loginKimi, refreshKimiToken } from "./kimi";
@@ -12,6 +12,7 @@ import { loginChatGPT, refreshChatGPTToken } from "./chatgpt";
 import { loginAntigravity, refreshAntigravityToken } from "./google-antigravity";
 import { loginCursor, refreshCursorToken } from "./cursor";
 import { loginGithubCopilot, refreshGithubCopilotToken, validateCopilotApiBaseUrl } from "./github-copilot";
+import { formatClineWorkOsAccessToken, loginCline, refreshClineToken } from "./cline";
 import { deriveOAuthDefaultModel, deriveOAuthProviderConfig } from "../providers/derive";
 import { effectiveGoogleMode } from "../providers/registry";
 import { resolveProviderTransport } from "../providers/xai-transport";
@@ -61,6 +62,12 @@ function oauthDefaultModel(id: string): string {
 }
 
 export const OAUTH_PROVIDERS: Record<string, OAuthProviderDef> = {
+  cline: {
+    login: (ctrl) => loginCline(ctrl),
+    refresh: (rt, signal) => refreshClineToken(rt, signal),
+    providerConfig: oauthConfig("cline"),
+    defaultModel: oauthDefaultModel("cline"),
+  },
   xai: {
     // forceLogin skips the local grok-cli import so a SECOND account can be chosen in the browser.
     login: (ctrl, opts) => loginXai(ctrl, { importLocal: opts?.forceLogin ? "off" : "fallback" }),
@@ -111,7 +118,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderDef> = {
   },
   chatgpt: {
     login: loginChatGPT,
-    refresh: (rt) => refreshChatGPTToken(rt),
+    refresh: (rt, signal) => refreshChatGPTToken(rt, signal),
     providerConfig: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" as const },
     defaultModel: "gpt-5.4",
   },
@@ -227,9 +234,42 @@ export async function forceRefreshOAuthAccessSnapshot(
   return resolveAccessSnapshotForAccount(rejected.provider, rejected.accountId, rejected.generation);
 }
 
+/**
+ * Resolve the next logged-in account after an upstream quota response without changing
+ * the saved selection. The caller commits it only after the retry completes successfully.
+ * Only Cline opts in: 401/403 and other providers remain pinned to their selected account.
+ */
+export async function rotateOAuthAccessSnapshotAfterQuota(
+  rejected: OAuthAccessSnapshot,
+  excludedAccountIds: ReadonlySet<string>,
+): Promise<OAuthAccessSnapshot | null> {
+  if (rejected.provider !== "cline") throw new UnsupportedOAuthProviderError(rejected.provider);
+  const candidate = nextAccountAfterFailure(
+    rejected.provider,
+    rejected.accountId,
+    excludedAccountIds,
+  );
+  if (candidate) return resolveAccessSnapshotForAccount(rejected.provider, candidate.id);
+  return null;
+}
+
+/** Persist a Cline fallback only after its upstream response completed successfully. */
+export async function commitOAuthAccessSnapshotAfterQuota(
+  expectedActiveAccountId: string,
+  successful: OAuthAccessSnapshot,
+): Promise<boolean> {
+  if (successful.provider !== "cline") throw new UnsupportedOAuthProviderError(successful.provider);
+  return setActiveAccountIfCurrent(successful.provider, expectedActiveAccountId, successful.accountId);
+}
+
 /** Return a valid access token for the ACTIVE account, refreshing + persisting if expired. */
 export async function getValidAccessToken(provider: string): Promise<string> {
   return (await getValidAccessTokenSnapshot(provider)).accessToken;
+}
+
+/** Adapt a stored OAuth access token to the upstream provider's bearer-key contract. */
+export function formatOAuthAccessTokenForTransport(provider: string, accessToken: string): string {
+  return provider === "cline" ? formatClineWorkOsAccessToken(accessToken) : accessToken;
 }
 
 /**
@@ -375,6 +415,18 @@ export function buildModelsRequest(prov: OcxProviderConfig, apiKey: string | und
     }
     return { url: `${effectiveProvider.baseUrl}/v1/models?limit=1000`, headers };
   }
+  if (providerName === "cline" || providerName === "cline-pass") {
+    if (apiKey) {
+      const bearer = providerName === "cline"
+        ? formatClineWorkOsAccessToken(apiKey)
+        : apiKey;
+      headers["Authorization"] = `Bearer ${bearer}`;
+    }
+    return {
+      url: `${effectiveProvider.baseUrl.replace(/\/+$/, "")}/ai/cline/recommended-models`,
+      headers,
+    };
+  }
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
   return { url: `${effectiveProvider.baseUrl}/models`, headers };
 }
@@ -450,7 +502,17 @@ export function upsertOAuthProvider(config: OcxConfig, provider: string): void {
 export async function runLogin(provider: string, ctrl: OAuthController, opts?: LoginOpts): Promise<OAuthCredentials> {
   const def = OAUTH_PROVIDERS[provider];
   if (!def) throw new UnsupportedOAuthProviderError(provider);
+  // Linearize the start of this login with every process that can logout. The generation is
+  // checked again after the auth-store lock is acquired and immediately before publication.
+  const expectedLoginFence = await snapshotLoginFenceGeneration(provider);
+  const loginIsActive = () => ctrl.signal?.aborted !== true;
+  const throwIfCancelled = () => {
+    if (!loginIsActive()) throw new Error("Login cancelled", { cause: ctrl.signal?.reason });
+  };
   const rawCred = await def.login(ctrl, opts);
+  // A provider may ignore AbortSignal while an external browser/device flow is pending. Never let
+  // such a late completion recreate credentials after the user cancelled or logged out.
+  throwIfCancelled();
   const cred: OAuthCredentials = rawCred.source ? rawCred : { ...rawCred, source: "oauth" };
   if (opts?.reauthAccountId) {
     const existing = getAccountCredential(provider, opts.reauthAccountId);
@@ -463,10 +525,11 @@ export async function runLogin(provider: string, ctrl: OAuthController, opts?: L
     if (!got || expected !== got) {
       throw new Error("Signed-in account does not match the selected account. Sign in with the same account.");
     }
-    await saveAccountCredential(provider, opts.reauthAccountId, cred);
+    await saveAccountCredential(provider, opts.reauthAccountId, cred, loginIsActive, expectedLoginFence);
   } else {
-    await saveCredential(provider, cred);
+    await saveCredential(provider, cred, loginIsActive, expectedLoginFence);
   }
+  throwIfCancelled();
   if (provider === "chatgpt") return cred;
   const config = loadConfig();
   upsertOAuthProvider(config, provider);
@@ -485,6 +548,13 @@ export async function runLogin(provider: string, ctrl: OAuthController, opts?: L
  */
 const loginState = new Map<string, { error?: string; done: boolean }>();
 const loginAbort = new Map<string, AbortController>();
+const loginGeneration = new Map<string, number>();
+
+function advanceLoginGeneration(provider: string): number {
+  const generation = (loginGeneration.get(provider) ?? 0) + 1;
+  loginGeneration.set(provider, generation);
+  return generation;
+}
 
 /** Pending paste for a login in progress: either a waiter or a stashed early submission. */
 interface ManualCodeSlot {
@@ -600,6 +670,7 @@ export function oauthLoginSummary(): Array<{ provider: string; loggedIn: boolean
 
 export function clearLoginState(provider: string): void {
   loginAbort.get(provider)?.abort("cleared");
+  advanceLoginGeneration(provider);
   loginAbort.delete(provider);
   clearManualCodeSlot(provider);
   loginState.delete(provider);
@@ -610,6 +681,7 @@ export function cancelLoginFlow(provider: string): boolean {
   const existing = loginState.get(provider);
   if (!ctrl && (!existing || existing.done)) return false;
   ctrl?.abort("cancelled");
+  advanceLoginGeneration(provider);
   loginAbort.delete(provider);
   clearManualCodeSlot(provider);
   loginState.set(provider, { done: true, error: "Login cancelled" });
@@ -625,6 +697,7 @@ export async function startLoginFlow(provider: string, opts?: LoginOpts): Promis
   }
   clearManualCodeSlot(provider);
   loginState.set(provider, { done: false });
+  const generation = advanceLoginGeneration(provider);
   const abort = new AbortController();
   loginAbort.set(provider, abort);
   return new Promise((resolve, reject) => {
@@ -642,6 +715,7 @@ export async function startLoginFlow(provider: string, opts?: LoginOpts): Promis
     // Background: runLogin persists the credential + upserts the provider entry to disk config.
     runLogin(provider, ctrl, opts)
       .then(() => {
+        if (loginGeneration.get(provider) !== generation) return;
         loginAbort.delete(provider);
         clearManualCodeSlot(provider);
         loginState.set(provider, { done: true });
@@ -650,10 +724,12 @@ export async function startLoginFlow(provider: string, opts?: LoginOpts): Promis
         if (!urlResolved) resolve({ url: "", instructions: "Logged in via an existing local CLI/keychain token — no browser needed." });
       })
       .catch((e: unknown) => {
-        loginAbort.delete(provider);
-        clearManualCodeSlot(provider);
         const msg = e instanceof Error ? e.message : String(e);
-        loginState.set(provider, { done: true, error: msg });
+        if (loginGeneration.get(provider) === generation) {
+          loginAbort.delete(provider);
+          clearManualCodeSlot(provider);
+          loginState.set(provider, { done: true, error: msg });
+        }
         if (!urlResolved) reject(e);
       });
   });

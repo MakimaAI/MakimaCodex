@@ -45,10 +45,17 @@ export function renameAtomicFile(
  */
 export interface AtomicWriteIO {
   write: (path: string, content: string) => void;
-  harden: (path: string) => void;
+  harden: (path: string) => void | { ok: boolean; diagnostics?: string };
   rename: (source: string, destination: string) => void;
   truncate: (path: string) => void;
   unlink: (path: string) => void;
+}
+
+export class AtomicWriteHardeningError extends Error {
+  constructor(message = "Secret file hardening failed") {
+    super(message);
+    this.name = "AtomicWriteHardeningError";
+  }
 }
 
 export class AtomicWriteResidualTempError extends Error {
@@ -73,7 +80,7 @@ export function atomicWriteFile(path: string, content: string, io: AtomicWriteIO
   write: (target, value) => writeFileSync(target, value, { encoding: "utf-8", mode: 0o600 }),
   harden: target => {
     try { chmodSync(target, 0o600); } catch { /* platform may ignore chmod */ }
-    if (process.platform === "win32") hardenSecretPath(target, { required: true });
+    if (process.platform === "win32") return hardenSecretPath(target, { required: true });
   },
   rename: renameAtomicFile,
   truncate: target => truncateSync(target, 0),
@@ -82,9 +89,15 @@ export function atomicWriteFile(path: string, content: string, io: AtomicWriteIO
   const tmp = `${path}.ocx.${process.pid}.${++_atomicSeq}.tmp`;
   let hardened = false;
   try {
-    io.write(tmp, content);
-    io.harden(tmp);
+    // Do not place secret bytes in a path whose inherited Windows ACL has not been
+    // constrained yet. A crash during hardening can then leave only an empty temp.
+    io.write(tmp, "");
+    const hardening = io.harden(tmp);
+    if (hardening?.ok === false) {
+      throw new AtomicWriteHardeningError(hardening.diagnostics);
+    }
     hardened = true;
+    io.write(tmp, content);
     io.rename(tmp, path);
   } catch (cause) {
     let scrubbed = false;
@@ -141,7 +154,7 @@ export interface OpenAiTierBackupIO {
   read(path: string): Uint8Array;
   createExclusive(path: string): void;
   write(path: string, bytes: Uint8Array): void;
-  harden(path: string): void;
+  harden(path: string): void | { ok: boolean; diagnostics?: string };
   publishNoReplace(temp: string, backup: string): void;
   truncate(path: string): void;
   unlink(path: string): void;
@@ -164,7 +177,7 @@ export function backupConfigBeforeOpenAiTierMigration(
     write: (target, bytes) => writeFileSync(target, bytes),
     harden: target => {
       try { chmodSync(target, 0o600); } catch { /* platform may ignore chmod */ }
-      if (process.platform === "win32") hardenSecretPath(target, { required: true });
+      if (process.platform === "win32") return hardenSecretPath(target, { required: true });
     },
     publishNoReplace: (temp, backup) => linkSync(temp, backup),
     truncate: target => truncateSync(target, 0),
@@ -217,8 +230,11 @@ export function backupConfigBeforeOpenAiTierMigration(
 
   try {
     io.createExclusive(temp);
+    const hardening = io.harden(temp);
+    if (hardening?.ok === false) {
+      throw new AtomicWriteHardeningError(hardening.diagnostics);
+    }
     io.write(temp, original);
-    io.harden(temp);
     try {
       io.publishNoReplace(temp, backup);
     } catch (cause) {
@@ -291,6 +307,7 @@ const providerConfigSchema = z.object({
   adapter: z.string().min(1),
   baseUrl: z.string().min(1),
   allowPrivateNetwork: z.boolean().optional(),
+  showRawReasoning: z.boolean().optional(),
   codexAccountMode: z.enum(["pool", "direct"]).optional(),
 }).passthrough();
 
@@ -364,6 +381,7 @@ const configSchema = z.object({
   openaiProviderTierVersion: z.union([z.literal(1), z.literal(2)]).optional(),
   providerContextCaps: z.record(z.string(), z.number().int().positive()).optional(),
   contextCapValue: z.number().int().positive().optional(),
+  subagentBridge: z.object({ enabled: z.boolean() }).default({ enabled: false }),
 }).passthrough().superRefine((config, ctx) => {
   for (const name of Object.keys(config.providers)) {
     if (!isValidProviderName(name)) {
@@ -651,6 +669,7 @@ export function getDefaultConfig(): OcxConfig {
     },
     defaultProvider: "openai",
     subagentModels: [...DEFAULT_SUBAGENT_MODELS],
+    subagentBridge: { enabled: false },
     websockets: false,
     codexAutoStart: true,
   };

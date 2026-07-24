@@ -7,6 +7,7 @@ import {
   getKeyCooldownUntil,
   hasKeyPoolFailover,
   rotateKeyOn429,
+  rotateKeyOnStatus,
   rotateProviderTransportOn429,
 } from "../src/providers/key-failover";
 import { deriveXaiConvId } from "../src/providers/xai-transport";
@@ -59,6 +60,15 @@ describe("hasKeyPoolFailover", () => {
 });
 
 describe("rotateKeyOn429", () => {
+  test("402 subscription exhaustion rotates with a long cooldown while 403 never rotates", () => {
+    const config = makeConfig({ apiKey: "key-alpha-000111222333", apiKeyPool: pool3() });
+    const now = 1_000_000;
+    expect(rotateKeyOnStatus(config, "p", 402, null, now)?.apiKey).toBe("key-beta-444555666777");
+    expect(getKeyCooldownUntil("p", "k1", now)).toBe(now + 10 * 60_000);
+    expect(rotateKeyOnStatus(config, "p", 403, null, now)).toBeNull();
+    expect(config.providers.p.apiKey).toBe("key-beta-444555666777");
+  });
+
   test("rotates to the next key and cools down the exhausted one", () => {
     const config = makeConfig({ apiKey: "key-alpha-000111222333", apiKeyPool: pool3() });
     const now = 1_000_000;
@@ -92,6 +102,20 @@ describe("rotateKeyOn429", () => {
     expect(rotateKeyOn429(config, "p", null, now)).toBeNull();
     // after alpha's cooldown expires the pool recovers
     expect(rotateKeyOn429(config, "p", null, now + 61_000)?.apiKey).toBe("key-alpha-000111222333");
+  });
+
+  test("checks every pooled key when the active key is no longer in the pool", () => {
+    const config = makeConfig({ apiKey: "key-alpha-000111222333", apiKeyPool: pool3() });
+    const now = 1_000_000;
+
+    // Cool alpha and beta, leaving only the final pool entry available.
+    expect(rotateKeyOn429(config, "p", null, now)?.apiKey).toBe("key-beta-444555666777");
+    expect(rotateKeyOn429(config, "p", null, now)?.apiKey).toBe("key-gamma-888999000111");
+
+    // A manual config edit can leave the selected key outside the managed pool.
+    config.providers.p.apiKey = "legacy-key-not-in-pool";
+
+    expect(rotateKeyOn429(config, "p", null, now)?.apiKey).toBe("key-gamma-888999000111");
   });
 
   test("returns null for oauth/forward providers and single-key pools", () => {

@@ -29,6 +29,9 @@ import { modelInList, namespacedToolName } from "../types";
 import type { AdapterEvent, OcxConfig, OcxParsedRequest, OcxProviderConfig, OcxUsage } from "../types";
 import {
   forceRefreshOAuthAccessSnapshot,
+  commitOAuthAccessSnapshotAfterQuota,
+  formatOAuthAccessTokenForTransport,
+  rotateOAuthAccessSnapshotAfterQuota,
   getOAuthCredentialApiBaseUrl,
   getOAuthCredentialProjectId,
   getValidAccessTokenSnapshot,
@@ -62,9 +65,14 @@ import { applyOpenAiVirtualModel, resolveOpenAiCompactModel } from "../providers
 import { isUsageDebugEnabled } from "../usage/debug";
 import { readJsonRequestBody, DecompressedBodyTooLargeError, UnsupportedContentEncodingError } from "./request-decompress";
 import { resolveAdapter, resolveWireProtocolOverride } from "./adapter-resolve";
-import { hasKeyPoolFailover, rotateProviderTransportOn429 } from "../providers/key-failover";
+import { commitProviderKeyAfterSuccessfulRetry, hasKeyPoolFailover, rotateProviderTransportOnStatus } from "../providers/key-failover";
 import { shouldAttemptImageTierRetry } from "./image-retry";
 import { resolveProviderTransport } from "../providers/xai-transport";
+import { rawReasoningPromotionEnabled } from "../providers/wire-protocol";
+import {
+  hasSelectedRoutedSubagentHandoffCandidate,
+  recoverSelectedRoutedSubagentRequest,
+} from "../subagent-bridge/recovery";
 import type { WsData } from "./ws-bridge";
 import { registerTurn, trackStreamLifetime, unregisterTurn } from "./lifecycle";
 import { redactSecretString } from "../lib/redact";
@@ -86,9 +94,12 @@ import {
   consumeForInspection,
   consumeForResponseLogMetadata,
   markNativePassthroughSseResponse,
+  rebuildSensitiveFailedJson,
+  relaySensitivePassthroughSse,
   relaySseWithFailedTail,
   relayWithAbort,
   sanitizePassthroughHeaders,
+  sensitiveFailureClassificationText,
 } from "./relay";
 
 export function buildToolBridgeMaps(parsed: OcxParsedRequest): {
@@ -247,13 +258,14 @@ function applyInjectionPlaceholders(prompt: string, model?: string, effort?: str
 /**
  * Compact one-line roster of configured sub-agent models, or "" when no configured
  * model resolves to a catalog entry. Efforts come from the injected catalog
- * (catalogModelEfforts) so only rungs codex-rs will actually accept are advertised.
+ * (catalogV2ModelEfforts) so only V2 rows and rungs codex-rs will actually accept
+ * are advertised.
  */
 async function subagentRosterText(subagentModels?: string[]): Promise<string> {
   const featured = (subagentModels ?? []).filter(id => typeof id === "string" && id.trim().length > 0);
   if (featured.length === 0) return "";
-  const { catalogModelEfforts } = await import("../codex/catalog");
-  const efforts = catalogModelEfforts(featured);
+  const { catalogV2ModelEfforts } = await import("../codex/catalog");
+  const efforts = catalogV2ModelEfforts(featured);
   const resolved = featured.filter(id => efforts.has(id));
   if (resolved.length === 0) return "";
   const ladders = new Set(resolved.map(id => efforts.get(id)!.join("/")));
@@ -471,12 +483,20 @@ interface HandleResponsesOptions {
   onNativePassthroughCancel?: () => void;
   /** Internal recursion guard; callers outside this module must not set it. */
   comboAttempt?: boolean;
+  /** Recovered handoff plaintext was present; suppress provider/adapter error details end-to-end. */
+  sensitiveHandoff?: boolean;
+  /** Ciphertext-preserving request body used only by the response-state continuation cache. */
+  responseStateBodyOverride?: unknown;
   /** 030-owned handoff when a child consumed the original failure under bounds. */
   onConsumedComboFailure?: (failure: ConsumedComboFailure) => void;
 }
 
 function clientCancelledResponse(): Response {
   return formatErrorResponse(499, "client_cancelled", "Client cancelled request");
+}
+
+function providerFailureMessage(status: number, detail: string, sensitiveHandoff: boolean): string {
+  return sensitiveHandoff ? `Provider error ${status}` : detail;
 }
 
 function sanitizedRetryAfter(value: string | null, now: number): string | undefined {
@@ -489,6 +509,7 @@ async function consumeComboFailure(
   response: Response,
   signal?: AbortSignal,
   now = Date.now(),
+  sensitiveHandoff = false,
 ): Promise<ConsumedComboFailure> {
   const fallback = `Provider error ${response.status}`;
   let classificationText = fallback;
@@ -497,14 +518,18 @@ async function consumeComboFailure(
     const body = await readBoundedResponseBody(response, { signal });
     usage = usageFromComboFailureText(body.text);
     if (body.displaySafe) {
-      const safeText = redactSecretString(body.text).slice(0, 500);
-      if (safeText) classificationText = safeText;
+      if (sensitiveHandoff) {
+        classificationText = sensitiveFailureClassificationText(body.text, response.status);
+      } else {
+        const safeText = redactSecretString(body.text).slice(0, 500);
+        if (safeText) classificationText = safeText;
+      }
     }
   } catch (error) {
     if (signal?.aborted) throw error;
     classificationText = fallback;
   }
-  const message = classificationText === fallback
+  const message = sensitiveHandoff || classificationText === fallback
     ? fallback
     : `${fallback}: ${classificationText}`;
   const retryAfter = sanitizedRetryAfter(response.headers.get("retry-after"), now);
@@ -569,6 +594,7 @@ async function handleComboResponses(
   config: OcxConfig,
   logCtx: RequestLogContext,
   options: HandleResponsesOptions,
+  responseStateRawBody: unknown,
 ): Promise<Response> {
   Object.assign(logCtx, {
     requestedModel: `combo/${comboId}`,
@@ -594,9 +620,15 @@ async function handleComboResponses(
     const childLog: RequestLogContext = {
       model: pick.target.model,
       provider: pick.target.provider,
+      ...(options.sensitiveHandoff ? { sensitiveHandoff: true } : {}),
     };
     const childBody = concreteComboRequestBody(
       rawBody,
+      pick.target,
+      comboDefaultEffort(config, comboId),
+    );
+    const responseStateChildBody = concreteComboRequestBody(
+      responseStateRawBody,
       pick.target,
       comboDefaultEffort(config, comboId),
     );
@@ -636,6 +668,7 @@ async function handleComboResponses(
       response = await handleResponses(childRequest, config, childLog, {
         ...options,
         comboAttempt: true,
+        responseStateBodyOverride: responseStateChildBody,
         // Attempt-relative TTFT is recorded HERE (not via childLog.firstOutputMs — a later
         // Object.assign(logCtx, childLog) would overwrite the request-relative value).
         onFirstOutput: () => {
@@ -697,7 +730,7 @@ async function handleComboResponses(
     let failure: ConsumedComboFailure;
     try {
       failure = consumedChildFailure
-        ?? await consumeComboFailure(response, options.abortSignal);
+        ?? await consumeComboFailure(response, options.abortSignal, Date.now(), options.sensitiveHandoff === true);
     } catch (error) {
       if (options.abortSignal?.aborted) {
         retainCancelledAttempt();
@@ -757,13 +790,70 @@ export async function handleResponses(
   } catch (err) {
     return decodeRequestErrorResponse(err, "responses");
   }
+  // V2 cross-provider handoff recovery must happen while the agent_message still carries its
+  // backend Fernet token. Only explicitly selected routed child models participate; native rows
+  // keep the ciphertext byte-identical for ChatGPT to decrypt.
+  const recoveryEnabled = !options.comboAttempt
+    && config.subagentBridge?.enabled === true
+    && config.multiAgentMode !== "v1";
+  const recoveryOptions = {
+    enabled: recoveryEnabled,
+    selectedModels: config.subagentModels ?? [],
+  };
+  const hasHandoffCandidate = hasSelectedRoutedSubagentHandoffCandidate(body, recoveryOptions);
+  if (hasHandoffCandidate) {
+    // Validate deterministic request structure before the store's destructive one-shot consume.
+    try { parseRequest(body); }
+    catch (err) {
+      return formatErrorResponse(400, "invalid_request_error", err instanceof Error ? err.message : String(err));
+    }
+  }
+  const ciphertextBody = hasHandoffCandidate ? structuredClone(body) : body;
+  const handoffRecovery = recoverSelectedRoutedSubagentRequest(body, recoveryOptions);
+  if (handoffRecovery.status === "missing") {
+    return new Response(JSON.stringify({
+      error: {
+        message: "No staged subagent handoff matched this routed child request",
+        type: "invalid_request_error",
+        code: "subagent_handoff_missing",
+      },
+    }), { status: 409, headers: { "Content-Type": "application/json" } });
+  }
+  if (handoffRecovery.status === "invalid") {
+    return new Response(JSON.stringify({
+      error: {
+        message: "Invalid routed subagent handoff envelope",
+        type: "invalid_request_error",
+        code: "subagent_handoff_invalid",
+      },
+    }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
+  const sensitiveHandoff = options.sensitiveHandoff === true || handoffRecovery.status === "recovered";
+  if (sensitiveHandoff) logCtx.sensitiveHandoff = true;
+  const responseStateRawBody = options.responseStateBodyOverride
+    ?? (handoffRecovery.status === "recovered" ? ciphertextBody : body);
+
+  // Recover a selected combo's original model boundary before choosing a concrete target. Child
+  // attempts receive the recovered body plus a separate ciphertext-only persistence copy, so
+  // failover never consumes the one-shot handoff twice and never snapshots plaintext.
   const comboId = !options.comboAttempt ? comboIdFromRawBody(body) : null;
   if (comboId && Object.hasOwn(config.combos ?? {}, comboId)) {
-    return handleComboResponses(req, body, comboId, config, logCtx, options);
+    return handleComboResponses(
+      req,
+      body,
+      comboId,
+      config,
+      logCtx,
+      sensitiveHandoff ? { ...options, sensitiveHandoff: true } : options,
+      responseStateRawBody,
+    );
   }
   const originalBody = body;
   body = expandPreviousResponseInput(body);
   const previousResponseInputExpanded = body !== originalBody;
+  const responseStateRequestBody = responseStateRawBody === originalBody
+    ? body
+    : expandPreviousResponseInput(responseStateRawBody);
 
   // Spawn-message compatibility (both directions): agent_message task payloads ride in
   // encrypted_content slots as plaintext. Rewrite them to input_text on the RAW body BEFORE
@@ -967,8 +1057,11 @@ export async function handleResponses(
   if (route.provider.authMode === "oauth") {
     try {
       const resolved = await getValidAccessTokenSnapshot(route.providerName);
-      if (isOAuth401ReplayProvider) sentOAuthSnapshot = resolved;
-      route.provider = { ...route.provider, apiKey: resolved.accessToken };
+      if (isOAuth401ReplayProvider || route.providerName === "cline") sentOAuthSnapshot = resolved;
+      route.provider = {
+        ...route.provider,
+        apiKey: formatOAuthAccessTokenForTransport(route.providerName, resolved.accessToken),
+      };
       // Antigravity (cloud-code-assist) needs the discovered Cloud Code Assist project id in the
       // CCA envelope; the server injects only the bare token, so pull project from the credential.
       if (route.provider.googleMode === "cloud-code-assist" && !route.provider.project) {
@@ -994,6 +1087,11 @@ export async function handleResponses(
   );
   const adapterProvider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider);
   const adapter = resolveAdapter(adapterProvider, config.cacheRetention);
+  const promoteRawReasoningToSummary = rawReasoningPromotionEnabled(route.providerName, route.modelId, route.provider)
+    && adapter.name === "openai-chat"
+    && parsed.options.hideRawReasoningSummary !== true;
+  // Raw reasoning stays envelope-only unless this exact provider/adapter turn opted in.
+  const hideRawReasoningSummary = !promoteRawReasoningToSummary;
   logCtx.providerAdapter = adapter.name;
   sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, adapter.name);
   const isPassthrough = "passthrough" in adapter && !!adapter.passthrough;
@@ -1063,7 +1161,7 @@ export async function handleResponses(
       && (!parsed.previousResponseId || parsed._previousResponseInputExpanded === true);
     const rememberPassthroughResponse = passthroughRecordEligible
       ? (response: { id?: unknown; output?: unknown; status?: unknown }) =>
-        rememberResponseState(parsed._rawBody, response, undefined, { force: true })
+        rememberResponseState(responseStateRequestBody, response, undefined, { force: true })
       : undefined;
     if (parsed.previousResponseId && !parsed._previousResponseInputExpanded) {
       console.warn(
@@ -1071,7 +1169,13 @@ export async function handleResponses(
         + `(model ${parsed.modelId}); forwarding without it — earlier turns may be missing from this request`,
       );
     }
-    const request = await adapter.buildRequest(parsed, { headers: selectedForwardHeaders });
+    let request: Awaited<ReturnType<typeof adapter.buildRequest>>;
+    try {
+      request = await adapter.buildRequest(parsed, { headers: selectedForwardHeaders });
+    } catch (err) {
+      if (!sensitiveHandoff) throw err;
+      return formatErrorResponse(502, "upstream_error", "Provider error 502");
+    }
     const passthroughEstimate = typeof request.usageLog?.inputTokens === "number"
       ? request.usageLog.inputTokens
       : undefined;
@@ -1108,11 +1212,11 @@ export async function handleResponses(
       const msg = outcome === "timeout"
         ? `Provider connect timeout after ${connectMs}ms`
         : `Provider unreachable: ${err instanceof Error ? err.message : String(err)}`;
-      return formatErrorResponse(502, "upstream_error", msg);
+      return formatErrorResponse(502, "upstream_error", providerFailureMessage(502, msg, sensitiveHandoff));
     }
     const headers = sanitizePassthroughHeaders(upstreamResponse.headers);
     const resolvedModel = headers.get("openai-model")?.trim();
-    if (resolvedModel) logCtx.resolvedModel = resolvedModel;
+    if (!sensitiveHandoff && resolvedModel) logCtx.resolvedModel = resolvedModel;
     if (isUsageDebugEnabled()) {
       const upstreamContentType = upstreamResponse.headers.get("content-type");
       if (upstreamContentType) logCtx.usageDebugContentType = upstreamContentType;
@@ -1125,7 +1229,7 @@ export async function handleResponses(
     const terminalRecorder = codexForwardTerminalOutcomeRecorder(config, authCtx, route.provider);
     const terminalBodyWillRecord = !!terminalRecorder && upstreamResponse.ok && isEventStream;
     // Capture quota from upstream response for multi-account tracking
-   if (usesCodexForwardPoolAuth(authCtx, route.provider)) {
+    if (usesCodexForwardPoolAuth(authCtx, route.provider)) {
       // primary was the 5h window; it now carries weekly data for GPT plans.
       // Prefer primary when present, fall back to secondary for compatibility.
       const primaryRaw = upstreamResponse.headers.get("x-codex-primary-used-percent");
@@ -1158,6 +1262,12 @@ export async function handleResponses(
          resetAt: [primaryResetRaw, secondaryResetRaw, monthlyResetRaw].filter(Boolean),
         });
       }
+    }
+
+    if (!upstreamResponse.ok && sensitiveHandoff) {
+      const failure = await consumeComboFailure(upstreamResponse, options.abortSignal, Date.now(), true);
+      options.onConsumedComboFailure?.(failure);
+      return failure.response;
     }
 
     // Bun#32111 workaround: passthrough SSE uses tee()+native relay to avoid the
@@ -1202,9 +1312,11 @@ export async function handleResponses(
       // win32 must keep the pure native relay (Bun#32111 JS-sink segfault); elsewhere a JS pull
       // relay is established practice (relayWithAbort, relaySseWithHeartbeat) and lets a
       // mid-stream reset end with a clean response.failed terminal instead of a raw socket error.
-      const clientBody = process.platform === "win32"
-        ? nativeBody
-        : relaySseWithFailedTail(nativeBody, upstream);
+      const clientBody = sensitiveHandoff
+        ? relaySensitivePassthroughSse(nativeBody, upstream)
+        : process.platform === "win32"
+          ? nativeBody
+          : relaySseWithFailedTail(nativeBody, upstream);
       return markNativePassthroughSseResponse(new Response(clientBody, {
         status: upstreamResponse.status,
         headers,
@@ -1212,18 +1324,22 @@ export async function handleResponses(
     }
     if (headers.get("content-type")?.toLowerCase().includes("application/json")) {
       if (!upstreamResponse.ok && options.comboAttempt) {
-        const failure = await consumeComboFailure(upstreamResponse, options.abortSignal);
+        const failure = await consumeComboFailure(upstreamResponse, options.abortSignal, Date.now(), sensitiveHandoff);
         options.onConsumedComboFailure?.(failure);
         return failure.response;
       }
       const text = await upstreamResponse.text();
-      inspectResponseLogJson(logCtx, text);
-      if (upstreamResponse.ok && rememberPassthroughResponse) {
+      const sensitiveFailureText = sensitiveHandoff
+        ? rebuildSensitiveFailedJson(text, upstreamResponse.status)
+        : null;
+      const responseText = sensitiveFailureText ?? text;
+      inspectResponseLogJson(logCtx, responseText);
+      if (upstreamResponse.ok && rememberPassthroughResponse && sensitiveFailureText === null) {
         try {
           rememberPassthroughResponse(JSON.parse(text) as { id?: unknown; output?: unknown; status?: unknown });
         } catch { /* non-JSON despite content-type; recording is best-effort */ }
       }
-      return new Response(text, {
+      return new Response(responseText, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
         headers,
@@ -1270,7 +1386,11 @@ export async function handleResponses(
           runTurnAbort.abort();
           queue.close();
           const message = preflight.error?.message ?? "Adapter ended before producing a response";
-          return formatErrorResponse(502, "upstream_error", redactSecretString(message));
+          return formatErrorResponse(
+            502,
+            "upstream_error",
+            providerFailureMessage(502, redactSecretString(message), sensitiveHandoff),
+          );
         }
         eventSource = preflight.stream;
       }
@@ -1284,9 +1404,12 @@ export async function handleResponses(
           ...(options.forceEmptyResponseId ? { responseId: "" } : {}),
           stallTimeoutSec: config.stallTimeoutSec,
           hideThinkingSummary: parsed.options.hideThinkingSummary,
+          sensitiveHandoff,
+          promoteRawReasoningToSummary,
+          hideRawReasoningSummary,
           ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
           ...(routedCompaction ? { compaction: true } : {}),
-          ...(routedCompaction ? {} : { onCompletedResponse: (response: Record<string, unknown>) => rememberResponseState(parsed._rawBody, response, parsed._cursorConversationId) }),
+          ...(routedCompaction ? {} : { onCompletedResponse: (response: Record<string, unknown>) => rememberResponseState(responseStateRequestBody, response, parsed._cursorConversationId) }),
         },
       );
       const bridgeTurnAc = new AbortController();
@@ -1304,17 +1427,24 @@ export async function handleResponses(
         const message = firstMeaningful?.type === "error"
           ? firstMeaningful.message
           : "Adapter ended before producing a response";
-        return formatErrorResponse(502, "upstream_error", redactSecretString(message));
+        return formatErrorResponse(
+          502,
+          "upstream_error",
+          providerFailureMessage(502, redactSecretString(message), sensitiveHandoff),
+        );
       }
     }
     const json = buildResponseJSON(events, parsed.modelId, {
       hideThinkingSummary: parsed.options.hideThinkingSummary,
+      sensitiveHandoff,
+      promoteRawReasoningToSummary,
+      hideRawReasoningSummary,
       toolNsMap,
       freeformToolNames,
       toolSearchToolNames,
       ...(routedCompaction ? { compaction: true } : {}),
     });
-    if (!routedCompaction) rememberResponseState(parsed._rawBody, json, parsed._cursorConversationId);
+    if (!routedCompaction) rememberResponseState(responseStateRequestBody, json, parsed._cursorConversationId);
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
 
@@ -1325,6 +1455,13 @@ export async function handleResponses(
   if (wsPlan) {
     parsed.context.tools = [...(parsed.context.tools ?? []), buildWebSearchTool()];
     noteAttemptSend(logCtx.activeAttempt, logCtx.usageLogInputTokens);
+    let wsExpectedActiveKey = config.providers[route.providerName]?.apiKey;
+    let wsPendingKey: string | undefined;
+    let wsExpectedOAuthAccountId = sentOAuthSnapshot?.accountId;
+    let wsPendingOAuthSnapshot: OAuthAccessSnapshot | undefined;
+    const wsAttemptedOAuthAccounts = new Set<string>(
+      sentOAuthSnapshot ? [sentOAuthSnapshot.accountId] : [],
+    );
     const wsResponse = await runWithWebSearch({
       parsed, adapter,
       backend: wsPlan.backend,
@@ -1341,19 +1478,73 @@ export async function handleResponses(
       connectTimeoutMs: config.connectTimeoutMs ?? 200_000,
       routedModelStallTimeoutMs: wsPlan.routedModelStallTimeoutMs,
       stallTimeoutSec: wsPlan.stallTimeoutSec,
-      on429: retryAfter => {
-        const rotated = rotateProviderTransportOn429(config, route.providerName, {
+      sensitiveHandoff,
+      promoteRawReasoningToSummary,
+      hideRawReasoningSummary,
+      onQuota: async (status, retryAfter) => {
+        if (route.providerName === "cline" && route.provider.authMode === "oauth" && sentOAuthSnapshot) {
+          const next = await rotateOAuthAccessSnapshotAfterQuota(
+            sentOAuthSnapshot,
+            wsAttemptedOAuthAccounts,
+          );
+          if (!next) return null;
+          wsAttemptedOAuthAccounts.add(next.accountId);
+          sentOAuthSnapshot = next;
+          wsPendingOAuthSnapshot = next;
+          route.provider = resolveProviderTransport(
+            route.providerName,
+            {
+              ...route.provider,
+              apiKey: formatOAuthAccessTokenForTransport(route.providerName, next.accessToken),
+            },
+            parsed.options.promptCacheKey,
+          );
+          return resolveAdapter(
+            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider),
+            config.cacheRetention,
+          );
+        }
+        if (status === 402 && route.providerName !== "cline-pass") return null;
+        if (!hasKeyPoolFailover(route.provider)) return null;
+        const rotated = rotateProviderTransportOnStatus(config, route.providerName, status, {
           retryAfter,
           now: Date.now(),
           attemptedKey: route.provider.apiKey,
           promptCacheKey: parsed.options.promptCacheKey,
+          persistActive: false,
         });
         if (!rotated) return null;
-        route.provider = rotated;
+        // `config` holds the persisted user shape, while route.provider also carries registry-only
+        // runtime hints (for example ClinePass's wire model prefix). Preserve those hints across
+        // key rotation and overlay the fresh key/transport fields from the rotated config.
+        route.provider = { ...route.provider, ...rotated };
+        wsPendingKey = rotated.apiKey;
         return resolveAdapter(
           resolveWireProtocolOverride(route.providerName, route.modelId, route.provider),
           config.cacheRetention,
         );
+      },
+      onQuotaRecovered: async () => {
+        if (wsPendingOAuthSnapshot && wsExpectedOAuthAccountId) {
+          const committed = await commitOAuthAccessSnapshotAfterQuota(
+            wsExpectedOAuthAccountId,
+            wsPendingOAuthSnapshot,
+          );
+          if (committed) wsExpectedOAuthAccountId = wsPendingOAuthSnapshot.accountId;
+          wsAttemptedOAuthAccounts.clear();
+          wsAttemptedOAuthAccounts.add(wsPendingOAuthSnapshot.accountId);
+          wsPendingOAuthSnapshot = undefined;
+        }
+        if (wsPendingKey) {
+          const committed = commitProviderKeyAfterSuccessfulRetry(
+            config,
+            route.providerName,
+            wsExpectedActiveKey,
+            wsPendingKey,
+          );
+          if (committed) wsExpectedActiveKey = wsPendingKey;
+          wsPendingKey = undefined;
+        }
       },
     });
     // Register the sidecar stream as an active turn so drainAndShutdown waits for (or aborts)
@@ -1372,7 +1563,13 @@ export async function handleResponses(
   const cleanupUpstreamAbort = linkAbortSignal(upstream, options.abortSignal);
   const connectMs = config.connectTimeoutMs ?? 200_000;
 
-  const request = await adapter.buildRequest(parsed, { headers: selectedForwardHeaders });
+  let request: Awaited<ReturnType<typeof adapter.buildRequest>>;
+  try {
+    request = await adapter.buildRequest(parsed, { headers: selectedForwardHeaders });
+  } catch (err) {
+    if (!sensitiveHandoff) throw err;
+    return formatErrorResponse(502, "upstream_error", "Provider error 502");
+  }
   const inputTokenEstimate = typeof request.usageLog?.inputTokens === "number"
     ? request.usageLog.inputTokens
     : undefined;
@@ -1404,8 +1601,29 @@ export async function handleResponses(
     const msg = err instanceof Error && err.name === "TimeoutError"
       ? `Provider connect timeout after ${connectMs}ms`
       : `Provider unreachable: ${err instanceof Error ? err.message : String(err)}`;
-    return formatErrorResponse(502, "upstream_error", msg);
+    return formatErrorResponse(502, "upstream_error", providerFailureMessage(502, msg, sensitiveHandoff));
   }
+
+  let responseAdapter = adapter;
+  let pendingOAuthQuotaCommit: { expectedAccountId: string; snapshot: OAuthAccessSnapshot } | undefined;
+  let pendingKeyCommit: { expectedKey: string | undefined; successfulKey: string } | undefined;
+  const commitRecoveredSelection = async (): Promise<void> => {
+    if (pendingOAuthQuotaCommit) {
+      const pending = pendingOAuthQuotaCommit;
+      pendingOAuthQuotaCommit = undefined;
+      await commitOAuthAccessSnapshotAfterQuota(pending.expectedAccountId, pending.snapshot);
+    }
+    if (pendingKeyCommit) {
+      const pending = pendingKeyCommit;
+      pendingKeyCommit = undefined;
+      commitProviderKeyAfterSuccessfulRetry(
+        config,
+        route.providerName,
+        pending.expectedKey,
+        pending.successfulKey,
+      );
+    }
+  };
 
   if (!upstreamResponse.ok) {
     // Recovery loop: multi-key 429 failover + at most ONE anthropic 413 tightened retry
@@ -1417,13 +1635,24 @@ export async function handleResponses(
     let imageTierBias = 0;
     let imageRetryAttempted = false;
     let oauth401ReplayAttempted = false;
+    const initialPersistedKey = config.providers[route.providerName]?.apiKey;
+    const oauthQuotaAttemptedAccounts = new Set<string>(
+      sentOAuthSnapshot ? [sentOAuthSnapshot.accountId] : [],
+    );
+    const initialOAuthAccountId = sentOAuthSnapshot?.accountId;
     const rebuildAndRefetch = async (
       recovery: AttemptRecoveryKind,
     ): Promise<Response | { failed: Response }> => {
-      const retryRequest = await activeAdapter.buildRequest(parsed, {
-        headers: selectedForwardHeaders,
-        ...(imageTierBias > 0 ? { imageTierBias } : {}),
-      });
+      let retryRequest: Awaited<ReturnType<typeof activeAdapter.buildRequest>>;
+      try {
+        retryRequest = await activeAdapter.buildRequest(parsed, {
+          headers: selectedForwardHeaders,
+          ...(imageTierBias > 0 ? { imageTierBias } : {}),
+        });
+      } catch (err) {
+        if (!sensitiveHandoff) throw err;
+        return { failed: formatErrorResponse(502, "upstream_error", "Provider error 502") };
+      }
       const retryEstimate = typeof retryRequest.usageLog?.inputTokens === "number"
         ? retryRequest.usageLog.inputTokens
         : undefined;
@@ -1446,7 +1675,11 @@ export async function handleResponses(
         const msg = err instanceof Error && err.name === "TimeoutError"
           ? `Provider connect timeout after ${connectMs}ms`
           : `Provider unreachable: ${err instanceof Error ? err.message : String(err)}`;
-        return { failed: formatErrorResponse(502, "upstream_error", msg) };
+        return { failed: formatErrorResponse(
+          502,
+          "upstream_error",
+          providerFailureMessage(502, msg, sensitiveHandoff),
+        ) };
       }
     };
     recovery: for (;;) {
@@ -1463,12 +1696,16 @@ export async function handleResponses(
           refreshed = await forceRefreshOAuthAccessSnapshot(sentOAuthSnapshot);
         } catch (err) {
           cleanupUpstreamAbort();
-          return formatErrorResponse(401, "authentication_error", err instanceof Error ? err.message : String(err));
+          const message = err instanceof Error ? err.message : String(err);
+          return formatErrorResponse(401, "authentication_error", providerFailureMessage(401, message, sensitiveHandoff));
         }
         sentOAuthSnapshot = refreshed;
         const refreshedProvider = resolveProviderTransport(
           route.providerName,
-          { ...route.provider, apiKey: refreshed.accessToken },
+          {
+            ...route.provider,
+            apiKey: formatOAuthAccessTokenForTransport(route.providerName, refreshed.accessToken),
+          },
           parsed.options.promptCacheKey,
           route.providerName === "github-copilot" ? getOAuthCredentialApiBaseUrl(route.providerName) : undefined,
         );
@@ -1483,26 +1720,80 @@ export async function handleResponses(
         continue recovery;
       }
 
+      if (
+        route.providerName === "cline"
+        && (upstreamResponse.status === 402 || upstreamResponse.status === 429)
+        && sentOAuthSnapshot
+      ) {
+        let next: OAuthAccessSnapshot | null;
+        try {
+          next = await rotateOAuthAccessSnapshotAfterQuota(
+            sentOAuthSnapshot,
+            oauthQuotaAttemptedAccounts,
+          );
+        } catch (err) {
+          cleanupUpstreamAbort();
+          const message = err instanceof Error ? err.message : String(err);
+          return formatErrorResponse(401, "authentication_error", providerFailureMessage(401, message, sensitiveHandoff));
+        }
+        if (next) {
+          oauthQuotaAttemptedAccounts.add(next.accountId);
+          try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+          sentOAuthSnapshot = next;
+          if (initialOAuthAccountId) {
+            pendingOAuthQuotaCommit = { expectedAccountId: initialOAuthAccountId, snapshot: next };
+          }
+          route.provider = resolveProviderTransport(
+            route.providerName,
+            {
+              ...route.provider,
+              apiKey: formatOAuthAccessTokenForTransport(route.providerName, next.accessToken),
+            },
+            parsed.options.promptCacheKey,
+          );
+          activeAdapter = resolveAdapter(
+            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider),
+            config.cacheRetention,
+          );
+          const result = await rebuildAndRefetch(
+            upstreamResponse.status === 402 ? "oauth-402" : "oauth-429",
+          );
+          if ("failed" in result) return result.failed;
+          upstreamResponse = result;
+          continue recovery;
+        }
+      }
+
       // Multi-key 429 failover: rotate to the next pool key (cooldown-aware) and retry the
       // SAME request once per remaining key. OAuth/forward providers and single-key pools
       // return null immediately, so this stays a no-op for them (src/providers/key-failover.ts).
-      while (upstreamResponse.status === 429 && hasKeyPoolFailover(route.provider)) {
-        const rotated = rotateProviderTransportOn429(config, route.providerName, {
+      while (
+        (upstreamResponse.status === 429 || (route.providerName === "cline-pass" && upstreamResponse.status === 402))
+        && hasKeyPoolFailover(route.provider)
+      ) {
+        const recoveryStatus = upstreamResponse.status as 402 | 429;
+        const rotated = rotateProviderTransportOnStatus(config, route.providerName, recoveryStatus, {
           retryAfter: upstreamResponse.headers.get("retry-after"),
           now: Date.now(),
           attemptedKey: route.provider.apiKey,
           promptCacheKey: parsed.options.promptCacheKey,
+          persistActive: false,
         });
         if (!rotated) break;
+        const rotatedApiKey = rotated.apiKey;
+        if (!rotatedApiKey) break;
         // Release the failed response's socket before retrying; unread bodies otherwise linger
         // until runtime cleanup (one per rotated key under a rate-limit storm).
         try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
-        route.provider = rotated;
+        // Preserve registry-only runtime hints (such as ClinePass's wire model prefix)
+        // while overlaying the fresh key and transport fields from persisted config.
+        route.provider = { ...route.provider, ...rotated };
+        pendingKeyCommit = { expectedKey: initialPersistedKey, successfulKey: rotatedApiKey };
         activeAdapter = resolveAdapter(
           resolveWireProtocolOverride(route.providerName, route.modelId, route.provider),
           config.cacheRetention,
         );
-        const result = await rebuildAndRefetch("key-429");
+        const result = await rebuildAndRefetch(recoveryStatus === 402 ? "key-402" : "key-429");
         if ("failed" in result) return result.failed;
         upstreamResponse = result;
       }
@@ -1524,9 +1815,10 @@ export async function handleResponses(
       }
       break;
     }
+    responseAdapter = activeAdapter;
     if (!upstreamResponse.ok) {
       if (options.comboAttempt) {
-        const failure = await consumeComboFailure(upstreamResponse, options.abortSignal)
+        const failure = await consumeComboFailure(upstreamResponse, options.abortSignal, Date.now(), sensitiveHandoff)
           .finally(cleanupUpstreamAbort);
         options.onConsumedComboFailure?.(failure);
         return failure.response;
@@ -1535,12 +1827,24 @@ export async function handleResponses(
       cleanupUpstreamAbort();
       // Upstreams occasionally echo request details in error bodies — scrub token-shaped
       // material before it reaches the client-facing error surface.
-      return formatErrorResponse(upstreamResponse.status, "upstream_error", `Provider error ${upstreamResponse.status}: ${redactSecretString(errorText.slice(0, 500))}`);
+      const detail = `Provider error ${upstreamResponse.status}: ${redactSecretString(errorText.slice(0, 500))}`;
+      return formatErrorResponse(
+        upstreamResponse.status,
+        "upstream_error",
+        providerFailureMessage(upstreamResponse.status, detail, sensitiveHandoff),
+      );
     }
   }
 
   if (parsed.stream) {
-    const eventStream = adapter.parseStream(upstreamResponse);
+    const parsedEventStream = responseAdapter.parseStream(upstreamResponse);
+    const eventStream = (async function* (): AsyncGenerator<AdapterEvent> {
+      for await (const event of parsedEventStream) {
+        if (event.type === "done") await commitRecoveredSelection();
+        yield event;
+        if (event.type === "error") return;
+      }
+    })();
     const { toolNsMap, freeformToolNames, toolSearchToolNames } = buildToolBridgeMaps(parsed);
     const sseStream = bridgeToResponsesSSE(
       eventStream, parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames,
@@ -1549,12 +1853,15 @@ export async function handleResponses(
         ...(options.forceEmptyResponseId ? { responseId: "" } : {}),
         stallTimeoutSec: config.stallTimeoutSec,
         hideThinkingSummary: parsed.options.hideThinkingSummary,
+        sensitiveHandoff,
+        promoteRawReasoningToSummary,
+        hideRawReasoningSummary,
         ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
         ...(routedCompaction ? { compaction: true } : {}),
         // Compaction turns must NOT enter the continuation cache: _rawBody still holds the full
         // PRE-compaction history, and a later previous_response_id expansion would rehydrate the
         // giant stale chain Codex just replaced.
-        ...(routedCompaction ? {} : { onCompletedResponse: (response: Record<string, unknown>) => rememberResponseState(parsed._rawBody, response, parsed._cursorConversationId) }),
+        ...(routedCompaction ? {} : { onCompletedResponse: (response: Record<string, unknown>) => rememberResponseState(responseStateRequestBody, response, parsed._cursorConversationId) }),
       },
     );
     const bridgeTurnAc = new AbortController();
@@ -1564,23 +1871,32 @@ export async function handleResponses(
     });
   }
 
-  if (adapter.parseResponse) {
+  if (responseAdapter.parseResponse) {
     let events: AdapterEvent[];
     try {
-      events = await adapter.parseResponse(upstreamResponse);
+      events = await responseAdapter.parseResponse(upstreamResponse);
+    } catch (err) {
+      if (!sensitiveHandoff) throw err;
+      return formatErrorResponse(502, "upstream_error", "Provider error 502");
     } finally {
       cleanupUpstreamAbort();
     }
     const { toolNsMap, freeformToolNames, toolSearchToolNames } = buildToolBridgeMaps(parsed);
     const json = buildResponseJSON(events, parsed.modelId, {
       hideThinkingSummary: parsed.options.hideThinkingSummary,
+      sensitiveHandoff,
+      promoteRawReasoningToSummary,
+      hideRawReasoningSummary,
       toolNsMap,
       freeformToolNames,
       toolSearchToolNames,
       ...(routedCompaction ? { compaction: true } : {}),
     });
+    if (json.status === "completed" && events.some(event => event.type === "done")) {
+      await commitRecoveredSelection();
+    }
     // See the streaming branch: compaction turns skip the continuation cache.
-    if (!routedCompaction) rememberResponseState(parsed._rawBody, json, parsed._cursorConversationId);
+    if (!routedCompaction) rememberResponseState(responseStateRequestBody, json, parsed._cursorConversationId);
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
 

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencodex.local/schemas/oef/event-envelope-v1.schema.json",
+  "title": "OEF Audit Event Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "event_type", "event_schema_version", "aggregate", "actor", "trace", "occurred_at", "recorded_at", "payload", "integrity"],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "event_type": { "type": "string", "minLength": 1 },
+    "event_schema_version": { "const": 1 },
+    "aggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "version"],
+      "properties": {
+        "type": { "const": "task" },
+        "id": { "type": "string", "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$" },
+        "version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "actor": { "$ref": "actor-v1.schema.json" },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trace_id", "correlation_id", "causation_id"],
+      "properties": {
+        "trace_id": { "type": "string", "minLength": 1 },
+        "correlation_id": { "type": "string", "minLength": 1 },
+        "causation_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "payload": { "type": "object" },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["previous_event_hash", "event_hash"],
+      "properties": {
+        "previous_event_hash": { "oneOf": [{ "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }, { "type": "null" }] },
+        "event_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

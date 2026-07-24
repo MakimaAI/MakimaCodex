@@ -86,6 +86,19 @@
 }
 .pwi-settings-textarea:focus { border-color: var(--accent-ring); outline: none; }
 .pwi-settings-hint { font-size: var(--text-caption); color: var(--muted); line-height: 1.4; }
+.pwi-settings-raw-reasoning {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-xs);
+  background: var(--raised);
+}
+.pwi-settings-raw-reasoning-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pwi-settings-raw-reasoning-warning {
+  display: flex; align-items: flex-start; gap: 6px;
+  padding: 7px 8px; border-radius: var(--radius-2xs);
+  font-size: var(--text-caption); line-height: 1.4; color: var(--amber);
+  background: var(--amber-soft);
+}
+.pwi-settings-raw-reasoning-warning svg { width: 13px; height: 13px; flex: 0 0 auto; margin-top: 1px; }
 
 .pwi-settings-sticky-bar {
   position: sticky; bottom: 0; z-index: 2;

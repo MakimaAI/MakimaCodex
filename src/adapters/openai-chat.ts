@@ -462,8 +462,14 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const tools = toolsToChatFormatForProvider(parsed, provider);
       const toolChoice = toolChoiceToChatFormat(parsed.options.toolChoice, parsed.context.tools);
 
+      const normalizedModelId = provider.modelSuffixBracketStrip
+        ? stripBracketedModelSuffix(parsed.modelId)
+        : parsed.modelId;
+      const wireModelId = provider.modelIdPrefix && !normalizedModelId.includes("/")
+        ? `${provider.modelIdPrefix}${normalizedModelId}`
+        : normalizedModelId;
       const body: Record<string, unknown> = {
-        model: provider.modelSuffixBracketStrip ? stripBracketedModelSuffix(parsed.modelId) : parsed.modelId,
+        model: wireModelId,
         messages,
         stream: parsed.stream,
       };
@@ -611,12 +617,12 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         }
         const delta = choices[0].delta;
         if (delta) {
-          if (typeof delta.content === "string" && delta.content.length > 0) {
-            yield { type: "text_delta", text: delta.content };
-          }
-
           if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
             yield { type: "reasoning_raw_delta", text: delta.reasoning_content };
+          }
+
+          if (typeof delta.content === "string" && delta.content.length > 0) {
+            yield { type: "text_delta", text: delta.content };
           }
 
           const toolCalls = delta.tool_calls as { index?: number; id?: string; function?: { name?: string; arguments?: string } }[] | undefined;
@@ -690,7 +696,15 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
     },
 
     async parseResponse(response: Response): Promise<AdapterEvent[]> {
-      const json = await response.json() as Record<string, unknown>;
+      const outer = await response.json() as Record<string, unknown>;
+      const nested = outer.data;
+      const json = !outer.choices
+        && !outer.error
+        && nested !== null
+        && typeof nested === "object"
+        && !Array.isArray(nested)
+        ? nested as Record<string, unknown>
+        : outer;
       if (json.error) {
         const upstreamError = json.error as { message?: unknown };
         return [{
@@ -706,11 +720,11 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       }
 
       const msg = choices[0].message;
-      if (typeof msg.content === "string") {
-        events.push({ type: "text_delta", text: msg.content });
-      }
       if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) {
         events.push({ type: "reasoning_raw_delta", text: msg.reasoning_content });
+      }
+      if (typeof msg.content === "string") {
+        events.push({ type: "text_delta", text: msg.content });
       }
       const toolCalls = msg.tool_calls as { id: string; function: { name: string; arguments: string } }[] | undefined;
       if (toolCalls) {

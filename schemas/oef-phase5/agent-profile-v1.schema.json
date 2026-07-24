@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "agent_profile_id": {
+      "type": "string",
+      "pattern": "^agent-profile:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "role_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "prompt_profile_ref": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tool_bundle_ref": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "context_policy_ref": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "permission_envelope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "memory_scope": {
+      "type": "string",
+      "enum": [
+        "none",
+        "task",
+        "project"
+      ]
+    },
+    "verification_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "profile_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "agent_profile_id",
+    "version",
+    "role_id",
+    "prompt_profile_ref",
+    "skills",
+    "tool_bundle_ref",
+    "context_policy_ref",
+    "permission_envelope",
+    "memory_scope",
+    "verification_requirements",
+    "profile_hash"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase5/agent-profile-v1.schema.json"
+}

@@ -797,6 +797,76 @@ describe("server local API auth", () => {
     }
   });
 
+  test("provider management APIs round-trip showRawReasoning and reject non-booleans", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig(config("127.0.0.1"));
+
+    const server = startServer(0);
+    try {
+      const create = await fetch(new URL("/api/providers", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "raw-reasoning",
+          provider: {
+            adapter: "openai-chat",
+            baseUrl: "http://127.0.0.1:65530/v1",
+            allowPrivateNetwork: true,
+            showRawReasoning: false,
+          },
+        }),
+      });
+      expect(create.status).toBe(200);
+
+      const patch = await fetch(new URL("/api/providers?name=raw-reasoning", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ showRawReasoning: true }),
+      });
+      expect(patch.status).toBe(200);
+      expect(await patch.json()).toMatchObject({ success: true, showRawReasoning: true });
+
+      const providers = await fetch(new URL("/api/providers", server.url)).then(response => response.json()) as
+        Array<{ name: string; showRawReasoning?: boolean }>;
+      expect(providers.find(provider => provider.name === "raw-reasoning")?.showRawReasoning).toBe(true);
+
+      const dto = await fetch(new URL("/api/config", server.url)).then(response => response.json()) as {
+        providers: Record<string, { showRawReasoning?: boolean }>;
+      };
+      expect(dto.providers["raw-reasoning"].showRawReasoning).toBe(true);
+      expect(loadConfig().providers["raw-reasoning"].showRawReasoning).toBe(true);
+
+      const invalidPatch = await fetch(new URL("/api/providers?name=raw-reasoning", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ showRawReasoning: "true" }),
+      });
+      expect(invalidPatch.status).toBe(400);
+      expect(await invalidPatch.json()).toMatchObject({ error: expect.stringContaining("showRawReasoning") });
+      expect(loadConfig().providers["raw-reasoning"].showRawReasoning).toBe(true);
+
+      const invalidCreate = await fetch(new URL("/api/providers", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "raw-reasoning-invalid",
+          provider: {
+            adapter: "openai-chat",
+            baseUrl: "http://127.0.0.1:65531/v1",
+            allowPrivateNetwork: true,
+            showRawReasoning: 1,
+          },
+        }),
+      });
+      expect(invalidCreate.status).toBe(400);
+      expect(await invalidCreate.json()).toMatchObject({ error: expect.stringContaining("showRawReasoning") });
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("provider PATCH rejects disabling allowPrivateNetwork while baseUrl is private", async () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
@@ -1392,6 +1462,93 @@ describe("server local API auth", () => {
         headers: { "x-opencodex-api-key": "local-secret", origin: `http://127.0.0.1:${server.port}` },
       });
       expect(ok.status).toBe(200);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("loopback management API rejects a different loopback web origin unless allowlisted", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig(config("127.0.0.1"));
+
+    const server = startServer(0);
+    const foreignLoopbackOrigin = `http://localhost:${server.port + 1}`;
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/api/config`, {
+        headers: { origin: foreignLoopbackOrigin },
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: "cross-origin request blocked" });
+
+      const preflight = await fetch(`http://127.0.0.1:${server.port}/api/config`, {
+        method: "OPTIONS",
+        headers: {
+          origin: foreignLoopbackOrigin,
+          "access-control-request-method": "PATCH",
+        },
+      });
+      expect(preflight.status).toBe(403);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("management handler itself rejects a foreign loopback origin", async () => {
+    const liveConfig = config("127.0.0.1");
+    const request = new Request("http://127.0.0.1:10100/api/config", {
+      headers: { origin: "http://localhost:5173" },
+    });
+    const response = await handleManagementAPI(request, new URL(request.url), liveConfig);
+
+    expect(response?.status).toBe(403);
+    expect(await response?.json()).toMatchObject({ error: "cross-origin request blocked" });
+  });
+
+  test("loopback management API preserves explicit cross-origin allowlisting", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const allowedOrigin = "http://localhost:43210";
+    saveConfig({ ...config("127.0.0.1"), corsAllowOrigins: [allowedOrigin] });
+
+    const server = startServer(0);
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/api/config`, {
+        headers: { origin: allowedOrigin },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("access-control-allow-origin")).toBe(allowedOrigin);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("loopback data-plane keeps cross-loopback browser compatibility", async () => {
+    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig(config("127.0.0.1"));
+
+    const server = startServer(0);
+    const browserOrigin = `http://localhost:${server.port + 1}`;
+    try {
+      const models = await fetch(new URL("/v1/models", server.url), {
+        headers: { origin: browserOrigin },
+      });
+      expect(models.status).toBe(200);
+      expect(models.headers.get("access-control-allow-origin")).toBe(browserOrigin);
+
+      const preflight = await fetch(new URL("/v1/models", server.url), {
+        method: "OPTIONS",
+        headers: {
+          origin: browserOrigin,
+          "access-control-request-method": "GET",
+        },
+      });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-origin")).toBe(browserOrigin);
     } finally {
       await server.stop(true);
     }

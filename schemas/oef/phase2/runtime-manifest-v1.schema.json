@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "runtime_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "adapter": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "protocol": {
+      "type": "object",
+      "properties": {
+        "min": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "enum": [
+          "repository-read",
+          "repository-write",
+          "shell",
+          "git",
+          "structured-output",
+          "tool-events",
+          "streaming",
+          "session-resume",
+          "native-worktree",
+          "subagents",
+          "mcp",
+          "browser",
+          "image-input",
+          "computer-use",
+          "network-access",
+          "file-edit",
+          "test-execution",
+          "usage-reporting",
+          "cancellation"
+        ]
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "supported": {
+            "type": "boolean"
+          },
+          "enforcement": {
+            "type": "string",
+            "enum": [
+              "NONE",
+              "ADVISORY",
+              "OBSERVED",
+              "ENFORCED",
+              "SANDBOX_ENFORCED"
+            ]
+          }
+        },
+        "required": [
+          "supported",
+          "enforcement"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "runtime_id",
+    "adapter",
+    "protocol",
+    "capabilities"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/runtime-manifest-v1.schema.json"
+}

@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "assignment_id": {
+      "type": "string",
+      "pattern": "^assignment:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "revision": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "previous_revision_hash": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "contract_ref": {
+      "type": "object",
+      "properties": {
+        "revision_id": {
+          "type": "string",
+          "pattern": "^contract-revision:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+        },
+        "hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "revision_id",
+        "hash"
+      ],
+      "additionalProperties": false
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20000
+    },
+    "role": {
+      "type": "string",
+      "maxLength": 160,
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "minItems": 1,
+          "maxItems": 512,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
+        "denied_paths": {
+          "maxItems": 512,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        }
+      },
+      "required": [
+        "allowed_paths",
+        "denied_paths"
+      ],
+      "additionalProperties": false
+    },
+    "required_capabilities": {
+      "maxItems": 19,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "repository-read",
+          "repository-write",
+          "shell",
+          "git",
+          "structured-output",
+          "tool-events",
+          "streaming",
+          "session-resume",
+          "native-worktree",
+          "subagents",
+          "mcp",
+          "browser",
+          "image-input",
+          "computer-use",
+          "network-access",
+          "file-edit",
+          "test-execution",
+          "usage-reporting",
+          "cancellation"
+        ]
+      }
+    },
+    "preferred_capabilities": {
+      "maxItems": 19,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "repository-read",
+          "repository-write",
+          "shell",
+          "git",
+          "structured-output",
+          "tool-events",
+          "streaming",
+          "session-resume",
+          "native-worktree",
+          "subagents",
+          "mcp",
+          "browser",
+          "image-input",
+          "computer-use",
+          "network-access",
+          "file-edit",
+          "test-execution",
+          "usage-reporting",
+          "cancellation"
+        ]
+      }
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "commands": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "executable": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "args": {
+                "maxItems": 256,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 20000
+                }
+              },
+              "timeout_seconds": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 86400
+              }
+            },
+            "required": [
+              "executable",
+              "args",
+              "timeout_seconds"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "commands"
+      ],
+      "additionalProperties": false
+    },
+    "required_evidence": {
+      "minItems": 1,
+      "maxItems": 64,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]*$"
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "properties": {
+        "max_wall_time_seconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 604800
+        },
+        "max_idle_seconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 86400
+        },
+        "max_attempts": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 10000000000
+        }
+      },
+      "required": [
+        "max_wall_time_seconds",
+        "max_idle_seconds",
+        "max_attempts",
+        "max_output_bytes"
+      ],
+      "additionalProperties": false
+    },
+    "created_by": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "human",
+            "agent",
+            "system",
+            "integration",
+            "scheduler"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "model_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "runtime_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        }
+      },
+      "required": [
+        "type",
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "assignment_id",
+    "revision",
+    "previous_revision_hash",
+    "task_id",
+    "contract_ref",
+    "objective",
+    "role",
+    "scope",
+    "required_capabilities",
+    "preferred_capabilities",
+    "verification",
+    "required_evidence",
+    "budgets",
+    "created_by",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/assignment-v1.schema.json"
+}

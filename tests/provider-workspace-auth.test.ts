@@ -22,6 +22,12 @@ const t = ((key: string, vars?: Record<string, string | number>) => {
 }) as TFn;
 
 describe("provider workspace auth surface", () => {
+  test("classic account login renders the Cline brand name", async () => {
+    const page = await Bun.file("gui/src/pages/Providers.tsx").text();
+    expect(page).toContain('cline: "Cline"');
+    expect(page).toContain('<span className="oauth-name-text">{oauthLabel(p)}</span>');
+  });
+
   test("only canonical OpenAI forward owns the Codex account pool", () => {
     const canonical = provider("openai", {
       adapter: "openai-responses",

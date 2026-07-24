@@ -285,9 +285,10 @@ describe("Cursor native exec bridge", () => {
 
   test("runs harmless shell commands", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ocx-cursor-shell-"));
+    const command = `"${process.execPath}" -e "process.stdout.write('cursor-ok')"`;
     const shell = decode((await handleCursorNativeExec(execMessage({
       case: "shellArgs",
-      value: create(ShellArgsSchema, { command: "printf cursor-ok", workingDirectory: dir }),
+      value: create(ShellArgsSchema, { command, workingDirectory: dir }),
     }), { unsafeAllowNativeLocalExec: true }))[0]);
 
     expect(shell.message.case).toBe("shellResult");
@@ -299,9 +300,10 @@ describe("Cursor native exec bridge", () => {
 
   test("returns shell stream events for shellStreamArgs", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ocx-cursor-stream-"));
+    const command = `"${process.execPath}" -e "process.stdout.write('stream-ok')"`;
     const replies = await handleCursorNativeExec(execMessage({
       case: "shellStreamArgs",
-      value: create(ShellArgsSchema, { command: "printf stream-ok", workingDirectory: dir }),
+      value: create(ShellArgsSchema, { command, workingDirectory: dir }),
     }), { unsafeAllowNativeLocalExec: true });
     const decodedAll = replies.map(reply => fromBinary(AgentClientMessageSchema, reply));
     const execFrames = decodedAll

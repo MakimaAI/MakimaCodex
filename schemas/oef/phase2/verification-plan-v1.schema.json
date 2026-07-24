@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "verification_plan_id": {
+      "type": "string",
+      "pattern": "^verification:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "steps": {
+      "minItems": 1,
+      "maxItems": 128,
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]*$"
+              },
+              "type": {
+                "type": "string",
+                "const": "command"
+              },
+              "command": {
+                "type": "object",
+                "properties": {
+                  "executable": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000
+                  },
+                  "arguments": {
+                    "maxItems": 1024,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "maxLength": 50000
+                    }
+                  }
+                },
+                "required": [
+                  "executable",
+                  "arguments"
+                ],
+                "additionalProperties": false
+              },
+              "timeout_seconds": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 86400
+              },
+              "required": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "type",
+              "command",
+              "timeout_seconds",
+              "required"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]*$"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "changed-path-policy",
+                  "secret-scan",
+                  "dependency-change"
+                ]
+              },
+              "required": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "type",
+              "required"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "verification_plan_id",
+    "steps"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/verification-plan-v1.schema.json"
+}

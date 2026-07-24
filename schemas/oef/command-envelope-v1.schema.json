@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencodex.local/schemas/oef/command-envelope-v1.schema.json",
+  "title": "OEF Command Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "command_id", "command_type", "task_id", "expected_aggregate_version", "actor", "idempotency_key", "payload"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "command_id": { "type": "string", "minLength": 1, "maxLength": 300 },
+    "command_type": { "enum": ["CreateTask", "CreateContractRevision", "ProposeContractRevision", "ApproveContractRevision", "RejectContractRevision", "GrantApproval", "MigrateWorkflow", "TransitionTaskStage", "RecordEvidence", "VerifyEvidence", "InvalidateEvidence", "IssueVerdict", "ReopenTask", "BlockTask", "UnblockTask", "CancelTask"] },
+    "task_id": { "type": "string", "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$" },
+    "expected_aggregate_version": { "type": "integer", "minimum": 0 },
+    "actor": { "$ref": "actor-v1.schema.json" },
+    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "payload": {}
+  }
+}

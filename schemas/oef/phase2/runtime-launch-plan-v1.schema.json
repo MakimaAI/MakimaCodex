@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "executable": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "arguments": {
+      "maxItems": 1024,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 50000
+      }
+    },
+    "working_directory": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "inherited": {
+          "maxItems": 128,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          }
+        },
+        "injected_secret_refs": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^secret-ref:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          }
+        },
+        "path_prepend": {
+          "maxItems": 32,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          }
+        }
+      },
+      "required": [
+        "inherited",
+        "injected_secret_refs"
+      ],
+      "additionalProperties": false
+    },
+    "stdin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "closed"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "pipe"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "file"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4000
+            }
+          },
+          "required": [
+            "mode",
+            "path"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "output_protocol": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "jsonl",
+            "text"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "type",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "timeouts": {
+      "type": "object",
+      "properties": {
+        "startup_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3600
+        },
+        "idle_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 86400
+        },
+        "tool_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 86400
+        },
+        "total_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 604800
+        },
+        "graceful_shutdown_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 600
+        }
+      },
+      "required": [
+        "startup_seconds",
+        "idle_seconds",
+        "tool_seconds",
+        "total_seconds",
+        "graceful_shutdown_seconds"
+      ],
+      "additionalProperties": false
+    },
+    "output_limit_bytes": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 10000000000
+    },
+    "prompt_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "executable",
+    "arguments",
+    "working_directory",
+    "environment",
+    "stdin",
+    "output_protocol",
+    "timeouts",
+    "output_limit_bytes",
+    "prompt_hash"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/runtime-launch-plan-v1.schema.json"
+}

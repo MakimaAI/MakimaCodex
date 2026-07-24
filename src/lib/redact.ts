@@ -3,6 +3,8 @@ export const REDACTED_SECRET = "[REDACTED]";
 const SENSITIVE_KEY_PATTERN = /^(?:authorization|proxy-authorization|cookie|set-cookie|set-cookie2|api[-_]?key|x-api-key|x-goog-api-key|x-amz-security-token|access[-_]?token|refresh[-_]?token|id[-_]?token|token|secret|client[-_]?secret|password|profile[-_]?arn)$/i;
 
 const SECRET_VALUE_PATTERNS: Array<[RegExp, string]> = [
+  [/\bBearer\s+workos:[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])/gi, `Bearer ${REDACTED_SECRET}`],
+  [/\bworkos:[A-Za-z0-9._~+/=-]{8,}(?![A-Za-z0-9._~+/=-])/gi, REDACTED_SECRET],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, `Bearer ${REDACTED_SECRET}`],
   [/\b(sk-[A-Za-z0-9][A-Za-z0-9._-]{6,})\b/g, REDACTED_SECRET],
   // GitHub tokens (classic + fine-grained + OAuth/refresh): ghp_/gho_/ghu_/ghs_/ghr_/github_pat_.

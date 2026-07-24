@@ -563,6 +563,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
   }
   const summaryMode = data.reasoning?.summary;
   if (!summaryMode || summaryMode === "none") options.hideThinkingSummary = true;
+  if (summaryMode === "none") options.hideRawReasoningSummary = true;
   if (data.presence_penalty !== undefined) options.presencePenalty = data.presence_penalty;
   if (data.frequency_penalty !== undefined) options.frequencyPenalty = data.frequency_penalty;
   if (data.service_tier !== undefined) options.serviceTier = data.service_tier;

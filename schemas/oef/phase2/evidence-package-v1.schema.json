@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "pattern": "^task:"
+    },
+    "contract_revision_id": {
+      "type": "string",
+      "pattern": "^contract-revision:"
+    },
+    "assignment_id": {
+      "type": "string",
+      "pattern": "^assignment:"
+    },
+    "attempt_id": {
+      "type": "string",
+      "pattern": "^attempt:"
+    },
+    "manifest_ref": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "pattern": "^artifact:"
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "content_hash"
+      ],
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "execution_completed": {
+          "type": "boolean"
+        },
+        "mechanical_verification": {
+          "type": "string",
+          "enum": [
+            "PASSED",
+            "FAILED",
+            "BLOCKED",
+            "NOT_RUN"
+          ]
+        }
+      },
+      "required": [
+        "execution_completed",
+        "mechanical_verification"
+      ],
+      "additionalProperties": false
+    },
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "evidence_package_id": {
+      "type": "string",
+      "pattern": "^evidence-package:[a-f0-9]{64}$"
+    },
+    "evidence": {
+      "maxItems": 256,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^artifact:"
+          },
+          "content_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "type": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "valid": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "artifact_id",
+          "content_hash",
+          "type",
+          "valid"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "properties": {
+        "package_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "artifacts_valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "package_hash",
+        "artifacts_valid"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "task_id",
+    "contract_revision_id",
+    "assignment_id",
+    "attempt_id",
+    "manifest_ref",
+    "result",
+    "schema_version",
+    "evidence_package_id",
+    "evidence",
+    "integrity"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/evidence-package-v1.schema.json"
+}

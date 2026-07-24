@@ -5,6 +5,7 @@ import { Trans } from "../i18n/provider";
 import { useI18n, type TKey } from "../i18n/shared";
 import { formatTokens } from "../format-tokens";
 import { EmptyState, Select } from "../ui";
+import { startDashboardPolling, type DashboardPollingHost } from "../dashboard-polling";
 
 interface HealthData { status: string; version: string; uptime: number }
 interface ProviderInfo { name: string; adapter: string; baseUrl: string; defaultModel?: string; hasApiKey: boolean }
@@ -73,6 +74,16 @@ interface UpdateJob {
 const EFFORT_CAP_LEVELS = ["low", "medium", "high", "xhigh"];
 const UPDATE_CHECK_MAX_AUTO_RETRIES = 2;
 const UPDATE_CHECK_RETRY_BASE_MS = 800;
+
+function browserDashboardPollingHost(): DashboardPollingHost {
+  return {
+    isHidden: () => document.hidden,
+    setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+    clearTimeout: timerId => window.clearTimeout(timerId),
+    addVisibilityListener: listener => document.addEventListener("visibilitychange", listener),
+    removeVisibilityListener: listener => document.removeEventListener("visibilitychange", listener),
+  };
+}
 
 function defaultUpdateChannel(version: string | undefined): UpdateChannel {
   return version?.includes("-preview.") ? "preview" : "latest";
@@ -209,6 +220,8 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
   const updateRetryRef = useRef(0);
   const updateRetryTimerRef = useRef<number | null>(null);
   const updateRequestEpochRef = useRef(0);
+  const dashboardRefreshEpochRef = useRef(0);
+  const dashboardMutationsInFlightRef = useRef(0);
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckData | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [updateJob, setUpdateJob] = useState<UpdateJob | null>(null);
@@ -220,6 +233,17 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
   const effortCapHelpDialogRef = useModalDialog(effortCapHelpOpen, effortCapHelpTriggerRef);
   const updateDialogRef = useModalDialog(updateOpen, updateTriggerRef);
   const maHelpDialogRef = useModalDialog(maHelpOpen, maHelpTriggerRef);
+  const beginDashboardMutation = () => {
+    dashboardMutationsInFlightRef.current += 1;
+    dashboardRefreshEpochRef.current += 1;
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      dashboardMutationsInFlightRef.current -= 1;
+      dashboardRefreshEpochRef.current += 1;
+    };
+  };
 
   useEffect(() => () => {
     updateRequestEpochRef.current += 1;
@@ -230,38 +254,55 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
   }, []);
 
   useEffect(() => {
-    const fetchData = async () => {
+    const fetchData = async (signal: AbortSignal) => {
+      const refreshEpoch = dashboardRefreshEpochRef.current;
+      const canCommitRefresh = () => (
+        !signal.aborted
+        && dashboardMutationsInFlightRef.current === 0
+        && dashboardRefreshEpochRef.current === refreshEpoch
+      );
       try {
         const [hRes, pRes, sRes, scRes, shRes, uRes] = await Promise.all([
-          fetch(`${apiBase}/healthz`),
-          fetch(`${apiBase}/api/providers`),
-          fetch(`${apiBase}/api/settings`),
-          fetch(`${apiBase}/api/sidecar-settings`),
-          fetch(`${apiBase}/api/shadow-call-settings`),
-          fetch(`${apiBase}/api/usage?range=30d`),
+          fetch(`${apiBase}/healthz`, { signal }),
+          fetch(`${apiBase}/api/providers`, { signal }),
+          fetch(`${apiBase}/api/settings`, { signal }),
+          fetch(`${apiBase}/api/sidecar-settings`, { signal }),
+          fetch(`${apiBase}/api/shadow-call-settings`, { signal }),
+          fetch(`${apiBase}/api/usage?range=30d`, { signal }),
         ]);
-        setHealth(await hRes.json());
-        setProviders(await pRes.json());
-        setSettings(await sRes.json());
-        setSidecar(await scRes.json());
+        const healthData = await hRes.json() as HealthData;
+        const providersData = await pRes.json() as ProviderInfo[];
+        const settingsData = await sRes.json() as SettingsData;
+        const sidecarData = await scRes.json() as SidecarData;
         // Old servers fall through to the SPA HTML for this route; don't let a parse
         // failure here take down the whole dashboard.
-        try { if (shRes.ok) setShadowCall(await shRes.json()); } catch { setShadowCall(null); }
-        try { setUsage30d(uRes.ok ? await uRes.json() : null); } catch { setUsage30d(null); }
+        let shadowCallData: ShadowCallData | null = null;
+        try { if (shRes.ok) shadowCallData = await shRes.json() as ShadowCallData; } catch { /* old server */ }
+        let usageData: UsageSummary30d | null = null;
+        try { usageData = uRes.ok ? await uRes.json() as UsageSummary30d : null; } catch { /* optional */ }
+        if (!canCommitRefresh()) return;
+        setHealth(healthData);
+        setProviders(providersData);
+        setSettings(settingsData);
+        setSidecar(sidecarData);
+        setShadowCall(shadowCallData);
+        setUsage30d(usageData);
         setError(false);
         // Best-effort v2 mode fetch (independent of core health)
         try {
-          const v2Res = await fetch(`${apiBase}/api/v2`);
+          const v2Res = await fetch(`${apiBase}/api/v2`, { signal });
           if (v2Res.ok) {
             const v2Data = await v2Res.json();
+            if (!canCommitRefresh()) return;
             if (v2Data.multiAgentMode === "v1" || v2Data.multiAgentMode === "v2") setMaMode(v2Data.multiAgentMode);
             else setMaMode("default");
           }
         } catch { /* old server */ }
         try {
-          const imRes = await fetch(`${apiBase}/api/injection-model`);
+          const imRes = await fetch(`${apiBase}/api/injection-model`, { signal });
           if (imRes.ok) {
             const imData = await imRes.json() as { model?: string | null; effort?: string | null; efforts?: string[]; available?: Array<{ provider: string; model: string; namespaced: string }> };
+            if (!canCommitRefresh()) return;
             setInjectionModel(imData.model ?? "");
             setInjectionEffort(imData.effort ?? "");
             setInjectionEfforts(imData.efforts ?? []);
@@ -269,35 +310,40 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
           }
         } catch { /* old server */ }
         try {
-          const ecRes = await fetch(`${apiBase}/api/effort-caps`);
+          const ecRes = await fetch(`${apiBase}/api/effort-caps`, { signal });
           if (ecRes.ok) {
             const ecData = await ecRes.json() as { effortCap?: string | null; subagentEffortCap?: string | null; efforts?: string[] };
+            if (!canCommitRefresh()) return;
             setEffortCap(ecData.effortCap ?? "");
             setSubagentEffortCap(ecData.subagentEffortCap ?? "");
           }
         } catch { /* old server */ }
       } catch {
-        setError(true);
+        if (canCommitRefresh()) setError(true);
       }
     };
-    fetchData();
-    const interval = setInterval(fetchData, 5000);
-    return () => clearInterval(interval);
+    return startDashboardPolling({
+      intervalMs: 5_000,
+      host: browserDashboardPollingHost(),
+      run: fetchData,
+    });
   }, [apiBase]);
 
   useEffect(() => {
-    const fetchDiagnostics = async () => {
+    const fetchDiagnostics = async (signal: AbortSignal) => {
       try {
-        const pcRes = await fetch(`${apiBase}/api/diagnostics/project-config`);
+        const pcRes = await fetch(`${apiBase}/api/diagnostics/project-config`, { signal });
         const pcData = pcRes.ok ? await pcRes.json() as { grouped?: ProjectCodexConfigGroup[] } : null;
-        setProjectConfigWarnings(pcData?.grouped ?? []);
+        if (!signal.aborted) setProjectConfigWarnings(pcData?.grouped ?? []);
       } catch {
-        setProjectConfigWarnings([]);
+        if (!signal.aborted) setProjectConfigWarnings([]);
       }
     };
-    void fetchDiagnostics();
-    const interval = setInterval(() => void fetchDiagnostics(), 30_000);
-    return () => clearInterval(interval);
+    return startDashboardPolling({
+      intervalMs: 30_000,
+      host: browserDashboardPollingHost(),
+      run: fetchDiagnostics,
+    });
   }, [apiBase]);
 
   const fetchModels = useCallback(async () => {
@@ -322,14 +368,13 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
 
   useEffect(() => {
     if (!updateJob?.id || !updateJob.restart) return;
-    let cancelled = false;
     const targetVersion = updateJob.latestVersion;
-    const poll = async () => {
+    const poll = async (signal: AbortSignal) => {
       try {
-        const res = await fetch(`${apiBase}/api/update/status?jobId=${encodeURIComponent(updateJob.id)}`);
+        const res = await fetch(`${apiBase}/api/update/status?jobId=${encodeURIComponent(updateJob.id)}`, { signal });
         if (res.ok) {
           const data = await res.json() as { job?: UpdateJob };
-          if (!cancelled && data.job) {
+          if (!signal.aborted && data.job) {
             setUpdateJob(data.job);
             if (data.job.status === "failed") {
               setReconnecting(false);
@@ -338,25 +383,27 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
           }
         }
       } catch {
-        if (!cancelled) setReconnecting(true);
+        if (!signal.aborted) setReconnecting(true);
       }
 
-      if (!targetVersion) return;
+      if (signal.aborted || !targetVersion) return;
       try {
-        const healthRes = await fetch(`${apiBase}/healthz`, { cache: "no-store" });
+        const healthRes = await fetch(`${apiBase}/healthz`, { cache: "no-store", signal });
         if (!healthRes.ok) throw new Error("health failed");
         const data = await healthRes.json() as HealthData;
-        if (!cancelled && data.version === targetVersion) {
+        if (!signal.aborted && data.version === targetVersion) {
           setReconnecting(false);
           window.location.reload();
         }
       } catch {
-        if (!cancelled) setReconnecting(true);
+        if (!signal.aborted) setReconnecting(true);
       }
     };
-    poll();
-    const interval = setInterval(poll, 1500);
-    return () => { cancelled = true; clearInterval(interval); };
+    return startDashboardPolling({
+      intervalMs: 1_500,
+      host: browserDashboardPollingHost(),
+      run: poll,
+    });
   }, [apiBase, updateJob?.id, updateJob?.latestVersion, updateJob?.restart]);
 
   // Group models by provider so the list reads as provider → its models, not one flat wall of cards.
@@ -380,6 +427,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
 
   const saveSidecar = async (patch: SidecarPatch) => {
     if (!sidecar || sidecarSaving) return;
+    const finishDashboardMutation = beginDashboardMutation();
     const next = {
       webSearch: mergeSidecarSetting(sidecar.webSearch, patch.webSearch),
       vision: mergeSidecarSetting(sidecar.vision, patch.vision),
@@ -398,12 +446,14 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
     } catch {
       setSidecar(sidecar);
     } finally {
+      finishDashboardMutation();
       setSidecarSaving(false);
     }
   };
 
   async function saveShadowCall(patch: Partial<ShadowCallData>) {
     if (!shadowCall || shadowCallSaving) return;
+    const finishDashboardMutation = beginDashboardMutation();
     setShadowCallSaving(true);
     const updated = { ...shadowCall, ...patch };
     setShadowCall(updated);
@@ -414,12 +464,14 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
         body: JSON.stringify(patch),
       });
     } finally {
+      finishDashboardMutation();
       setShadowCallSaving(false);
     }
   }
 
   const switchMaMode = async (mode: "v1" | "default" | "v2") => {
     if (maBusy || maMode === mode) return;
+    const finishDashboardMutation = beginDashboardMutation();
     setMaBusy(true);
     try {
       const r = await fetch(`${apiBase}/api/v2`, {
@@ -429,11 +481,15 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
       });
       if (r.ok) setMaMode(mode);
     } catch { /* ignore */ }
-    finally { setMaBusy(false); }
+    finally {
+      finishDashboardMutation();
+      setMaBusy(false);
+    }
   };
 
   const toggleCodexAutoStart = async () => {
     if (!settings || settingsSaving) return;
+    const finishDashboardMutation = beginDashboardMutation();
     const next = !settings.codexAutoStart;
     setSettingsSaving(true);
     setSettings({ ...settings, codexAutoStart: next });
@@ -450,6 +506,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
       setSettings(prev => prev ? { ...prev, codexAutoStart: !next } : prev);
       setError(true);
     } finally {
+      finishDashboardMutation();
       setSettingsSaving(false);
     }
   };
@@ -681,6 +738,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
             ]}
             onChange={async (v) => {
               if (effortCapSaving) return;
+              const finishDashboardMutation = beginDashboardMutation();
               setEffortCapSaving(true);
               try {
                 const res = await fetch(`${apiBase}/api/effort-caps`, {
@@ -694,7 +752,10 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
                   setSubagentEffortCap(data.subagentEffortCap ?? "");
                 }
               } catch { /* ignore */ }
-              finally { setEffortCapSaving(false); }
+              finally {
+                finishDashboardMutation();
+                setEffortCapSaving(false);
+              }
             }}
             disabled={effortCapSaving}
             label={t("dash.effortCapLabel")}
@@ -707,6 +768,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
             ]}
             onChange={async (v) => {
               if (effortCapSaving) return;
+              const finishDashboardMutation = beginDashboardMutation();
               setEffortCapSaving(true);
               try {
                 const res = await fetch(`${apiBase}/api/effort-caps`, {
@@ -720,7 +782,10 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
                   setSubagentEffortCap(data.subagentEffortCap ?? "");
                 }
               } catch { /* ignore */ }
-              finally { setEffortCapSaving(false); }
+              finally {
+                finishDashboardMutation();
+                setEffortCapSaving(false);
+              }
             }}
             disabled={effortCapSaving}
             label={t("dash.subagentEffortCapLabel")}
@@ -740,6 +805,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
             ]}
             onChange={async (v) => {
               if (injectionSaving) return;
+              const finishDashboardMutation = beginDashboardMutation();
               setInjectionSaving(true);
               try {
                 const res = await fetch(`${apiBase}/api/injection-model`, {
@@ -753,7 +819,10 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
                   setInjectionEffort(data.effort ?? "");
                 }
               } catch { /* ignore */ }
-              finally { setInjectionSaving(false); }
+              finally {
+                finishDashboardMutation();
+                setInjectionSaving(false);
+              }
             }}
             disabled={injectionSaving}
             label={t("dash.injectionLabel")}
@@ -767,6 +836,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
               ]}
               onChange={async (v) => {
                 if (injectionSaving) return;
+                const finishDashboardMutation = beginDashboardMutation();
                 setInjectionSaving(true);
                 try {
                   const res = await fetch(`${apiBase}/api/injection-model`, {
@@ -780,7 +850,10 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
                     setInjectionEffort(data.effort ?? "");
                   }
                 } catch { /* ignore */ }
-                finally { setInjectionSaving(false); }
+                finally {
+                  finishDashboardMutation();
+                  setInjectionSaving(false);
+                }
               }}
               disabled={injectionSaving}
               label={t("dash.injectionEffortLabel")}

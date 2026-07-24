@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,11 +15,22 @@ import { XAI_OAUTH_DISCOVERY_URL } from "../src/oauth/xai";
 import { XAI_GROK_CLI_BASE_URL } from "../src/providers/xai-transport";
 import type { AdapterEvent, OcxConfig, OcxProviderConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
-import { clearRequestLogsForTests, type RequestLogContext } from "../src/server/request-log";
+import {
+  addFinalRequestLog,
+  clearRequestLogsForTests,
+  getRequestLogEntries,
+  httpStatusForTerminalStatus,
+  type RequestLogContext,
+} from "../src/server/request-log";
 import { responseWithDeferredRequestLog } from "../src/server/relay";
+import {
+  clearResponseStateForTests,
+  flushResponseState,
+} from "../src/responses/state";
 import { readUsageEntries } from "../src/usage/log";
 import { saveCodexAccountCredential } from "../src/codex/account-store";
 import { formatCodexProviderForLog } from "../src/codex/routing";
+import { subagentHandoffStore } from "../src/subagent-bridge/handoff-store";
 
 const actualResolver = await import("../src/server/adapter-resolve");
 const actualResolveAdapter = actualResolver.resolveAdapter;
@@ -33,6 +44,20 @@ let customUsageEstimate: ((model: string) => number | undefined) | undefined;
 mock.module("../src/server/adapter-resolve", () => ({
   ...actualResolver,
   resolveAdapter(provider: OcxProviderConfig, cacheRetention?: "none" | "short" | "long") {
+    if (provider.adapter === "openai-chat" && provider.baseUrl === "https://raw-reasoning-run-turn.test/v1") {
+      const adapter: ProviderAdapter = {
+        name: "openai-chat",
+        buildRequest: () => ({ url: provider.baseUrl, method: "POST", headers: {}, body: "" }),
+        async *parseStream(): AsyncGenerator<AdapterEvent> {
+          yield { type: "error", message: "raw reasoning runTurn adapter does not use parseStream" };
+        },
+        async runTurn(parsed, incoming, emit) {
+          if (!customRunTurn) throw new Error("custom runTurn not installed");
+          await customRunTurn(parsed, incoming, emit);
+        },
+      };
+      return adapter;
+    }
     if (provider.adapter === "test-run-turn") {
       const adapter: ProviderAdapter = {
         name: "test-run-turn",
@@ -84,6 +109,7 @@ type HandleOptions = NonNullable<Parameters<typeof handleResponses>[3]>;
 
 const TOKEN_ENDPOINT = "https://auth.x.ai/oauth/token";
 const XAI_CHAT_ENDPOINT = `${XAI_GROK_CLI_BASE_URL}/chat/completions`;
+const BRIDGE_FERNET = "gAAAAABnX6DqvQfLy4CIvIQp9x1G7m2JXjvXgWIBu8VG6OKoyHDyEwE6Q9H9YfdwWlQF-Qj3Hb_RkPBMFa9_k54XfOpfK0S7Ng==";
 
 let testDir = "";
 let previousHome: string | undefined;
@@ -102,6 +128,7 @@ beforeEach(() => {
   isolatedCodexHome = installIsolatedCodexHome("ocx-combo-030-codex-");
   testDir = mkdtempSync(join(tmpdir(), "ocx-combo-030-"));
   process.env.OPENCODEX_HOME = testDir;
+  clearResponseStateForTests();
   clearComboSelectionState();
   clearComboTargetCooldowns();
   customRunTurn = undefined;
@@ -109,12 +136,14 @@ beforeEach(() => {
   customTransientResponse = undefined;
   customUsageEstimate = undefined;
   clearRequestLogsForTests();
+  subagentHandoffStore.clear();
 });
 
 afterEach(async () => {
   globalThis.fetch = originalFetch;
   Date.now = originalNow;
   for (const server of servers.splice(0)) await server.stop(true);
+  clearResponseStateForTests();
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   if (previousCursorToken === undefined) delete process.env.OPENCODEX_CURSOR_TEST_TOKEN;
@@ -125,7 +154,19 @@ afterEach(async () => {
   clearComboSelectionState();
   clearComboTargetCooldowns();
   clearRequestLogsForTests();
+  subagentHandoffStore.clear();
 });
+
+function bridgeAgentMessage(target: string) {
+  return {
+    type: "agent_message",
+    recipient: target,
+    content: [
+      { type: "input_text", text: `Message Type: MESSAGE\nTask name: ${target}\nSender: /root\nPayload:\n` },
+      { type: "encrypted_content", encrypted_content: BRIDGE_FERNET },
+    ],
+  };
+}
 
 function serve(handler: (request: Request) => Response | Promise<Response>) {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: handler });
@@ -347,6 +388,244 @@ describe("server combo failover 030 activation matrix", () => {
     expect(streaming.status).toBe(200);
     expect(JSON.stringify(await collectSse(streaming))).toContain("stream backup");
     expect(hits).toEqual(["a:false", "b:false", "a:true", "b:true"]);
+  });
+
+  test("recovered combo failover keeps echoed plaintext out of the final response and logs", async () => {
+    const target = "/root/private_combo_000000000001";
+    const plaintext = "COMBO_PRIVATE_NONCE_86be31";
+    const seenBodies: string[] = [];
+    const failed = (label: string) => serve(async request => {
+      seenBodies.push(await request.text());
+      return Response.json({ error: { message: `${label} echoed ${plaintext} and ${BRIDGE_FERNET}` } }, { status: 503 });
+    });
+    const a = failed("first");
+    const b = failed("second");
+    const config = comboConfig({
+      a: provider("openai-chat", baseUrl(a), "key-a"),
+      b: provider("openai-chat", baseUrl(b), "key-b"),
+    });
+    config.subagentBridge = { enabled: true };
+    config.subagentModels = ["combo/free"];
+    subagentHandoffStore.stageMessage({ kind: "message", target, message: plaintext });
+
+    const response = await postLogged(config, { input: [bridgeAgentMessage(target)], store: false });
+    const responseText = await response.text();
+    const receipts = await latestAttemptReceipts(config);
+
+    expect(response.status).toBe(503);
+    expect(seenBodies).toHaveLength(2);
+    expect(seenBodies.every(body => body.includes(plaintext))).toBe(true);
+    expect(responseText).toContain("Provider error 503");
+    expect(responseText).not.toContain(plaintext);
+    expect(responseText).not.toContain(BRIDGE_FERNET);
+    expect(JSON.stringify(receipts)).not.toContain(plaintext);
+    expect(JSON.stringify(receipts)).not.toContain(BRIDGE_FERNET);
+  });
+
+  test("recovered adapter exceptions expose only generic error metadata while ordinary errors stay unchanged", async () => {
+    const target = "/root/private_adapter_000000000001";
+    const plaintext = "ADAPTER_PRIVATE_NONCE_63a94f";
+    const adapterDetail = `adapter exception echoed ${plaintext} and ${BRIDGE_FERNET}`;
+    customRunTurn = async () => { throw new Error(adapterDetail); };
+    const config: OcxConfig = {
+      port: 0,
+      defaultProvider: "a",
+      providers: { a: provider("test-run-turn", "test://run-turn", "key-a") },
+      subagentBridge: { enabled: true },
+      subagentModels: ["a/m1"],
+    };
+    subagentHandoffStore.stageMessage({ kind: "message", target, message: plaintext });
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const started = Date.now();
+    const raw = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "a/m1", input: [bridgeAgentMessage(target)], stream: false, store: false }),
+    }), config, logCtx);
+    const sensitive = responseWithDeferredRequestLog(raw, "sensitive-adapter", started, logCtx);
+    const sensitiveText = await sensitive.text();
+
+    expect(sensitiveText).toContain("Provider error 502");
+    expect(sensitiveText).toContain("upstream_server_error");
+    expect(sensitiveText).not.toContain(plaintext);
+    expect(sensitiveText).not.toContain(BRIDGE_FERNET);
+    expect(JSON.stringify(getRequestLogEntries().at(-1))).not.toContain(plaintext);
+    expect(JSON.stringify(getRequestLogEntries().at(-1))).not.toContain(BRIDGE_FERNET);
+
+    const ordinary = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "a/m1", input: "ordinary", stream: false, store: false }),
+    }), config, { model: "", provider: "" });
+    expect(await ordinary.text()).toContain(adapterDetail);
+  });
+
+  test("recovered passthrough response.failed SSE discards every upstream line and metadata field", async () => {
+    const target = "/root/private_sse_000000000001";
+    const plaintext = "PASSTHROUGH_PRIVATE_NONCE_d9e7a1";
+    const detail = `passthrough echoed ${plaintext} and ${BRIDGE_FERNET}`;
+    const failure = { type: "server_error", code: "server_is_overloaded", message: detail };
+    const sse = [
+      `id: private-${plaintext}\n: private comment ${plaintext}\nx-provider-debug: ${plaintext}\nevent: response.failed\ndata: ${JSON.stringify({
+        type: "response.failed",
+        provider_event_debug: plaintext,
+        response: {
+          status: "failed",
+          id: `resp-${plaintext}`,
+          model: `private-model-${plaintext}`,
+          service_tier: `private-tier-${plaintext}`,
+          error: failure,
+          last_error: failure,
+          provider_debug: `extra echo ${plaintext} and ${BRIDGE_FERNET}`,
+        },
+      })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("");
+    customTransientResponse = async () => new Response(sse, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const config: OcxConfig = {
+      port: 0,
+      defaultProvider: "a",
+      providers: { a: provider("openai-responses", "https://passthrough.test/v1", "key-a") },
+      subagentBridge: { enabled: true },
+      subagentModels: ["a/m1"],
+    };
+    subagentHandoffStore.stageMessage({ kind: "message", target, message: plaintext });
+
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const started = Date.now();
+    const finalized = deferred();
+    const sensitive = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "a/m1", input: [bridgeAgentMessage(target)], stream: true, store: false }),
+    }), config, logCtx, {
+      onNativePassthroughTerminal: status => {
+        addFinalRequestLog("sensitive-sse-lines", started, logCtx, httpStatusForTerminalStatus(status), {
+          terminalStatus: status,
+          closeReason: "terminal",
+        });
+        finalized.resolve();
+      },
+    });
+    const sensitiveText = await sensitive.text();
+    await within(finalized.promise);
+    const sensitiveBlocks = sensitiveText.split("\n\n").filter(block => block.trim() && !block.includes("[DONE]"));
+    expect(sensitiveBlocks).toHaveLength(1);
+    expect(sensitiveBlocks[0]!.split("\n")[0]).toBe("event: response.failed");
+    expect(sensitiveText).toContain("server_is_overloaded");
+    expect(sensitiveText).toContain("Provider error 503");
+    expect(sensitiveText).not.toContain(plaintext);
+    expect(sensitiveText).not.toContain(BRIDGE_FERNET);
+    expect(JSON.stringify(getRequestLogEntries().at(-1))).not.toContain(plaintext);
+    expect(JSON.stringify(getRequestLogEntries().at(-1))).not.toContain(BRIDGE_FERNET);
+    flushResponseState();
+    const snapshotPath = join(testDir, "responses-state.json");
+    const snapshot = existsSync(snapshotPath) ? readFileSync(snapshotPath, "utf8") : "";
+    expect(snapshot).not.toContain(plaintext);
+    expect(snapshot).not.toContain(BRIDGE_FERNET);
+
+    const ordinary = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "a/m1", input: "ordinary", stream: true, store: false }),
+    }), config, { model: "", provider: "" });
+    expect(await ordinary.text()).toContain(detail);
+  });
+
+  test("recovered HTTP-200 JSON protocol failure is rebuilt from minimal safe metadata", async () => {
+    const target = "/root/private_json_000000000001";
+    const plaintext = "JSON_PROTOCOL_PRIVATE_NONCE_2c8e71";
+    const upstreamFailure = {
+      id: `resp-${plaintext}`,
+      object: "response",
+      created_at: 1,
+      status: "failed",
+      model: `private-model-${plaintext}`,
+      service_tier: `private-tier-${plaintext}`,
+      error: {
+        type: "server_error",
+        code: "server_is_overloaded",
+        message: `provider echoed ${plaintext} and ${BRIDGE_FERNET}`,
+        provider_debug: plaintext,
+      },
+      output: [{ type: "message", content: plaintext }],
+      arbitrary_provider_field: plaintext,
+    };
+    customTransientResponse = async () => Response.json(upstreamFailure);
+    const config: OcxConfig = {
+      port: 0,
+      defaultProvider: "a",
+      providers: { a: provider("openai-responses", "https://passthrough.test/v1", "key-a") },
+      subagentBridge: { enabled: true },
+      subagentModels: ["a/m1"],
+    };
+    subagentHandoffStore.stageMessage({ kind: "message", target, message: plaintext });
+
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const raw = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "a/m1", input: [bridgeAgentMessage(target)], stream: false, store: true }),
+    }), config, logCtx);
+    const sensitive = responseWithDeferredRequestLog(raw, "sensitive-json-protocol", Date.now(), logCtx);
+    const sensitiveJson = await sensitive.json() as Record<string, unknown>;
+    expect(sensitive.status).toBe(200);
+    expect(Object.keys(sensitiveJson).sort()).toEqual(["error", "status"]);
+    expect(sensitiveJson).toEqual({
+      status: "failed",
+      error: {
+        type: "server_error",
+        code: "server_is_overloaded",
+        message: "Provider error 503",
+      },
+    });
+    expect(JSON.stringify(getRequestLogEntries().at(-1))).not.toContain(plaintext);
+    expect(JSON.stringify(getRequestLogEntries().at(-1))).not.toContain(BRIDGE_FERNET);
+    flushResponseState();
+    const snapshotPath = join(testDir, "responses-state.json");
+    const snapshot = existsSync(snapshotPath) ? readFileSync(snapshotPath, "utf8") : "";
+    expect(snapshot).not.toContain(plaintext);
+    expect(snapshot).not.toContain(BRIDGE_FERNET);
+
+    const ordinary = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "a/m1", input: "ordinary", stream: false, store: false }),
+    }), config, { model: "", provider: "" });
+    expect(await ordinary.json()).toEqual(upstreamFailure);
+  });
+
+  test("recovered combo 5xx ignores echoed classifier phrases and reaches the backup", async () => {
+    const target = "/root/private_classifier_000000000001";
+    const plaintext = "COMBO_CLASSIFIER_PRIVATE_NONCE_11df7c";
+    const hits: string[] = [];
+    const a = serve(() => {
+      hits.push("a");
+      return Response.json({
+        error: { message: `context_length_exceeded: invalid request echoed ${plaintext}` },
+      }, { status: 503 });
+    });
+    const b = serve(() => {
+      hits.push("b");
+      return chatSuccess("classifier-safe backup", "m2");
+    });
+    const config = comboConfig({
+      a: provider("openai-chat", baseUrl(a), "key-a"),
+      b: provider("openai-chat", baseUrl(b), "key-b"),
+    });
+    config.subagentBridge = { enabled: true };
+    config.subagentModels = ["combo/free"];
+    subagentHandoffStore.stageMessage({ kind: "message", target, message: plaintext });
+
+    const response = await postLogged(config, {
+      input: [bridgeAgentMessage(target)],
+      store: false,
+    });
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    expect(hits).toEqual(["a", "b"]);
+    expect(text).toContain("classifier-safe backup");
+    expect(text).not.toContain(plaintext);
+    expect(text).not.toContain(BRIDGE_FERNET);
+    expect(JSON.stringify(await latestAttemptReceipts(config))).not.toContain(plaintext);
+    expect(JSON.stringify(await latestAttemptReceipts(config))).not.toContain(BRIDGE_FERNET);
   });
 
   test("persists one logical A503 to B200 request with ordered physical usage", async () => {
@@ -654,6 +933,38 @@ describe("server combo failover 030 activation matrix", () => {
     expect(response.status).toBe(200);
     expect(JSON.stringify(await collectSse(response))).toContain("cursor backup");
     expect(bHits).toBe(1);
+  });
+
+  test("openai-chat runTurn promotes opted-in raw reasoning into native summary events", async () => {
+    customRunTurn = async (_parsed, _incoming, emit) => {
+      emit({ type: "reasoning_raw_delta", text: "runTurn plan" });
+      emit({ type: "text_delta", text: "runTurn answer" });
+      emit({ type: "done" });
+    };
+    const config: OcxConfig = {
+      port: 0,
+      defaultProvider: "raw",
+      providers: {
+        raw: {
+          adapter: "openai-chat",
+          baseUrl: "https://raw-reasoning-run-turn.test/v1",
+          apiKey: "test-key",
+          models: ["k3[1m]"],
+          showRawReasoning: true,
+        },
+      },
+    };
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "raw/k3[1m]", input: "hello", stream: true, reasoning: { summary: "auto" } }),
+    }), config, { model: "", provider: "" });
+
+    expect(response.status).toBe(200);
+    const frames = await collectSse(response);
+    expect(frames.some(frame => frame.event === "response.reasoning_summary_text.delta"
+      && frame.data.delta === "runTurn plan")).toBe(true);
+    expect(frames.some(frame => frame.event === "response.reasoning_text.delta")).toBe(false);
   });
 
   test("hosted web-search eager model failure hops through the loop path", async () => {

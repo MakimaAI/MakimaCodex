@@ -76,7 +76,22 @@ export function rotateKeyOn429(
   retryAfterHeader: string | null | undefined,
   now = Date.now(),
   attemptedKey?: string,
+  persistActive = true,
 ): OcxProviderConfig | null {
+  return rotateKeyOnStatus(config, providerName, 429, retryAfterHeader, now, attemptedKey, persistActive);
+}
+
+/** Rotate on a retryable pool status. 402 is reserved for exhausted subscription capacity. */
+export function rotateKeyOnStatus(
+  config: OcxConfig,
+  providerName: string,
+  status: 402 | 429 | number,
+  retryAfterHeader: string | null | undefined,
+  now = Date.now(),
+  attemptedKey?: string,
+  persistActive = true,
+): OcxProviderConfig | null {
+  if (status !== 402 && status !== 429) return null;
   const provider = config.providers[providerName];
   if (!provider) return null;
   if (provider.authMode === "oauth" || provider.authMode === "forward") return null;
@@ -90,7 +105,9 @@ export function rotateKeyOn429(
   const failedKey = attemptedKey ?? provider.apiKey;
   const currentEntry = pool.find(e => e.key === failedKey);
   if (currentEntry) {
-    const cooldownMs = parseRetryAfterMs(retryAfterHeader, now) ?? DEFAULT_COOLDOWN_MS;
+    const cooldownMs = status === 402
+      ? MAX_COOLDOWN_MS
+      : parseRetryAfterMs(retryAfterHeader, now) ?? DEFAULT_COOLDOWN_MS;
     keyCooldowns.set(cooldownKey(providerName, currentEntry.id), {
       cooldownUntil: now + cooldownMs,
     });
@@ -106,23 +123,25 @@ export function rotateKeyOn429(
   }
 
   // Pick the next key that is NOT in cooldown
-  const currentIndex = currentEntry ? pool.indexOf(currentEntry) : -1;
-  for (let i = 1; i < pool.length; i++) {
+  const currentIndex = currentEntry ? pool.indexOf(currentEntry) : 0;
+  const firstOffset = currentEntry ? 1 : 0;
+  for (let i = firstOffset; i < pool.length; i++) {
     const candidate = pool[(currentIndex + i) % pool.length]!;
     if (!isKeyInCooldown(providerName, candidate.id, now)) {
-      // Swap active key
-      provider.apiKey = candidate.key;
-      saveConfig(config);
+      if (persistActive) {
+        provider.apiKey = candidate.key;
+        saveConfig(config);
+      }
       console.warn(
         // Log ids only — labels are user-supplied free text and could carry secret material.
-        `[key-failover] ${providerName}: 429 on key ${currentEntry?.id ?? "?"}; rotating to key ${candidate.id}`,
+        `[key-failover] ${providerName}: ${status} on key ${currentEntry?.id ?? "?"}; rotating to key ${candidate.id}`,
       );
-      return { ...provider };
+      return { ...provider, apiKey: candidate.key };
     }
   }
 
   // All keys in cooldown
-  console.warn(`[key-failover] ${providerName}: all ${pool.length} keys in cooldown; returning 429 to client`);
+  console.warn(`[key-failover] ${providerName}: all ${pool.length} keys in cooldown; returning ${status} to client`);
   return null;
 }
 
@@ -131,6 +150,8 @@ interface RotateProviderTransportOptions {
   now?: number;
   attemptedKey?: string;
   promptCacheKey?: string;
+  /** Keep the candidate tentative until the caller observes a successful response. */
+  persistActive?: boolean;
 }
 
 /** Rotate a failed key and re-apply provider-specific transport metadata to the replacement. */
@@ -145,6 +166,45 @@ export function rotateProviderTransportOn429(
     options.retryAfter,
     options.now,
     options.attemptedKey,
+    options.persistActive,
+  );
+  return rotated
+    ? resolveProviderTransport(providerName, rotated, options.promptCacheKey)
+    : null;
+}
+
+/** Persist a successfully-tested pool key without overwriting a concurrent/manual switch. */
+export function commitProviderKeyAfterSuccessfulRetry(
+  config: OcxConfig,
+  providerName: string,
+  expectedActiveKey: string | undefined,
+  successfulKey: string | undefined,
+): boolean {
+  if (!successfulKey) return false;
+  const provider = config.providers[providerName];
+  if (!provider?.apiKeyPool?.some(entry => entry.key === successfulKey)) return false;
+  if (provider.apiKey === successfulKey) return true;
+  if (provider.apiKey !== expectedActiveKey) return false;
+  provider.apiKey = successfulKey;
+  saveConfig(config);
+  return true;
+}
+
+/** Rotate a key for a retryable status and re-apply provider-specific transport metadata. */
+export function rotateProviderTransportOnStatus(
+  config: OcxConfig,
+  providerName: string,
+  status: 402 | 429,
+  options: RotateProviderTransportOptions = {},
+): OcxProviderConfig | null {
+  const rotated = rotateKeyOnStatus(
+    config,
+    providerName,
+    status,
+    options.retryAfter,
+    options.now,
+    options.attemptedKey,
+    options.persistActive,
   );
   return rotated
     ? resolveProviderTransport(providerName, rotated, options.promptCacheKey)

@@ -10,6 +10,9 @@ export type AttemptRecoveryKind =
   | "transient-5xx"
   | "connection-reset"
   | "oauth-401"
+  | "oauth-402"
+  | "oauth-429"
+  | "key-402"
   | "key-429"
   | "image-413";
 
@@ -111,6 +114,9 @@ const ATTEMPT_RECOVERY_KINDS = new Set<AttemptRecoveryKind>([
   "transient-5xx",
   "connection-reset",
   "oauth-401",
+  "oauth-402",
+  "oauth-429",
+  "key-402",
   "key-429",
   "image-413",
 ]);

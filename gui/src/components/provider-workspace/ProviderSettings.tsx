@@ -10,8 +10,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { baseUrlForChoice, matchChoiceId, resolvedBaseUrlForChoice } from "../../base-url-choice";
 import { useT } from "../../i18n";
-import { IconLock } from "../../icons";
+import { IconAlert, IconLock } from "../../icons";
 import { isCatalogProviderId } from "../../provider-icons";
+import { rawReasoningPatchForAdapter, supportsRawReasoningSetting } from "../../provider-workspace/raw-reasoning";
+import { Switch } from "../../ui";
 import type { CatalogPreset } from "../provider-catalog/provider-presets";
 import { authModeLabel } from "./ProviderRail";
 import type { WorkspaceItem, ProviderUpdatePatch } from "./types";
@@ -40,6 +42,7 @@ export default function ProviderSettings({
   const [authMode, setAuthMode] = useState(initialAuth);
   const [note, setNote] = useState(item.note ?? "");
   const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(item.allowPrivateNetwork ?? false);
+  const [showRawReasoning, setShowRawReasoning] = useState(item.showRawReasoning ?? false);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [baseUrlChoices, setBaseUrlChoices] = useState<CatalogPreset["baseUrlChoices"]>();
@@ -54,9 +57,10 @@ export default function ProviderSettings({
     setAuthMode(String(item.authMode ?? (item.keyOptional ? "local" : "key")));
     setNote(item.note ?? "");
     setAllowPrivateNetwork(item.allowPrivateNetwork ?? false);
+    setShowRawReasoning(item.showRawReasoning ?? false);
     setMsg(null);
     queueMicrotask(() => setEndpointChoice(matchChoiceId(baseUrlChoices, item.baseUrl)));
-  }, [item.adapter, item.baseUrl, item.defaultModel, item.authMode, item.keyOptional, item.note, item.allowPrivateNetwork, baseUrlChoices]);
+  }, [item.adapter, item.baseUrl, item.defaultModel, item.authMode, item.keyOptional, item.note, item.allowPrivateNetwork, item.showRawReasoning, baseUrlChoices]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
@@ -84,12 +88,14 @@ export default function ProviderSettings({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- item.baseUrl sync is handled by the form-reset effect
   }, [apiBase, item.name]);
 
+  const rawReasoningAvailable = supportsRawReasoningSetting(adapter);
   const dirty = adapter.trim() !== item.adapter
     || baseUrl.trim() !== item.baseUrl
     || defaultModel.trim() !== (item.defaultModel ?? "")
     || authMode !== String(item.authMode ?? (item.keyOptional ? "local" : "key"))
     || note.trim() !== (item.note ?? "")
-    || allowPrivateNetwork !== (item.allowPrivateNetwork ?? false);
+    || allowPrivateNetwork !== (item.allowPrivateNetwork ?? false)
+    || (rawReasoningAvailable && showRawReasoning !== (item.showRawReasoning ?? false));
 
   useEffect(() => { onDirtyChange?.(dirty); return () => onDirtyChange?.(false); }, [dirty, onDirtyChange]);
 
@@ -120,6 +126,7 @@ export default function ProviderSettings({
     if (!adapter.trim() || !nextBaseUrl) { setMsg({ ok: false, text: t("pws.adapterBaseRequired") }); return false; }
     setSaving(true); setMsg(null);
     const patch: ProviderUpdatePatch = { adapter: adapter.trim(), baseUrl: nextBaseUrl, defaultModel: defaultModel.trim(), authMode, note: note.trim(), allowPrivateNetwork };
+    Object.assign(patch, rawReasoningPatchForAdapter(adapter, showRawReasoning));
     const res = await onUpdateProvider(item.name, patch);
     setSaving(false);
     setMsg(res.ok ? { ok: true, text: t("pws.settingsSaved") } : { ok: false, text: res.error || t("prov.saveFailed") });
@@ -140,6 +147,7 @@ export default function ProviderSettings({
     setAdapter(item.adapter); setBaseUrl(item.baseUrl);
     setDefaultModel(item.defaultModel ?? ""); setAuthMode(initialAuth);
     setNote(item.note ?? ""); setAllowPrivateNetwork(item.allowPrivateNetwork ?? false); setMsg(null);
+    setShowRawReasoning(item.showRawReasoning ?? false);
     setEndpointChoice(matchChoiceId(baseUrlChoices, item.baseUrl));
   };
 
@@ -223,6 +231,22 @@ export default function ProviderSettings({
         <span className="pwi-settings-label">{t("pws.note")}</span>
         <textarea className="input pwi-settings-textarea" value={note} onChange={e => setNote(e.target.value)} rows={2} />
       </label>
+      {rawReasoningAvailable && (
+        <div className="pwi-settings-raw-reasoning">
+          <div className="pwi-settings-raw-reasoning-row">
+            <span className="pwi-settings-label">{t("pws.showRawReasoning")}</span>
+            <Switch
+              on={showRawReasoning}
+              onClick={() => setShowRawReasoning(value => !value)}
+              label={t("pws.showRawReasoning")}
+            />
+          </div>
+          <div className="pwi-settings-raw-reasoning-warning" role="note">
+            <IconAlert aria-hidden="true" />
+            <span>{t("pws.showRawReasoningWarning")}</span>
+          </div>
+        </div>
+      )}
       <label className="pwi-settings-field" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
         <input type="checkbox" checked={allowPrivateNetwork} onChange={e => setAllowPrivateNetwork(e.target.checked)} />
         <span className="pwi-settings-label">{t("pws.allowPrivateNetwork")}</span>

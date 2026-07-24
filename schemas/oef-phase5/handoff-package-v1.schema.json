@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "handoff_id": {
+      "type": "string",
+      "pattern": "^handoff:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "from_role_node_id": {
+      "type": "string",
+      "pattern": "^role-node:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "to_role_node_id": {
+      "type": "string",
+      "pattern": "^role-node:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "statement": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000
+          },
+          "trust": {
+            "type": "string",
+            "enum": [
+              "VERIFIED",
+              "SUPPORTED",
+              "UNVERIFIED",
+              "OPEN_QUESTION"
+            ]
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^artifact:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+            }
+          }
+        },
+        "required": [
+          "statement",
+          "trust",
+          "evidence_refs"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    },
+    "handoff_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "handoff_id",
+    "task_id",
+    "from_role_node_id",
+    "to_role_node_id",
+    "claims",
+    "open_questions",
+    "created_at",
+    "handoff_hash"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase5/handoff-package-v1.schema.json"
+}

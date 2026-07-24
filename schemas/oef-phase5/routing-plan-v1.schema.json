@@ -1,0 +1,621 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "routing_plan_id": {
+      "type": "string",
+      "pattern": "^routing-plan:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "revision": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "DRAFT",
+        "CANDIDATES_RESOLVED",
+        "OPTIMIZED",
+        "POLICY_VALIDATED",
+        "BUDGET_RESERVED",
+        "APPROVED",
+        "ACTIVE",
+        "COMPLETED",
+        "REJECTED",
+        "REBIND_REQUIRED",
+        "SUPERSEDED",
+        "CANCELLED",
+        "EXPIRED"
+      ]
+    },
+    "fingerprint_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "team_plan_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "policy_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "context_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991
+    },
+    "assignments": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role_node_id": {
+            "type": "string",
+            "pattern": "^role-node:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "role_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "candidate_id": {
+            "type": "string",
+            "pattern": "^candidate:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "provider_id": {
+            "type": "string",
+            "pattern": "^provider:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "execution_config_id": {
+            "type": "string",
+            "pattern": "^execution-config:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "explanation": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "account_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "role_node_id",
+          "role_id",
+          "candidate_id",
+          "provider_id",
+          "execution_config_id",
+          "score",
+          "explanation",
+          "account_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "schema_version": {
+            "type": "number",
+            "const": 1
+          },
+          "candidate_id": {
+            "type": "string",
+            "pattern": "^candidate:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "role_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "agent_profile_id": {
+            "type": "string",
+            "pattern": "^agent-profile:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "agent_profile_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "agent_profile_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "execution_config_id": {
+            "type": "string",
+            "pattern": "^execution-config:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "execution_config_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "scorecard_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scorecard_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          },
+          "provider_id": {
+            "type": "string",
+            "pattern": "^provider:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "model_version_id": {
+            "type": "string",
+            "pattern": "^model-version:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "runtime_id": {
+            "type": "string",
+            "pattern": "^runtime:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "runtime_adapter_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "deployment_id": {
+            "type": "string",
+            "pattern": "^deployment:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "qualification_level": {
+            "type": "string",
+            "enum": [
+              "Q0",
+              "Q1",
+              "Q2",
+              "Q3",
+              "Q4",
+              "Q5"
+            ]
+          },
+          "lifecycle_status": {
+            "type": "string",
+            "enum": [
+              "valid",
+              "stale",
+              "expired",
+              "quarantined"
+            ]
+          },
+          "valid_until": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "modalities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "context_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "permission_envelope": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "sandbox_enforced": {
+            "type": "boolean"
+          },
+          "privacy_classes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "public",
+                "internal",
+                "confidential",
+                "restricted"
+              ]
+            }
+          },
+          "metrics": {
+            "type": "object",
+            "properties": {
+              "role_quality": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "task_similarity": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "repository_affinity": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "tool_reliability": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "structured_output_reliability": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "operational_reliability": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "availability": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "confidence_lower": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "confidence_mean": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "incident_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "staleness_penalty": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "cost_p50": {
+                "type": "number",
+                "minimum": 0
+              },
+              "cost_p90": {
+                "type": "number",
+                "minimum": 0
+              },
+              "latency_p50_ms": {
+                "type": "number",
+                "minimum": 0
+              },
+              "latency_p90_ms": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "role_quality",
+              "task_similarity",
+              "repository_affinity",
+              "tool_reliability",
+              "structured_output_reliability",
+              "operational_reliability",
+              "availability",
+              "confidence_lower",
+              "confidence_mean",
+              "incident_penalty",
+              "staleness_penalty",
+              "cost_p50",
+              "cost_p90",
+              "latency_p50_ms",
+              "latency_p90_ms"
+            ],
+            "additionalProperties": false
+          },
+          "availability": {
+            "type": "object",
+            "properties": {
+              "runtime_healthy": {
+                "type": "boolean"
+              },
+              "provider_healthy": {
+                "type": "boolean"
+              },
+              "account_capacity": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "observed_at": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+              },
+              "expires_at": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+              }
+            },
+            "required": [
+              "runtime_healthy",
+              "provider_healthy",
+              "account_capacity",
+              "observed_at",
+              "expires_at"
+            ],
+            "additionalProperties": false
+          },
+          "account_pool": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "candidate_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "schema_version",
+          "candidate_id",
+          "role_id",
+          "agent_profile_id",
+          "agent_profile_version",
+          "agent_profile_hash",
+          "execution_config_id",
+          "execution_config_hash",
+          "scorecard_id",
+          "scorecard_hash",
+          "provider_id",
+          "model_version_id",
+          "runtime_id",
+          "runtime_adapter_version",
+          "deployment_id",
+          "qualification_level",
+          "lifecycle_status",
+          "valid_until",
+          "capabilities",
+          "modalities",
+          "context_tokens",
+          "permission_envelope",
+          "sandbox_enforced",
+          "privacy_classes",
+          "metrics",
+          "availability",
+          "account_pool",
+          "candidate_hash"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "rejected_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "candidate_id": {
+            "type": "string",
+            "pattern": "^candidate:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+          },
+          "reasons": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "candidate_id",
+          "reasons"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "score_basis": {
+      "type": "string",
+      "enum": [
+        "mean",
+        "lower-confidence-bound"
+      ]
+    },
+    "team_utility": {
+      "type": "number"
+    },
+    "routing_constraints": {
+      "type": "object",
+      "properties": {
+        "task_risk": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "task_privacy": {
+          "type": "string",
+          "enum": [
+            "public",
+            "internal",
+            "confidential",
+            "restricted"
+          ]
+        },
+        "task_modalities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_context_tokens": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "budget_multiplier": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 3
+        }
+      },
+      "required": [
+        "task_risk",
+        "task_privacy",
+        "task_modalities",
+        "required_capabilities",
+        "required_context_tokens",
+        "budget_multiplier"
+      ],
+      "additionalProperties": false
+    },
+    "cost_estimate": {
+      "type": "object",
+      "properties": {
+        "p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p90": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "p50",
+        "p90"
+      ],
+      "additionalProperties": false
+    },
+    "latency_estimate": {
+      "type": "object",
+      "properties": {
+        "p50_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p90_ms": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "p50_ms",
+        "p90_ms"
+      ],
+      "additionalProperties": false
+    },
+    "budget_reservation": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "reservation_id": {
+              "type": "string",
+              "pattern": "^budget-reservation:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+            },
+            "amount": {
+              "type": "number",
+              "minimum": 0
+            },
+            "reserved_at": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+            }
+          },
+          "required": [
+            "reservation_id",
+            "amount",
+            "reserved_at"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    },
+    "plan_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "routing_plan_id",
+    "revision",
+    "task_id",
+    "status",
+    "fingerprint_hash",
+    "team_plan_hash",
+    "policy_hash",
+    "context_hash",
+    "seed",
+    "assignments",
+    "candidates",
+    "rejected_candidates",
+    "score_basis",
+    "team_utility",
+    "routing_constraints",
+    "cost_estimate",
+    "latency_estimate",
+    "budget_reservation",
+    "created_at",
+    "updated_at",
+    "plan_hash"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase5/routing-plan-v1.schema.json"
+}

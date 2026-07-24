@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencodex.local/schemas/oef/verdict-v1.schema.json",
+  "title": "OEF Verdict v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "verdict_id", "task_id", "scope", "contract_revision_id", "decision", "status", "rationale", "evidence_refs", "missing_requirements", "issued_by", "policy_pack_ref", "repository_commit", "dependency_hashes", "created_at"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "verdict_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": "string", "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$" },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id"],
+      "properties": { "type": { "const": "task" }, "id": { "type": "string", "minLength": 1 } }
+    },
+    "contract_revision_id": { "type": "string", "minLength": 1 },
+    "decision": { "enum": ["ACCEPT", "REPAIR", "REDISPATCH", "ESCALATE_MODEL", "ESCALATE_ARCHITECTURE", "NEEDS_HUMAN", "BLOCK"] },
+    "status": { "enum": ["CURRENT", "STALE", "SUPERSEDED"] },
+    "rationale": { "type": "string", "minLength": 1, "maxLength": 10000 },
+    "evidence_refs": { "type": "array", "maxItems": 256, "items": { "type": "string", "minLength": 1 } },
+    "missing_requirements": { "type": "array", "maxItems": 512, "items": { "type": "string", "minLength": 1 } },
+    "issued_by": { "$ref": "actor-v1.schema.json" },
+    "policy_pack_ref": { "$ref": "#/$defs/versioned_definition_ref" },
+    "repository_commit": { "oneOf": [{ "type": "string", "minLength": 1, "maxLength": 300 }, { "type": "null" }] },
+    "dependency_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "workflow", "policy", "evidence"],
+      "properties": {
+        "contract": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "workflow": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "policy": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "evidence": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["evidence_id", "evidence_hash"],
+            "properties": {
+              "evidence_id": { "type": "string", "minLength": 1 },
+              "evidence_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+            }
+          }
+        }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "versioned_definition_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "hash"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

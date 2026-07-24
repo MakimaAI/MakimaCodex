@@ -16,13 +16,22 @@
  *   extracts JWT `sub` — both append distinct accounts under multiauth.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getConfigDir, atomicWriteFile, backupInvalidConfig, hardenConfigDir, hardenExistingSecret } from "../config";
+import { AtomicWriteSecretResidualError, getConfigDir, atomicWriteFile, backupInvalidConfig, hardenConfigDir, hardenExistingSecret } from "../config";
 import { validateCopilotApiBaseUrl } from "./github-copilot";
 import type { OAuthCredentialSource, OAuthCredentials, ProviderAccount, ProviderAccountSet } from "./types";
 
 type AuthStore = Record<string, ProviderAccountSet>;
+interface LoginFenceStore {
+  version: 1;
+  epoch: string;
+  generations: Record<string, number>;
+}
+export interface OAuthLoginFenceSnapshot {
+  epoch: string;
+  generation: number;
+}
 
 /** Providers whose account set is pinned to a single slot (see module doc). */
 const SINGLE_SLOT_PROVIDERS = new Set(["chatgpt"]);
@@ -31,6 +40,7 @@ export function getAuthStorePath(): string {
   return join(getConfigDir(), "auth.json");
 }
 export function getAuthStoreLockPath(): string { return join(getConfigDir(), "auth.store.lock"); }
+export function getAuthLoginFencePath(): string { return join(getConfigDir(), "auth.login-fences.json"); }
 export function getAuthRefreshIntentLockPath(provider: string, accountId: string): string {
   const safeProvider = provider.replace(/[^a-zA-Z0-9_-]/g, "_");
   const accountHash = createHash("sha256").update(accountId).digest("hex").slice(0, 24);
@@ -38,6 +48,60 @@ export function getAuthRefreshIntentLockPath(provider: string, accountId: string
 }
 export function credentialGeneration(cred: OAuthCredentials): string {
   return createHash("sha256").update(JSON.stringify([cred.refresh, cred.access, cred.expires])).digest("hex");
+}
+
+export class OAuthLoginFenceError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "OAuthLoginFenceError";
+  }
+}
+
+export class OAuthLoginSupersededError extends Error {
+  constructor(provider: string) {
+    super(`OAuth login for ${provider} was superseded by logout`);
+    this.name = "OAuthLoginSupersededError";
+  }
+}
+
+function emptyLoginFenceStore(): LoginFenceStore {
+  return { version: 1, epoch: randomUUID(), generations: Object.create(null) as Record<string, number> };
+}
+
+function loadLoginFenceStore(): LoginFenceStore | null {
+  const path = getAuthLoginFencePath();
+  hardenConfigDir();
+  hardenExistingSecret(path);
+  if (!existsSync(path)) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (cause) {
+    throw new OAuthLoginFenceError("OAuth login fence is corrupt; refusing credential mutation", { cause });
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new OAuthLoginFenceError("OAuth login fence has an invalid shape; refusing credential mutation");
+  }
+  const candidate = parsed as { version?: unknown; epoch?: unknown; generations?: unknown };
+  if (
+    candidate.version !== 1
+    || typeof candidate.epoch !== "string"
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate.epoch)
+    || !candidate.generations
+    || typeof candidate.generations !== "object"
+    || Array.isArray(candidate.generations)
+  ) {
+    throw new OAuthLoginFenceError("OAuth login fence has an invalid shape; refusing credential mutation");
+  }
+  const generations = Object.create(null) as Record<string, number>;
+  for (const [provider, generation] of Object.entries(candidate.generations)) {
+    if (!Number.isSafeInteger(generation) || Number(generation) < 0) {
+      throw new OAuthLoginFenceError("OAuth login fence has an invalid generation; refusing credential mutation");
+    }
+    generations[provider] = Number(generation);
+  }
+  return { version: 1, epoch: candidate.epoch, generations };
 }
 
 function loadAuthStoreInternal(): { store: AuthStore; hadLegacy: boolean } {
@@ -57,7 +121,7 @@ export function loadAuthStore(): AuthStore {
   return loadAuthStoreInternal().store;
 }
 
-function persist(store: AuthStore): void {
+function ensureAuthDirectory(): void {
   const dir = getConfigDir();
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -65,7 +129,16 @@ function persist(store: AuthStore): void {
     try { chmodSync(dir, 0o700); } catch { /* best-effort on existing dir */ }
   }
   hardenConfigDir();
+}
+
+function persist(store: AuthStore): void {
+  ensureAuthDirectory();
   atomicWriteFile(getAuthStorePath(), JSON.stringify(store, null, 2) + "\n");
+}
+
+function persistLoginFenceStore(store: LoginFenceStore): void {
+  ensureAuthDirectory();
+  atomicWriteFile(getAuthLoginFencePath(), JSON.stringify(store, null, 2) + "\n");
 }
 
 export class OAuthFileLockError extends Error { readonly code = "OAUTH_FILE_LOCK_UNAVAILABLE"; constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = "OAuthFileLockError"; } }
@@ -95,9 +168,15 @@ function backupLegacyOnce(): void {
   const backup = `${path}.pre-multiauth`;
   if (!existsSync(path) || existsSync(backup)) return;
   try {
-    copyFileSync(path, backup);
-    try { chmodSync(backup, 0o600); } catch { /* best-effort */ }
-  } catch { /* best-effort */ }
+    // This file contains the same refresh tokens as auth.json. Reuse the secret-aware atomic
+    // writer so bytes are added only after the temp file's Windows ACL is hardened, even when
+    // the process-local directory hardening cache outlives a delete/recreate of that path.
+    atomicWriteFile(backup, readFileSync(path, "utf8"));
+  } catch (error) {
+    // Losing the optional downgrade backup may be tolerated, but a temp file that still contains
+    // refresh tokens is a confidentiality incident and must never be hidden from the caller.
+    if (error instanceof AtomicWriteSecretResidualError) throw error;
+  }
 }
 
 function isCredentialSource(value: unknown): value is OAuthCredentialSource {
@@ -183,19 +262,82 @@ function normalizeAuthStore(raw: unknown): { store: AuthStore; hadLegacy: boolea
 }
 
 /**
- * In-process write serialization: every mutation runs load-modify-persist under this queue so
- * a guardian refresh persisting a non-active account cannot roll back a concurrent
- * active-account switch (lost update). Cross-process races are accepted (single proxy).
+ * In-process write serialization plus a cross-process file lock: every mutation runs
+ * load-modify-persist under the same lock so auth.json and the persisted login fence share
+ * one ordering boundary.
  */
 let mutationTail: Promise<void> = Promise.resolve();
 function serializeMutation<T>(work:()=>Promise<T>):Promise<T>{const result=mutationTail.then(work,work);mutationTail=result.then(()=>undefined,()=>undefined);return result;}
-export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>):Promise<T>{return serializeMutation(async()=>{const guard=await createOAuthFileLock({path:getAuthStoreLockPath(),staleAfterMs:30000}).acquire();try{
+function withAuthStoreLock<T>(work: () => T | Promise<T>): Promise<T> {
+  return serializeMutation(async () => {
+    const guard = await createOAuthFileLock({ path: getAuthStoreLockPath(), staleAfterMs: 30000 }).acquire();
+    try {
+      return await work();
+    } finally {
+      guard.release();
+    }
+  });
+}
+
+export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, shouldPersist:()=>boolean=()=>true):Promise<T>{return withAuthStoreLock(async()=>{
     const { store, hadLegacy } = loadAuthStoreInternal();
     if (hadLegacy) backupLegacyOnce();
     const result = await fn(store);
-    persist(store);
+    // A cancellation can land at the `await fn` microtask boundary after the in-memory mutation.
+    // Recheck immediately before publishing so a stale login never reaches auth.json.
+    if (shouldPersist()) persist(store);
     return result;
-  }finally{guard.release();}});
+  });
+}
+
+/** Snapshot the store incarnation and provider logout generation before external OAuth I/O. */
+export function snapshotLoginFenceGeneration(provider: string): Promise<OAuthLoginFenceSnapshot> {
+  return withAuthStoreLock(() => {
+    const loaded = loadLoginFenceStore();
+    const fences = loaded ?? emptyLoginFenceStore();
+    const providerMissing = !Object.hasOwn(fences.generations, provider);
+    if (providerMissing) fences.generations[provider] = 0;
+    if (!loaded || providerMissing) persistLoginFenceStore(fences);
+    return { epoch: fences.epoch, generation: fences.generations[provider]! };
+  });
+}
+
+function assertLoginFenceGeneration(provider: string, expectedFence: OAuthLoginFenceSnapshot | undefined): void {
+  if (expectedFence === undefined) return;
+  const fences = loadLoginFenceStore();
+  if (!fences) {
+    throw new OAuthLoginFenceError("OAuth login fence disappeared; refusing credential mutation");
+  }
+  if (
+    fences.epoch !== expectedFence.epoch
+    || !Object.hasOwn(fences.generations, provider)
+    || fences.generations[provider] !== expectedFence.generation
+  ) {
+    throw new OAuthLoginSupersededError(provider);
+  }
+}
+
+/** Advance the provider generation before a destructive credential mutation. Lock required. */
+function advanceLoginFence(provider: string): void {
+  const fences = loadLoginFenceStore() ?? emptyLoginFenceStore();
+  const generation = fences.generations[provider] ?? 0;
+  if (generation >= Number.MAX_SAFE_INTEGER) {
+    throw new OAuthLoginFenceError("OAuth login fence generation is exhausted; refusing logout");
+  }
+  fences.generations[provider] = generation + 1;
+  persistLoginFenceStore(fences);
+}
+
+function loginPersistGuard(
+  provider: string,
+  shouldPersist: () => boolean,
+  expectedLoginFence: OAuthLoginFenceSnapshot | undefined,
+): () => boolean {
+  return () => {
+    if (!shouldPersist()) return false;
+    assertLoginFenceGeneration(provider, expectedLoginFence);
+    return true;
+  };
 }
 
 /** The ACTIVE account's credential for a provider (what requests should use). */
@@ -211,10 +353,19 @@ export function getCredential(provider: string): OAuthCredentials | null {
  * (rotating refresh tokens would fabricate duplicates) and single-slot providers replace the
  * active slot / whole set instead.
  */
-export async function saveCredential(provider: string, cred: OAuthCredentials): Promise<void> {
+export async function saveCredential(
+  provider: string,
+  cred: OAuthCredentials,
+  shouldPersist: () => boolean = () => true,
+  expectedLoginFence?: OAuthLoginFenceSnapshot,
+): Promise<void> {
   const safe = normalizeCredential(cred);
   if (!safe) return;
+  const canPersist = loginPersistGuard(provider, shouldPersist, expectedLoginFence);
   await mutateStore(store => {
+    // Recheck after the store lock is acquired: a logout/cancel may have happened while this
+    // mutation waited behind another writer.
+    if (!canPersist()) return;
     const set = store[provider];
     const identity = safe.accountId ?? safe.email;
     if (!set || SINGLE_SLOT_PROVIDERS.has(provider)) {
@@ -255,20 +406,27 @@ export async function saveCredential(provider: string, cred: OAuthCredentials): 
       set.accounts.push({ id, credential: safe, addedAt: Date.now() });
       set.activeAccountId = id;
     }
-  });
+  }, canPersist);
 }
 
-/** Remove the ACTIVE account; remaining accounts promote the first one. */
+/**
+ * Remove the ACTIVE account; remaining accounts promote the first one. The persisted generation
+ * is advanced first under the shared lock, so a crash can leave an old credential present but can
+ * never allow a login that started before this logout to publish afterward.
+ */
 export async function removeCredential(provider: string): Promise<void> {
-  await mutateStore(store => {
+  await withAuthStoreLock(() => {
+    advanceLoginFence(provider);
+
+    const { store, hadLegacy } = loadAuthStoreInternal();
+    if (hadLegacy) backupLegacyOnce();
     const set = store[provider];
-    if (!set) return;
-    set.accounts = set.accounts.filter(a => a.id !== set.activeAccountId);
-    if (set.accounts.length === 0) {
-      delete store[provider];
-      return;
+    if (set) {
+      set.accounts = set.accounts.filter(a => a.id !== set.activeAccountId);
+      if (set.accounts.length === 0) delete store[provider];
+      else set.activeAccountId = set.accounts[0]!.id;
     }
-    set.activeAccountId = set.accounts[0]!.id;
+    persist(store);
   });
 }
 
@@ -289,15 +447,23 @@ export function getAccountCredential(provider: string, accountId: string): OAuth
 }
 
 /** Persist a refreshed credential for a SPECIFIC account without touching activeAccountId. */
-export async function saveAccountCredential(provider: string, accountId: string, cred: OAuthCredentials): Promise<void> {
+export async function saveAccountCredential(
+  provider: string,
+  accountId: string,
+  cred: OAuthCredentials,
+  shouldPersist: () => boolean = () => true,
+  expectedLoginFence?: OAuthLoginFenceSnapshot,
+): Promise<void> {
   const safe = normalizeCredential(cred);
   if (!safe) return;
+  const canPersist = loginPersistGuard(provider, shouldPersist, expectedLoginFence);
   await mutateStore(store => {
+    if (!canPersist()) return;
     const account = store[provider]?.accounts.find(a => a.id === accountId);
     if (!account) return;
     account.credential = safe;
     delete account.needsReauth;
-  });
+  }, canPersist);
 }
 
 export async function setActiveAccount(provider: string, accountId: string): Promise<boolean> {
@@ -309,19 +475,59 @@ export async function setActiveAccount(provider: string, accountId: string): Pro
   });
 }
 
-/** Remove one account by id; active removal promotes the first remaining account. */
-export async function removeAccount(provider: string, accountId: string): Promise<boolean> {
+/** Preview the next usable account without changing the user's active selection. */
+export function nextAccountAfterFailure(
+  provider: string,
+  failedAccountId: string,
+  excludedAccountIds: ReadonlySet<string>,
+): ProviderAccount | null {
+  const set = getAccountSet(provider);
+  if (!set || set.accounts.length < 2) return null;
+  const failedIndex = set.accounts.findIndex(account => account.id === failedAccountId);
+  if (failedIndex < 0) return null;
+  for (let offset = 1; offset < set.accounts.length; offset++) {
+    const candidate = set.accounts[(failedIndex + offset) % set.accounts.length]!;
+    if (candidate.needsReauth || excludedAccountIds.has(candidate.id)) continue;
+    return { ...candidate, credential: { ...candidate.credential } };
+  }
+  return null;
+}
+
+/** Commit a successful fallback only if the user's active account did not change meanwhile. */
+export async function setActiveAccountIfCurrent(
+  provider: string,
+  expectedAccountId: string,
+  nextAccountId: string,
+): Promise<boolean> {
   return await mutateStore(store => {
     const set = store[provider];
+    if (!set || !set.accounts.some(account => account.id === nextAccountId)) return false;
+    if (set.activeAccountId === nextAccountId) return true;
+    if (set.activeAccountId !== expectedAccountId) return false;
+    set.activeAccountId = nextAccountId;
+    return true;
+  });
+}
+
+/** Remove one account by id; active removal promotes the first remaining account. */
+export async function removeAccount(provider: string, accountId: string): Promise<boolean> {
+  return await withAuthStoreLock(() => {
+    const { store, hadLegacy } = loadAuthStoreInternal();
+    if (hadLegacy) backupLegacyOnce();
+    const set = store[provider];
     if (!set) return false;
-    const before = set.accounts.length;
-    set.accounts = set.accounts.filter(a => a.id !== accountId);
-    if (set.accounts.length === before) return false;
+    if (!set.accounts.some(account => account.id === accountId)) return false;
+
+    // Account deletion is logout-equivalent for this provider. Publish the fence before
+    // auth.json so a crash can retain an old account but cannot admit an older pending login.
+    advanceLoginFence(provider);
+    set.accounts = set.accounts.filter(account => account.id !== accountId);
     if (set.accounts.length === 0) {
       delete store[provider];
-      return true;
+    } else if (set.activeAccountId === accountId) {
+      set.activeAccountId = set.accounts[0]!.id;
     }
-    if (set.activeAccountId === accountId) set.activeAccountId = set.accounts[0]!.id;
+    persist(store);
     return true;
   });
 }

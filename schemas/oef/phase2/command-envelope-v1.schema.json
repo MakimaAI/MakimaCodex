@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "command_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "command_type": {
+      "type": "string",
+      "enum": [
+        "CreateAssignment",
+        "ReviseAssignment",
+        "CreateExecutionBinding",
+        "CreateExecution",
+        "TransitionExecution",
+        "CreateExecutionAttempt",
+        "TransitionExecutionAttempt",
+        "CompleteExecutionAttempt",
+        "RecordRuntimeEvent"
+      ]
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^task:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "aggregate_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "expected_aggregate_version": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "actor": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "human",
+            "agent",
+            "system",
+            "integration",
+            "scheduler"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "model_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "runtime_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        }
+      },
+      "required": [
+        "type",
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "payload": {}
+  },
+  "required": [
+    "schema_version",
+    "command_id",
+    "command_type",
+    "task_id",
+    "aggregate_id",
+    "expected_aggregate_version",
+    "actor",
+    "idempotency_key",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/command-envelope-v1.schema.json"
+}

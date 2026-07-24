@@ -6,6 +6,7 @@ import { atomicWriteFile, expandUserPath, getConfigDir, websocketsEnabled } from
 import { CODEX_CONFIG_PATH, CODEX_MODELS_CACHE_PATH, DEFAULT_CATALOG_PATH, readRootTomlString, resolveCodexConfigPath } from "./paths";
 import { clearModelCache, DEFAULT_MODEL_CACHE_TTL_MS, getFreshCached, getStaleCached, isModelsFetchCoolingDown, markModelsFetchFailure, setCached } from "./model-cache";
 import { buildModelsRequest, resolveModelsAuthToken } from "../oauth";
+import { fetchClineCatalog } from "../providers/cline-catalog";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 import { modelInList } from "../types";
 import { CODEX_REASONING_LEVELS, codexEffortRank, configuredReasoningEfforts, modelRecordValue, sanitizeCodexReasoningEfforts } from "../reasoning-effort";
@@ -18,6 +19,7 @@ import { CODEX_GPT5_IDENTITY_LINE } from "../adapters/identity";
 import { filterCursorConfiguredModelsByLiveDiscovery } from "../adapters/cursor/discovery";
 import { fetchCursorUsableModels } from "../adapters/cursor/live-models";
 import { OPENAI_API_PROVIDER_ID } from "../providers/openai-tiers";
+import { rawReasoningPromotionEnabled } from "../providers/wire-protocol";
 import {
   COMBO_NAMESPACE,
   comboModelId,
@@ -272,13 +274,17 @@ function shouldUpgradeToUpstreamEntry(entry: RawEntry): boolean {
  * Slugs missing from the catalog are omitted from the result. Used by the delegation
  * prompt to advertise the featured sub-agent roster with honest effort ladders.
  */
-export function catalogModelEfforts(slugs: readonly string[]): Map<string, string[]> {
+function catalogModelEffortsFiltered(
+  slugs: readonly string[],
+  requireV2: boolean,
+): Map<string, string[]> {
   const out = new Map<string, string[]>();
   if (slugs.length === 0) return out;
   const catalog = readCatalog(readCodexCatalogPath());
   if (!catalog) return out;
   for (const entry of catalog.models ?? []) {
     if (typeof entry.slug !== "string") continue;
+    if (requireV2 && entry.multi_agent_version !== "v2") continue;
     // Tolerate raw legacy config slugs (`provider/vendor/model`) against the
     // Codex-facing encoded catalog slug (`provider/vendor-model`).
     const callerSlug = slugs.find(s => slugsEquivalent(s, entry.slug as string));
@@ -286,10 +292,21 @@ export function catalogModelEfforts(slugs: readonly string[]): Map<string, strin
     const levels = Array.isArray(entry.supported_reasoning_levels)
       ? entry.supported_reasoning_levels as Array<{ effort?: string }>
       : [];
-    const efforts = levels.flatMap(l => typeof l.effort === "string" ? [l.effort] : []);
+    const allowedEfforts = new Set(CODEX_REASONING_LEVELS.map(level => level.effort));
+    const efforts = levels.flatMap(l => typeof l.effort === "string" && allowedEfforts.has(l.effort) ? [l.effort] : []);
     if (efforts.length > 0) out.set(callerSlug, efforts);
   }
   return out;
+}
+
+/** Effort ladders for ordinary catalog capability resolution, independent of agent mode. */
+export function catalogModelEfforts(slugs: readonly string[]): Map<string, string[]> {
+  return catalogModelEffortsFiltered(slugs, false);
+}
+
+/** Effort ladders for models that Codex can actually accept on its V2 subagent surface. */
+export function catalogV2ModelEfforts(slugs: readonly string[]): Map<string, string[]> {
+  return catalogModelEffortsFiltered(slugs, true);
 }
 
 /**
@@ -315,6 +332,8 @@ export interface CatalogModel {
   inputModalities?: string[];
   /** Provider opted into parallel tool calls (OcxProviderConfig.parallelToolCalls). */
   parallelToolCalls?: boolean;
+  /** Provider opted into promoting openai-chat raw reasoning as a native summary. */
+  showRawReasoning?: boolean;
 }
 
 type RawEntry = Record<string, unknown>;
@@ -484,7 +503,7 @@ export type MultiAgentMode = "v1" | "default" | "v2";
  *   get their snapshot pin, others get null so the codex feature flag decides)
  * - "v2": force multi_agent_version = "v2" on ALL entries (override upstream pins)
  */
-function applyMultiAgentMode(entries: RawEntry[], mode: MultiAgentMode): RawEntry[] {
+function applyMultiAgentMode(entries: RawEntry[], mode: MultiAgentMode, bridgeV2Slugs: readonly string[] = []): RawEntry[] {
   if (mode === "default") {
     // Restore upstream defaults: clear any stale forced multi_agent_version and
     // re-apply upstream pins from the snapshot for native entries that have one.
@@ -496,6 +515,12 @@ function applyMultiAgentMode(entries: RawEntry[], mode: MultiAgentMode): RawEntr
         entry.multi_agent_version = upstreamPin;
       } else {
         delete entry.multi_agent_version;
+      }
+    }
+    for (const entry of entries) {
+      const slug = typeof entry.slug === "string" ? entry.slug : "";
+      if (slug.includes("/") && bridgeV2Slugs.some(selected => slugsEquivalent(selected, slug))) {
+        entry.multi_agent_version = "v2";
       }
     }
     return entries;
@@ -732,6 +757,7 @@ const ROUTED_REASONING_LEVELS = [...CODEX_REASONING_LEVELS];
 
 function applyCatalogModelMetadata(entry: RawEntry, model?: CatalogModel): void {
   if (!model) return;
+  entry.default_reasoning_summary = model.showRawReasoning === true ? "auto" : "none";
   if (typeof model.contextWindow === "number" && model.contextWindow > 0) {
     entry.context_window = model.contextWindow;
     entry.max_context_window = model.contextWindow;
@@ -951,6 +977,7 @@ export function buildCatalogEntries(
   wsEnabled = false,
   multiAgentMode: MultiAgentMode = "default",
   exactComboSlugs: ReadonlySet<string> = new Set(),
+  bridgeV2Slugs: readonly string[] = [],
 ): RawEntry[] {
   // Codex's models-manager sorts by `priority` ASC and advertises the first 5 picker-visible
   // models to spawn_agent (sort_by_key(priority) + MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT=5). Catalog
@@ -994,7 +1021,7 @@ export function buildCatalogEntries(
       delete entry.prefer_websockets;
     }
   }
-  return applyMultiAgentMode(out, multiAgentMode);
+  return applyMultiAgentMode(out, multiAgentMode, bridgeV2Slugs);
 }
 
 /** Bare picker-visible native slugs in the live Codex catalog (drives the subagent picker UI). */
@@ -1137,6 +1164,9 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
     // advertise only on explicit opt-in.
     ...(prov.parallelToolCalls === true || (prov.adapter === "openai-chat" && prov.parallelToolCalls !== false)
       ? { parallelToolCalls: true }
+      : {}),
+    ...(rawReasoningPromotionEnabled(name, model.id, prov)
+      ? { showRawReasoning: true }
       : {}),
   };
   const capped = applyProviderContextCap(hinted.contextWindow, providerCap);
@@ -1282,6 +1312,26 @@ async function fetchProviderModels(name: string, prov: OcxProviderConfig, ttlMs:
     // fetch timeout on every catalog poll — the dashboard polls this path per page load.
     const stale = getStaleCached(name);
     return stale ? applyConfigHintsToCachedModels(name, prov, stale, contextCap) : configured;
+  }
+  if (name === "cline" || name === "cline-pass") {
+    try {
+      const ids = await fetchClineCatalog(name, apiKey);
+      if (!ids) {
+        markModelsFetchFailure(name);
+        const stale = getStaleCached(name);
+        return stale ? applyConfigHintsToCachedModels(name, prov, stale, contextCap) : configured;
+      }
+      const live = ids.map(id => applyProviderConfigHints(name, prov, {
+        id,
+        provider: name,
+      }, contextCap));
+      setCached(name, live);
+      return live;
+    } catch {
+      markModelsFetchFailure(name);
+      const stale = getStaleCached(name);
+      return stale ? applyConfigHintsToCachedModels(name, prov, stale, contextCap) : configured;
+    }
   }
   const { url, headers } = buildModelsRequest(prov, apiKey, name);
   try {
@@ -1496,6 +1546,9 @@ export function deriveComboCatalogModel(
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
     ...(members.every(member => member.parallelToolCalls === true)
       ? { parallelToolCalls: true }
+      : {}),
+    ...(members.every(member => member.showRawReasoning === true)
+      ? { showRawReasoning: true }
       : {}),
   };
 }
@@ -1734,6 +1787,7 @@ export function mergeCatalogEntriesForSync(
   multiAgentMode: MultiAgentMode = "default",
   exactComboSlugs: ReadonlySet<string> = new Set(),
   hasPhysicalComboProvider = false,
+  bridgeV2Slugs: readonly string[] = [],
 ): RawEntry[] {
   const rank = new Map(featured.map((slug, i) => [slug, i] as const));
   const native = catalogModels
@@ -1853,7 +1907,7 @@ export function mergeCatalogEntriesForSync(
   });
   // Native enable/disable (single choke point: bare slugs in `disabledModels`). Runs as the
   // LAST pass so the upstream-upgrade branch above can never clobber a hide flag back to list.
-  return applyMultiAgentMode(applyNativeVisibility(mergedEntries, disabledNative), multiAgentMode);
+  return applyMultiAgentMode(applyNativeVisibility(mergedEntries, disabledNative), multiAgentMode, bridgeV2Slugs);
 }
 
 /**
@@ -1885,9 +1939,12 @@ export async function syncCatalogModels(config: OcxConfig): Promise<{ added: num
   const featured = config.subagentModels ?? [];
   const orderedGoModels = orderForSubagents(enabledGo, featured); // stable tie-break among equal priorities
   const multiAgentMode: MultiAgentMode = config.multiAgentMode === "v1" || config.multiAgentMode === "v2" ? config.multiAgentMode : "default";
+  const bridgeV2Slugs = config.subagentBridge?.enabled === true && multiAgentMode !== "v1"
+    ? featured.filter(slug => slug.includes("/"))
+    : [];
   const exactComboSlugs = exactComboCatalogSlugs(config);
   const hasPhysicalComboProvider = Object.hasOwn(config.providers, COMBO_NAMESPACE);
-  const goEntries = buildCatalogEntries(template ? JSON.parse(JSON.stringify(template)) : null, [], orderedGoModels, featured, websocketsEnabled(config), multiAgentMode, exactComboSlugs);
+  const goEntries = buildCatalogEntries(template ? JSON.parse(JSON.stringify(template)) : null, [], orderedGoModels, featured, websocketsEnabled(config), multiAgentMode, exactComboSlugs, bridgeV2Slugs);
   // Keep genuine native entries (gpt-*, codex-*) with their real per-model fields and append
   // routed providers as namespaced slugs. Cursor and other adopted providers can expose model ids
   // like `gpt-5.5`; those must not delete the native OpenAI/Codex base row.
@@ -1902,7 +1959,7 @@ export async function syncCatalogModels(config: OcxConfig): Promise<{ added: num
   // native AND routed so the advertised flag matches the implemented endpoint (phase 120.4) and a
   // native template can never leak supports_websockets while the flag is off.
   const wsEnabled = websocketsEnabled(config);
-  catalog.models = mergeCatalogEntriesForSync(catalog.models ?? [], goEntries, baseline, featured, wsEnabled, goIds, template, disabledNativeSlugs(config), gatheredProviderNames, multiAgentMode, exactComboSlugs, hasPhysicalComboProvider);
+  catalog.models = mergeCatalogEntriesForSync(catalog.models ?? [], goEntries, baseline, featured, wsEnabled, goIds, template, disabledNativeSlugs(config), gatheredProviderNames, multiAgentMode, exactComboSlugs, hasPhysicalComboProvider, bridgeV2Slugs);
 
   atomicWriteFile(catalogPath, JSON.stringify(catalog, null, 2) + "\n");
   return { added: goEntries.length, path: catalogPath };

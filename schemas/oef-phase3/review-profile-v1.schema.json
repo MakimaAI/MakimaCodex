@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "review_profile_id": {
+      "type": "string",
+      "maxLength": 160,
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20000
+    },
+    "required_inputs": {
+      "minItems": 1,
+      "maxItems": 64,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]*$"
+      }
+    },
+    "required_capabilities": {
+      "minItems": 1,
+      "maxItems": 11,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "diff-analysis",
+          "repository-navigation",
+          "architecture-reasoning",
+          "security-analysis",
+          "multimodal-review",
+          "browser-observation",
+          "accessibility-analysis",
+          "performance-analysis",
+          "structured-findings",
+          "evidence-citation",
+          "contract-traceability"
+        ]
+      }
+    },
+    "preferred_capabilities": {
+      "maxItems": 11,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "diff-analysis",
+          "repository-navigation",
+          "architecture-reasoning",
+          "security-analysis",
+          "multimodal-review",
+          "browser-observation",
+          "accessibility-analysis",
+          "performance-analysis",
+          "structured-findings",
+          "evidence-citation",
+          "contract-traceability"
+        ]
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "properties": {
+        "source_mode": {
+          "type": "string",
+          "const": "read-only"
+        },
+        "temp_write": {
+          "type": "string",
+          "enum": [
+            "allowed",
+            "denied"
+          ]
+        },
+        "network": {
+          "type": "string",
+          "const": "denied"
+        }
+      },
+      "required": [
+        "source_mode",
+        "temp_write",
+        "network"
+      ],
+      "additionalProperties": false
+    },
+    "checks": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "type": "boolean"
+      }
+    },
+    "output_schema_ref": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "version": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "renderer_ref": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "budgets": {
+      "type": "object",
+      "properties": {
+        "max_wall_time_seconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 86400
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000
+        }
+      },
+      "required": [
+        "max_wall_time_seconds",
+        "max_output_tokens"
+      ],
+      "additionalProperties": false
+    },
+    "independence": {
+      "type": "object",
+      "properties": {
+        "different_session": {
+          "type": "string",
+          "const": "required"
+        },
+        "different_context": {
+          "type": "string",
+          "const": "required"
+        },
+        "different_provider": {
+          "type": "string",
+          "enum": [
+            "preferred",
+            "required"
+          ]
+        }
+      },
+      "required": [
+        "different_session",
+        "different_context",
+        "different_provider"
+      ],
+      "additionalProperties": false
+    },
+    "extensions": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {}
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    },
+    "content_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "review_profile_id",
+    "version",
+    "objective",
+    "required_inputs",
+    "required_capabilities",
+    "preferred_capabilities",
+    "workspace",
+    "checks",
+    "output_schema_ref",
+    "renderer_ref",
+    "budgets",
+    "independence",
+    "extensions",
+    "created_at",
+    "content_hash"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase3/review-profile-v1.schema.json"
+}

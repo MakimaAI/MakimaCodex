@@ -1,6 +1,7 @@
 import { OAuthCallbackFlow } from "./callback-server";
 import type { OAuthController, OAuthCredentials } from "./types";
 import { generatePKCE } from "./pkce";
+import { oauthRequestSignal } from "./request-signal";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_URL = "https://auth.openai.com/oauth/authorize";
@@ -106,6 +107,7 @@ export class ChatGPTOAuthFlow extends OAuthCallbackFlow {
         redirect_uri: redirectUri,
         code_verifier: this.#verifier,
       }).toString(),
+      signal: oauthRequestSignal(this.ctrl.signal),
     });
     if (!resp.ok) {
       const errDesc = await safeErrorDescription(resp);
@@ -132,7 +134,7 @@ export async function loginChatGPT(ctrl: OAuthController, opts?: { forceLogin?: 
 
 // Note: uses form-urlencoded per OAuth 2.0 spec (RFC 6749 §6).
 // Codex-rs uses JSON for refresh — intentional divergence; both accepted by auth.openai.com.
-export async function refreshChatGPTToken(refreshToken: string): Promise<OAuthCredentials> {
+export async function refreshChatGPTToken(refreshToken: string, signal?: AbortSignal): Promise<OAuthCredentials> {
   const resp = await fetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -141,6 +143,7 @@ export async function refreshChatGPTToken(refreshToken: string): Promise<OAuthCr
       client_id: CLIENT_ID,
       refresh_token: refreshToken,
     }).toString(),
+    signal: oauthRequestSignal(signal),
   });
   if (!resp.ok) {
     const errDesc = await safeErrorDescription(resp);

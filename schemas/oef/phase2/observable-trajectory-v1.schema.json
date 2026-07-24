@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "trajectory_id": {
+      "type": "string",
+      "pattern": "^trajectory:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "task_features": {
+      "type": "object",
+      "properties": {
+        "task_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "languages": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
+        },
+        "risk": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ]
+        }
+      },
+      "required": [
+        "task_type",
+        "languages",
+        "risk"
+      ],
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "properties": {
+        "agent_profile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "runtime": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "adapter_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "model_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "agent_profile",
+        "runtime",
+        "adapter_version",
+        "model_id"
+      ],
+      "additionalProperties": false
+    },
+    "observable_actions": {
+      "maxItems": 100000,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "file-read",
+              "file-write",
+              "command",
+              "tool",
+              "test",
+              "checkpoint",
+              "human-correction"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
+        "required": [
+          "type",
+          "summary"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "properties": {
+        "execution_status": {
+          "type": "string",
+          "enum": [
+            "COMPLETED",
+            "FAILED",
+            "INTERRUPTED",
+            "CANCELLED"
+          ]
+        },
+        "verification_status": {
+          "type": "string",
+          "enum": [
+            "PASSED",
+            "FAILED",
+            "BLOCKED",
+            "NOT_RUN"
+          ]
+        },
+        "verdict": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "READY_FOR_REVIEW",
+                "REPAIR_REQUIRED",
+                "BLOCKED"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "execution_status",
+        "verification_status",
+        "verdict"
+      ],
+      "additionalProperties": false
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "wall_time_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "changed_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "tests_passed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "tests_failed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "wall_time_ms",
+        "tokens",
+        "changed_files",
+        "tests_passed",
+        "tests_failed"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "trajectory_id",
+    "task_features",
+    "execution",
+    "observable_actions",
+    "outcome",
+    "metrics"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/observable-trajectory-v1.schema.json"
+}

@@ -1,0 +1,19 @@
+{
+  "name": "opencodex-subagent-bridge",
+  "version": "0.1.0",
+  "description": "Prepare secure cross-provider subagent handoffs through opencodex.",
+  "author": {
+    "name": "opencodex"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Opencodex Subagent Bridge",
+    "shortDescription": "Secure routed subagent handoffs for opencodex.",
+    "longDescription": "Stages one-time routed subagent messages immediately before Codex collaboration calls.",
+    "developerName": "opencodex",
+    "category": "Productivity",
+    "capabilities": ["Local tools"],
+    "defaultPrompt": ["Use routed subagents through the secure opencodex bridge."]
+  },
+  "mcpServers": "./.mcp.json"
+}

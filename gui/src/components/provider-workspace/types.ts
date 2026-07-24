@@ -69,4 +69,5 @@ export type ProviderUpdatePatch = {
   note?: string;
   disabled?: boolean;
   allowPrivateNetwork?: boolean;
+  showRawReasoning?: boolean;
 };

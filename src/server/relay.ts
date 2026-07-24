@@ -88,18 +88,326 @@ export function relaySseWithFailedTail(
   });
 }
 
-export function nextSseBlock(buffer: string): { block: string; rest: string } | null {
-  const match = buffer.match(/\r?\n\r?\n/);
-  if (!match || match.index === undefined) return null;
+const SENSITIVE_FAILURE_CODE_METADATA: Record<string, { status: number; type: string }> = {
+  client_closed_request: { status: 499, type: "invalid_request_error" },
+  client_cancelled: { status: 499, type: "client_cancelled" },
+  context_length_exceeded: { status: 400, type: "invalid_request_error" },
+  tool_catalog_too_large: { status: 400, type: "invalid_request_error" },
+  origin_rejected: { status: 400, type: "invalid_request_error" },
+  invalid_request_error: { status: 400, type: "invalid_request_error" },
+  invalid_api_key: { status: 401, type: "authentication_error" },
+  permission_denied: { status: 403, type: "permission_error" },
+  subscription_required: { status: 403, type: "permission_error" },
+  insufficient_quota: { status: 429, type: "insufficient_quota" },
+  rate_limit_exceeded: { status: 429, type: "rate_limit_error" },
+  server_is_overloaded: { status: 503, type: "server_error" },
+  upstream_server_error: { status: 502, type: "server_error" },
+  upstream_reset: { status: 502, type: "upstream_error" },
+};
+
+const SENSITIVE_FAILURE_TYPE_STATUS: Record<string, number> = {
+  client_cancelled: 499,
+  invalid_request_error: 400,
+  authentication_error: 401,
+  permission_error: 403,
+  insufficient_quota: 429,
+  rate_limit_error: 429,
+  proxy_error: 500,
+  server_error: 502,
+  upstream_error: 502,
+};
+
+function sensitiveFailureError(payload: unknown): Record<string, unknown> | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const root = payload as Record<string, unknown>;
+  const response = root.response && typeof root.response === "object" && !Array.isArray(root.response)
+    ? root.response as Record<string, unknown>
+    : root;
+  const candidate = response.error ?? response.last_error ?? root.error ?? root.last_error;
+  return candidate && typeof candidate === "object" && !Array.isArray(candidate)
+    ? candidate as Record<string, unknown>
+    : undefined;
+}
+
+function defaultSensitiveFailure(status: number): { type: string; code: string } {
+  if (status === 499) return { type: "invalid_request_error", code: "client_closed_request" };
+  if (status === 400) return { type: "invalid_request_error", code: "invalid_request_error" };
+  if (status === 401) return { type: "authentication_error", code: "invalid_api_key" };
+  if (status === 403) return { type: "permission_error", code: "permission_denied" };
+  if (status === 429) return { type: "rate_limit_error", code: "rate_limit_exceeded" };
+  if (status === 503) return { type: "server_error", code: "server_is_overloaded" };
+  if (status >= 500) return { type: "server_error", code: "upstream_server_error" };
+  return { type: "upstream_error", code: "upstream_server_error" };
+}
+
+export function sensitiveFailureMetadata(
+  payload: unknown,
+  fallbackStatus = 502,
+): { status: number; error: { type: string; code: string; message: string }; classificationCode?: string } {
+  const rawError = sensitiveFailureError(payload);
+  const rawCode = typeof rawError?.code === "string" ? rawError.code : undefined;
+  const codeMetadata = rawCode ? SENSITIVE_FAILURE_CODE_METADATA[rawCode] : undefined;
+  const rawType = typeof rawError?.type === "string" ? rawError.type : undefined;
+  const typeStatus = rawType ? SENSITIVE_FAILURE_TYPE_STATUS[rawType] : undefined;
+  const status = codeMetadata
+    ? (fallbackStatus >= 500 && codeMetadata.status >= 500 ? fallbackStatus : codeMetadata.status)
+    : typeStatus !== undefined
+      ? (fallbackStatus >= 500 && typeStatus >= 500 ? fallbackStatus : typeStatus)
+      : fallbackStatus >= 400
+        ? fallbackStatus
+        : 502;
+  const defaults = defaultSensitiveFailure(status);
+  const type = codeMetadata?.type
+    ?? (typeStatus !== undefined ? rawType! : defaults.type);
+  const code = codeMetadata ? rawCode! : defaults.code;
   return {
-    block: buffer.slice(0, match.index),
-    rest: buffer.slice(match.index + match[0].length),
+    status,
+    error: { type, code, message: `Provider error ${status}` },
+    ...(codeMetadata ? { classificationCode: rawCode } : typeStatus !== undefined ? { classificationCode: rawType } : {}),
   };
+}
+
+export function sensitiveFailureClassificationText(text: string, status: number): string {
+  try {
+    return sensitiveFailureMetadata(JSON.parse(text), status).classificationCode ?? `Provider error ${status}`;
+  } catch {
+    return `Provider error ${status}`;
+  }
+}
+
+export function rebuildSensitiveFailedJson(text: string, fallbackStatus = 502): string | null {
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const response = payload.response && typeof payload.response === "object" && !Array.isArray(payload.response)
+    ? payload.response as Record<string, unknown>
+    : undefined;
+  if (payload.status !== "failed" && payload.type !== "response.failed" && response?.status !== "failed") {
+    return null;
+  }
+  const failure = sensitiveFailureMetadata(payload, fallbackStatus);
+  return JSON.stringify({ status: "failed", error: failure.error });
+}
+
+function sensitivePassthroughBlock(block: string): string {
+  let eventName: string | null = null;
+  for (const line of block.split(/\r\n|\r|\n/)) {
+    if (!line || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon < 0 ? line : line.slice(0, colon);
+    if (field !== "event") continue;
+    let value = colon < 0 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    eventName = value;
+  }
+  const namedFailure = eventName === "response.failed";
+  const payload = sseDataPayload(block);
+  if (!namedFailure && (!payload || payload === "[DONE]")) return block;
+  let event: Record<string, unknown> | undefined;
+  if (payload) {
+    try {
+      event = JSON.parse(payload) as Record<string, unknown>;
+    } catch { /* a named response.failed block still fails closed below */ }
+  }
+  const partialFailure = payload !== null
+    && /(?:^|[,{}]\s*)"type"\s*:\s*"response\.failed"/.test(payload);
+  if (event?.type !== "response.failed" && !namedFailure && !partialFailure) return block;
+
+  const failure = sensitiveFailureMetadata(event, 200);
+  const publicEvent = {
+    type: "response.failed",
+    response: { status: "failed", error: failure.error },
+  };
+  return `event: response.failed\ndata: ${JSON.stringify(publicEvent)}`;
+}
+
+const MAX_RETAINED_SSE_BLOCK_BYTES = 4 * 1024 * 1024;
+
+class SseBlockTooLargeError extends Error {
+  constructor() {
+    super(`SSE block exceeded ${MAX_RETAINED_SSE_BLOCK_BYTES} bytes`);
+    this.name = "SseBlockTooLargeError";
+  }
+}
+
+/** Incrementally finds SSE blank-line boundaries while retaining at most one bounded block. */
+class BoundedSseBlocks {
+  private bytes = new Uint8Array(4096);
+  private length = 0;
+  private readonly decoder = new TextDecoder();
+  private skipLfAfterDelimiter = false;
+
+  push(chunk: Uint8Array, onBlock: (block: string) => void): void {
+    for (let index = 0; index < chunk.byteLength; index += 1) {
+      const byte = chunk[index]!;
+      if (this.skipLfAfterDelimiter) {
+        this.skipLfAfterDelimiter = false;
+        if (byte === 10) continue;
+      }
+      if (this.length === this.bytes.byteLength) {
+        const capacity = Math.min(MAX_RETAINED_SSE_BLOCK_BYTES + 4, this.bytes.byteLength * 2);
+        if (capacity <= this.bytes.byteLength) throw new SseBlockTooLargeError();
+        const grown = new Uint8Array(capacity);
+        grown.set(this.bytes);
+        this.bytes = grown;
+      }
+      this.bytes[this.length++] = byte;
+      const delimiterLength = this.delimiterLength();
+      if (delimiterLength === 0) {
+        if (this.length - this.trailingLineEndingLength() > MAX_RETAINED_SSE_BLOCK_BYTES) {
+          throw new SseBlockTooLargeError();
+        }
+        continue;
+      }
+      const blockLength = this.length - delimiterLength;
+      if (blockLength > MAX_RETAINED_SSE_BLOCK_BYTES) throw new SseBlockTooLargeError();
+      const delimiterEndsWithCr = this.bytes[this.length - 1] === 13;
+      onBlock(this.decoder.decode(this.bytes.subarray(0, blockLength)));
+      this.length = 0;
+      this.skipLfAfterDelimiter = delimiterEndsWithCr;
+    }
+  }
+
+  finish(onBlock: (block: string) => void): void {
+    if (this.length === 0) return;
+    if (this.length > MAX_RETAINED_SSE_BLOCK_BYTES) throw new SseBlockTooLargeError();
+    onBlock(this.decoder.decode(this.bytes.subarray(0, this.length)));
+    this.length = 0;
+  }
+
+  private delimiterLength(): number {
+    const end = this.length;
+    if (end >= 4
+      && this.bytes[end - 4] === 13
+      && this.bytes[end - 3] === 10
+      && this.bytes[end - 2] === 13
+      && this.bytes[end - 1] === 10) return 4;
+    if (end >= 3
+      && ((this.bytes[end - 3] === 13 && this.bytes[end - 2] === 10 && this.bytes[end - 1] === 10)
+        || (this.bytes[end - 3] === 10 && this.bytes[end - 2] === 13 && this.bytes[end - 1] === 10))) return 3;
+    if (end >= 3
+      && this.bytes[end - 3] === 13
+      && this.bytes[end - 2] === 10
+      && this.bytes[end - 1] === 13) return 3;
+    if (end >= 2
+      && ((this.bytes[end - 2] === 10 && this.bytes[end - 1] === 10)
+        || (this.bytes[end - 2] === 10 && this.bytes[end - 1] === 13)
+        || (this.bytes[end - 2] === 13 && this.bytes[end - 1] === 13))) return 2;
+    return 0;
+  }
+
+  private trailingLineEndingLength(): number {
+    if (this.length === 0) return 0;
+    const last = this.bytes[this.length - 1];
+    if (last === 13) return 1;
+    if (last !== 10) return 0;
+    return this.length >= 2 && this.bytes[this.length - 2] === 13 ? 2 : 1;
+  }
+}
+
+function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try { reader.releaseLock(); } catch { /* already released or a read is still pending */ }
+}
+
+function cancelAndReleaseReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reason: unknown,
+): void {
+  let cancellation: Promise<void> | undefined;
+  try { cancellation = reader.cancel(reason); } catch { /* source may already be errored */ }
+  releaseReader(reader);
+  if (cancellation) {
+    void cancellation.then(
+      () => releaseReader(reader),
+      () => releaseReader(reader),
+    );
+  }
+}
+
+/** Relay native Responses SSE while rebuilding response.failed blocks from safe metadata. */
+export function relaySensitivePassthroughSse(
+  body: ReadableStream<Uint8Array>,
+  upstream: AbortController,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  const encoder = new TextEncoder();
+  const blocks = new BoundedSseBlocks();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            blocks.finish(block => controller.enqueue(encoder.encode(sensitivePassthroughBlock(block))));
+            releaseReader(reader);
+            controller.close();
+            return;
+          }
+          let emitted = false;
+          blocks.push(value, block => {
+            emitted = true;
+            controller.enqueue(encoder.encode(`${sensitivePassthroughBlock(block)}\n\n`));
+          });
+          if (emitted) return;
+        }
+      } catch (error) {
+        const failure = {
+          type: "upstream_error",
+          code: "upstream_reset",
+          message: "Provider error 502",
+        };
+        const payload = JSON.stringify({
+          type: "response.failed",
+          response: { status: "failed", error: failure, last_error: failure },
+        });
+        try {
+          controller.enqueue(encoder.encode(`\n\nevent: response.failed\ndata: ${payload}\n\ndata: [DONE]\n\n`));
+          controller.close();
+        } catch { /* client already torn down */ }
+        upstream.abort(error);
+        cancelAndReleaseReader(reader, error);
+      }
+    },
+    async cancel(reason) {
+      upstream.abort(reason);
+      cancelAndReleaseReader(reader, reason);
+    },
+  });
+}
+
+export function nextSseBlock(buffer: string): { block: string; rest: string } | null {
+  for (let index = 0; index < buffer.length;) {
+    const firstLength = sseLineEndingLengthAt(buffer, index);
+    if (firstLength === 0) {
+      index += 1;
+      continue;
+    }
+    const secondLength = sseLineEndingLengthAt(buffer, index + firstLength);
+    if (secondLength > 0) {
+      return {
+        block: buffer.slice(0, index),
+        rest: buffer.slice(index + firstLength + secondLength),
+      };
+    }
+    index += firstLength;
+  }
+  return null;
+}
+
+function sseLineEndingLengthAt(value: string, index: number): number {
+  const char = value.charCodeAt(index);
+  if (char === 10) return 1;
+  if (char !== 13) return 0;
+  return value.charCodeAt(index + 1) === 10 ? 2 : 1;
 }
 
 export function sseDataPayload(block: string): string | null {
   const data: string[] = [];
-  for (const line of block.split(/\r?\n/)) {
+  for (const line of block.split(/\r\n|\r|\n/)) {
     if (!line.startsWith("data:")) continue;
     const value = line.slice(5);
     data.push(value.startsWith(" ") ? value.slice(1) : value);
@@ -176,8 +484,7 @@ export function trackSseForRequestLog(
   onFirstOutput?: () => void,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  let blocks: BoundedSseBlocks | null = new BoundedSseBlocks();
   let terminalReported = false;
   const reportFirstOutput = createFirstOutputReporter(onFirstOutput);
 
@@ -196,11 +503,13 @@ export function trackSseForRequestLog(
   };
 
   const inspectChunk = (value: Uint8Array) => {
-    buffer += decoder.decode(value, { stream: true });
-    let next: { block: string; rest: string } | null;
-    while ((next = nextSseBlock(buffer))) {
-      buffer = next.rest;
-      inspectPayload(sseDataPayload(next.block));
+    if (!blocks) return;
+    try {
+      blocks.push(value, block => inspectPayload(sseDataPayload(block)));
+    } catch (error) {
+      if (!(error instanceof SseBlockTooLargeError)) throw error;
+      // Logging is best-effort. Stop retaining provider bytes but keep relaying the client body.
+      blocks = null;
     }
   };
 
@@ -209,22 +518,30 @@ export function trackSseForRequestLog(
       try {
         const { done, value } = await reader.read();
         if (done) {
-          buffer += decoder.decode();
-          if (buffer.trim()) inspectPayload(sseDataPayload(buffer));
+          blocks?.finish(block => {
+            if (block.trim()) inspectPayload(sseDataPayload(block));
+          });
           if (!terminalReported) reportTerminal("incomplete");
+          releaseReader(reader);
           controller.close();
           return;
         }
-        inspectChunk(value);
         controller.enqueue(value);
+        inspectChunk(value);
       } catch (err) {
-        if (!terminalReported) reportTerminal("incomplete");
-        try { controller.error(err); } catch { /* already torn down */ }
+        let failure = err;
+        if (!terminalReported) {
+          try { reportTerminal("incomplete"); } catch (callbackError) { failure = callbackError; }
+        }
+        cancelAndReleaseReader(reader, failure);
+        try { controller.error(failure); } catch { /* already torn down */ }
       }
     },
-    cancel(reason) {
-      onCancel();
-      reader.cancel(reason).catch(() => {});
+    async cancel(reason) {
+      let failure: unknown;
+      try { onCancel(); } catch (error) { failure = error; }
+      cancelAndReleaseReader(reader, failure ?? reason);
+      if (failure) throw failure;
     },
   });
 }
@@ -415,8 +732,7 @@ export function consumeForInspection(
   onFirstOutput?: () => void,
 ): void {
   const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const blocks = new BoundedSseBlocks();
   let reported = false;
   let cancelled = false;
   const reportFirstOutput = createFirstOutputReporter(onFirstOutput);
@@ -426,7 +742,7 @@ export function consumeForInspection(
       // Finalize as a client-cancel and release the turn — the early return skips pump()'s finally,
       // so onDone/onCancel must run here or the entry is silently dropped (#44).
       cancelled = true;
-      reader.cancel(signal.reason).catch(() => {});
+      void cancelAndReleaseReader(reader, signal.reason);
       onCancel?.();
       onDone?.();
       return;
@@ -435,7 +751,7 @@ export function consumeForInspection(
       // Mid-drain disconnect: record a client-cancel entry (idempotent downstream) instead of the
       // suppressed onTerminal path. onDone still fires via pump()'s finally after the read rejects.
       cancelled = true;
-      reader.cancel(signal.reason).catch(() => {});
+      void reader.cancel(signal.reason).catch(() => undefined);
       onCancel?.();
     }, { once: true });
   }
@@ -444,9 +760,9 @@ export function consumeForInspection(
       for (;;) {
         const { done, value } = await reader.read();
         if (done) {
-          buffer += decoder.decode();
-          if (buffer.trim() && !reported) {
-            const payload = sseDataPayload(buffer);
+          blocks.finish(block => {
+            if (!block.trim() || reported) return;
+            const payload = sseDataPayload(block);
             if (logCtx) inspectResponseLogSsePayload(logCtx, payload);
             reportFirstOutput(payload);
             if (payload) {
@@ -457,19 +773,17 @@ export function consumeForInspection(
                 if (response) onCompletedResponse(response);
               }
             }
-          }
+          });
           if (!reported && !cancelled) onTerminal("incomplete");
+          releaseReader(reader);
           return;
         }
-        buffer += decoder.decode(value, { stream: true });
-        let next: { block: string; rest: string } | null;
-        while ((next = nextSseBlock(buffer))) {
-          buffer = next.rest;
-          if (reported && !onCompletedResponse) continue;
-          const payload = sseDataPayload(next.block);
+        blocks.push(value, block => {
+          if (reported && !onCompletedResponse) return;
+          const payload = sseDataPayload(block);
           if (!reported && logCtx) inspectResponseLogSsePayload(logCtx, payload);
           reportFirstOutput(payload);
-          if (!payload) continue;
+          if (!payload) return;
           if (!reported) {
             const status = terminalStatusFromSsePayload(payload);
             if (status) { reported = true; onTerminal(status); }
@@ -478,12 +792,16 @@ export function consumeForInspection(
             const response = completedResponseFromSsePayload(payload);
             if (response) onCompletedResponse(response);
           }
-        }
+        });
       }
-    } catch {
-      if (!reported && !cancelled) onTerminal("incomplete");
+    } catch (error) {
+      cancelAndReleaseReader(reader, error);
+      if (!reported && !cancelled) {
+        try { onTerminal("incomplete"); } catch { /* inspection callbacks are best-effort */ }
+      }
     } finally {
-      onDone?.();
+      releaseReader(reader);
+      try { onDone?.(); } catch { /* lifecycle reporting must not leak the reader */ }
     }
   };
   pump();
@@ -498,17 +816,16 @@ export function consumeForResponseLogMetadata(
   onFirstOutput?: () => void,
 ): void {
   const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const blocks = new BoundedSseBlocks();
   const reportFirstOutput = createFirstOutputReporter(onFirstOutput);
   if (signal) {
     if (signal.aborted) {
-      reader.cancel(signal.reason).catch(() => {});
+      void cancelAndReleaseReader(reader, signal.reason);
       onDone?.();
       return;
     }
     signal.addEventListener("abort", () => {
-      reader.cancel(signal.reason).catch(() => {});
+      void reader.cancel(signal.reason).catch(() => undefined);
     }, { once: true });
   }
   const pump = async () => {
@@ -516,35 +833,35 @@ export function consumeForResponseLogMetadata(
       for (;;) {
         const { done, value } = await reader.read();
         if (done) {
-          buffer += decoder.decode();
-          if (buffer.trim()) {
-            const payload = sseDataPayload(buffer);
+          blocks.finish(block => {
+            if (!block.trim()) return;
+            const payload = sseDataPayload(block);
             inspectResponseLogSsePayload(logCtx, payload);
             reportFirstOutput(payload);
             if (payload && onCompletedResponse) {
               const response = completedResponseFromSsePayload(payload);
               if (response) onCompletedResponse(response);
             }
-          }
+          });
+          releaseReader(reader);
           return;
         }
-        buffer += decoder.decode(value, { stream: true });
-        let next: { block: string; rest: string } | null;
-        while ((next = nextSseBlock(buffer))) {
-          buffer = next.rest;
-          const payload = sseDataPayload(next.block);
+        blocks.push(value, block => {
+          const payload = sseDataPayload(block);
           inspectResponseLogSsePayload(logCtx, payload);
           reportFirstOutput(payload);
           if (payload && onCompletedResponse) {
             const response = completedResponseFromSsePayload(payload);
             if (response) onCompletedResponse(response);
           }
-        }
+        });
       }
-    } catch {
+    } catch (error) {
+      cancelAndReleaseReader(reader, error);
       /* metadata inspection must not affect the client-facing stream */
     } finally {
-      onDone?.();
+      releaseReader(reader);
+      try { onDone?.(); } catch { /* lifecycle reporting must not leak the reader */ }
     }
   };
   pump();

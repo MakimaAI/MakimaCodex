@@ -78,6 +78,32 @@ describe("combo catalog capability intersection", () => {
     });
   });
 
+  test("advertises visible reasoning for a combo only when every target opted in", () => {
+    const allOptedIn = deriveComboCatalogModel("all-raw", normalizedCombo(), [
+      { ...memberA, showRawReasoning: true },
+      { ...memberB, showRawReasoning: true },
+    ])!;
+    const mixed = deriveComboCatalogModel("mixed-raw", normalizedCombo(), [
+      { ...memberA, showRawReasoning: true },
+      memberB,
+    ])!;
+
+    expect(allOptedIn.showRawReasoning).toBe(true);
+    expect(mixed.showRawReasoning).toBeUndefined();
+
+    const rows = buildCatalogEntries(
+      nativeTemplate(),
+      [],
+      [allOptedIn, mixed],
+      undefined,
+      false,
+      "default",
+      new Set(["combo/all-raw", "combo/mixed-raw"]),
+    );
+    expect(rows.find(row => row.slug === "combo/all-raw")?.default_reasoning_summary).toBe("auto");
+    expect(rows.find(row => row.slug === "combo/mixed-raw")?.default_reasoning_summary).toBe("none");
+  });
+
   test("handles vision, missing modalities, reasoning defaults, and parallel tools conservatively", () => {
     expect(deriveComboCatalogModel("vision", normalizedCombo({ defaultEffort: "low" }), [
       memberA,
@@ -296,6 +322,67 @@ function nativeTemplate(): Record<string, unknown> {
 }
 
 describe("Codex catalog routed normalization", () => {
+  test("provider opt-in is carried to openai-chat catalog rows while opt-out stays hidden", async () => {
+    const rows = await gatherRoutedModels({
+      port: 10100,
+      defaultProvider: "visible",
+      providers: {
+        visible: {
+          adapter: "openai-chat",
+          baseUrl: "https://visible.example/v1",
+          liveModels: false,
+          models: ["reasoner"],
+          showRawReasoning: true,
+        },
+        hidden: {
+          adapter: "openai-chat",
+          baseUrl: "https://hidden.example/v1",
+          liveModels: false,
+          models: ["reasoner"],
+        },
+        ignored: {
+          adapter: "openai-responses",
+          baseUrl: "https://responses.example/v1",
+          liveModels: false,
+          models: ["reasoner"],
+          showRawReasoning: true,
+        },
+        "opencode-go": {
+          adapter: "openai-chat",
+          baseUrl: "https://opencode-go.example/v1",
+          liveModels: false,
+          models: ["minimax-m3"],
+          showRawReasoning: true,
+        },
+      },
+    });
+
+    expect(rows.find(row => row.provider === "visible")?.showRawReasoning).toBe(true);
+    expect(rows.find(row => row.provider === "hidden")?.showRawReasoning).toBeUndefined();
+    expect(rows.find(row => row.provider === "ignored")?.showRawReasoning).toBeUndefined();
+    const wirePinned = rows.find(row => row.provider === "opencode-go" && row.id === "minimax-m3")!;
+    expect(wirePinned.showRawReasoning).toBeUndefined();
+
+    const catalog = buildCatalogEntries(nativeTemplate(), [], rows);
+    expect(catalog.find(row => row.slug === "visible/reasoner")?.default_reasoning_summary).toBe("auto");
+    expect(catalog.find(row => row.slug === "hidden/reasoner")?.default_reasoning_summary).toBe("none");
+    expect(catalog.find(row => row.slug === "ignored/reasoner")?.default_reasoning_summary).toBe("none");
+    expect(catalog.find(row => row.slug === "opencode-go/minimax-m3")?.default_reasoning_summary).toBe("none");
+
+    const combo = deriveComboCatalogModel("wire-mixed", normalizedCombo({
+      targets: [
+        { provider: "visible", model: "reasoner", weight: 1 },
+        { provider: "opencode-go", model: "minimax-m3", weight: 1 },
+      ],
+    }), [
+      { ...rows.find(row => row.provider === "visible")!, contextWindow: 128_000 },
+      { ...wirePinned, contextWindow: 128_000 },
+    ])!;
+    expect(combo.showRawReasoning).toBeUndefined();
+    expect(buildCatalogEntries(nativeTemplate(), [], [combo], undefined, false, "default", new Set(["combo/wire-mixed"]))
+      .find(row => row.slug === "combo/wire-mixed")?.default_reasoning_summary).toBe("none");
+  });
+
   test("canonical OpenAI forward mode stays native-only with no routed duplicate", async () => {
     globalThis.fetch = (() => { throw new Error("forward providers must not fetch /models"); }) as typeof fetch;
     const rows = await gatherRoutedModels({
@@ -380,6 +467,31 @@ describe("Codex catalog routed normalization", () => {
     expect(routed?.base_instructions).not.toBe(nativeTemplate().base_instructions);
     expect(routed?.base_instructions).toContain("claude-sonnet-4-6");
     expect(routed?.default_reasoning_level).toBe("medium");
+  });
+
+  test("bridge stamps only selected routed rows V2 and explicit V1 wins", () => {
+    const models = [
+      { provider: "anthropic", id: "claude-sonnet-5" },
+      { provider: "google", id: "gemini-3.1-pro" },
+    ];
+    const off = buildCatalogEntries(nativeTemplate(), ["gpt-5.6-luna"], models, undefined, false, "default");
+    expect(off.find(row => row.slug === "anthropic/claude-sonnet-5")?.multi_agent_version).toBeUndefined();
+
+    const on = buildCatalogEntries(
+      nativeTemplate(), ["gpt-5.6-luna"], models,
+      ["anthropic/claude-sonnet-5", "gpt-5.6-luna"], false, "default", new Set(),
+      ["anthropic/claude-sonnet-5", "gpt-5.6-luna"],
+    );
+    expect(on.find(row => row.slug === "anthropic/claude-sonnet-5")?.multi_agent_version).toBe("v2");
+    expect(on.find(row => row.slug === "google/gemini-3.1-pro")?.multi_agent_version).toBeUndefined();
+    expect(on.find(row => row.slug === "gpt-5.6-luna")?.multi_agent_version).toBe("v1");
+
+    const v1 = buildCatalogEntries(
+      nativeTemplate(), ["gpt-5.6-sol"], models,
+      ["anthropic/claude-sonnet-5"], false, "v1", new Set(),
+      ["anthropic/claude-sonnet-5"],
+    );
+    expect(v1.every(row => row.multi_agent_version === "v1")).toBe(true);
   });
   test("buildCatalogEntries advertises parallel tool calls only for Cursor routed models", () => {
     const entries = buildCatalogEntries(nativeTemplate(), [], [

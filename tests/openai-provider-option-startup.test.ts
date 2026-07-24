@@ -11,7 +11,7 @@ import {
   type OpenAiTierBackupIO,
 } from "../src/config";
 import { runOpenAiTierStartupMigration } from "../src/providers/openai-tier-startup";
-import { OpenAiTierMigrationCollisionError } from "../src/providers/openai-tiers";
+import { OpenAiTierMigrationCollisionError, projectOpenAiTierMigration } from "../src/providers/openai-tiers";
 import type { OcxConfig } from "../src/types";
 
 const config: OcxConfig = {
@@ -111,7 +111,11 @@ function virtualBackupIO(initial: Record<string, string>, fail: {
 describe("OpenAI provider option startup coordinator", () => {
   test("uses project -> backup -> save order and returns the projection", () => {
     const calls: string[] = [];
-    const projected = { ...config, openaiProviderTierVersion: 2 as const };
+    const projected = {
+      ...config,
+      providers: { openai: { ...config.providers.openai!, codexAccountMode: "pool" as const } },
+      openaiProviderTierVersion: 2 as const,
+    };
     const result = runOpenAiTierStartupMigration(config, {
       project: () => { calls.push("project"); return { config: projected, changed: true, resolvedMode: "pool", warnings: [] }; },
       backup: () => { calls.push("backup"); },
@@ -127,7 +131,7 @@ describe("OpenAI provider option startup coordinator", () => {
     console.warn = message => { calls.push(`warn:${String(message)}`); };
     try {
       runOpenAiTierStartupMigration(config, {
-        project: () => ({ config: { ...config, openaiProviderTierVersion: 2 }, changed: true, resolvedMode: "pool", warnings: ["providerContextCaps.openai: conflict resolved"] }),
+        project: () => ({ config: { ...config, providerContextCaps: { openai: 100_000 }, openaiProviderTierVersion: 2 }, changed: true, resolvedMode: "pool", warnings: ["providerContextCaps.openai: conflict resolved"] }),
         backup: () => { calls.push("backup"); },
         save: () => { calls.push("save"); },
       });
@@ -154,7 +158,7 @@ describe("OpenAI provider option startup coordinator", () => {
   test("backup failure performs no save", () => {
     const calls: string[] = [];
     expect(() => runOpenAiTierStartupMigration(config, {
-      project: () => ({ config: { ...config }, changed: true, resolvedMode: "pool", warnings: [] }),
+      project: () => ({ config: { ...config, providerContextCaps: { openai: 100_000 } }, changed: true, resolvedMode: "pool", warnings: [] }),
       backup: () => { calls.push("backup"); throw new Error("backup failed"); },
       save: () => { calls.push("save"); },
     })).toThrow("backup failed");
@@ -170,6 +174,36 @@ describe("OpenAI provider option startup coordinator", () => {
     });
     expect(calls).toEqual(["project"]);
     expect(result.defaultProvider).toBe(config.defaultProvider);
+  });
+
+  test("version-marker-only projection skips a stale backup but still saves the marker", () => {
+    const calls: string[] = [];
+    const projected = { ...config, openaiProviderTierVersion: 2 as const };
+    const result = runOpenAiTierStartupMigration(config, {
+      project: () => { calls.push("project"); return { config: projected, changed: true, resolvedMode: "pool", warnings: [] }; },
+      backup: () => { calls.push("backup"); throw new OpenAiTierBackupCollisionError(); },
+      save: value => { calls.push("save"); expect(value).toBe(projected); },
+    });
+    expect(calls).toEqual(["project", "save"]);
+    expect(result.openaiProviderTierVersion).toBe(2);
+  });
+
+  test("real non-OpenAI config treats undefined projection fields as non-persistent", () => {
+    const routedOnly: OcxConfig = {
+      port: 10100,
+      defaultProvider: "routed",
+      providers: { routed: { adapter: "openai-chat", baseUrl: "https://example.test/v1" } },
+      subagentModels: ["routed/model"],
+      subagentBridge: { enabled: true },
+    };
+    const calls: string[] = [];
+    const result = runOpenAiTierStartupMigration(routedOnly, {
+      project: projectOpenAiTierMigration,
+      backup: () => { calls.push("backup"); throw new OpenAiTierBackupCollisionError(); },
+      save: () => { calls.push("save"); },
+    });
+    expect(calls).toEqual(["save"]);
+    expect(result.openaiProviderTierVersion).toBe(2);
   });
 
   test("save failure propagates without masking", () => {
@@ -196,6 +230,36 @@ describe("OpenAI provider option startup coordinator", () => {
       unlink: () => { throw new Error("unlink failed"); },
     })).toThrow(AtomicWriteResidualTempError);
     expect(scrubbed).toBe(true);
+  });
+
+  test("atomic writer hardens an empty temp before placing secret content in it", () => {
+    const events: string[] = [];
+    atomicWriteFile("/virtual/config.json", "secret", {
+      write: (_path, value) => { events.push(`write:${value}`); },
+      harden: () => { events.push("harden"); },
+      rename: () => { events.push("rename"); },
+      truncate: () => { events.push("truncate"); },
+      unlink: () => { events.push("unlink"); },
+    });
+
+    expect(events).toEqual(["write:", "harden", "write:secret", "rename"]);
+  });
+
+  test("atomic writer fails closed when ACL hardening reports a soft failure", () => {
+    const files = new Map<string, string>([["/virtual/config.json", "original"]]);
+    expect(() => atomicWriteFile("/virtual/config.json", "TOP-SECRET", {
+      write: (path, value) => { files.set(path, value); },
+      harden: () => ({ ok: false, diagnostics: "ACL hardening timed out" }),
+      rename: (source, destination) => {
+        files.set(destination, files.get(source)!);
+        files.delete(source);
+      },
+      truncate: path => { files.set(path, ""); },
+      unlink: path => { files.delete(path); },
+    })).toThrow("ACL hardening timed out");
+
+    expect(files.get("/virtual/config.json")).toBe("original");
+    expect([...files.values()]).not.toContain("TOP-SECRET");
   });
 
   test("atomic writer reports an honest secret residual when scrub and removal both fail", () => {
@@ -238,6 +302,27 @@ describe("OpenAI provider option startup coordinator", () => {
     const backup = state.files.get("/virtual/config.json.pre-openai-tiers-v2.bak");
     expect(new TextDecoder().decode(backup?.bytes)).toBe("original-secret");
     expect(backup?.hardened).toBe(true);
+    expect([...state.files.keys()].filter(path => path.endsWith(".tmp"))).toEqual([]);
+  });
+
+  test("backup hardens its empty exclusive temp before writing config secrets", () => {
+    const state = virtualBackupIO({ "/virtual/config.json": "api-key-secret" });
+    expect(backupConfigBeforeOpenAiTierMigration("/virtual/config.json", state.io)).toBe("created");
+
+    const createIndex = state.calls.findIndex(call => call.startsWith("create:"));
+    const hardenIndex = state.calls.findIndex(call => call.startsWith("harden:"));
+    const writeIndex = state.calls.findIndex(call => call.startsWith("write:"));
+    const publishIndex = state.calls.findIndex(call => call.startsWith("publish:"));
+    expect([createIndex, hardenIndex, writeIndex, publishIndex]).toEqual([1, 2, 3, 4]);
+  });
+
+  test("backup fails closed when ACL hardening reports a soft failure", () => {
+    const state = virtualBackupIO({ "/virtual/config.json": "api-key-secret" });
+    state.io.harden = () => ({ ok: false, diagnostics: "ACL hardening timed out" });
+
+    expect(() => backupConfigBeforeOpenAiTierMigration("/virtual/config.json", state.io))
+      .toThrow("ACL hardening timed out");
+    expect(state.files.has("/virtual/config.json.pre-openai-tiers-v2.bak")).toBe(false);
     expect([...state.files.keys()].filter(path => path.endsWith(".tmp"))).toEqual([]);
   });
 
@@ -304,14 +389,15 @@ describe("OpenAI provider option startup coordinator", () => {
     }
   });
 
-  test("backup reports honest secret residuals before publication and after rollback", () => {
+  test("backup harden failures leave only empty temps while post-write rollback reports secret residuals", () => {
     const beforePublish = virtualBackupIO(
       { "/virtual/config.json": "backup-secret" },
       { harden: 1, truncate: 1, writeAfter: 1, tempUnlink: 2 },
     );
     expect(() => backupConfigBeforeOpenAiTierMigration("/virtual/config.json", beforePublish.io))
-      .toThrow(OpenAiTierBackupSecretResidualError);
-    expect([...beforePublish.files.values()].some(inode => new TextDecoder().decode(inode.bytes) === "backup-secret")).toBe(true);
+      .toThrow(OpenAiTierBackupCleanupError);
+    const emptyResidual = [...beforePublish.files.entries()].find(([path]) => path.endsWith(".tmp"));
+    expect(new TextDecoder().decode(emptyResidual?.[1].bytes)).toBe("");
 
     const afterRollback = virtualBackupIO(
       { "/virtual/config.json": "backup-secret" },

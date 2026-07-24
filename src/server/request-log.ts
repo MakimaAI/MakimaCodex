@@ -31,6 +31,8 @@ import {
 export interface RequestLogContext {
   model: string;
   provider: string;
+  /** Recovered handoff content is request-sensitive; never retain upstream body/error samples. */
+  sensitiveHandoff?: boolean;
   /** TTFT: ms from request start to the first non-empty model output delta (WP4, devlog 040). */
   firstOutputMs?: number;
   surface?: "claude";
@@ -322,10 +324,12 @@ export function applyResponseLogMetadata(logCtx: RequestLogContext, payload: unk
     ? (payload as { response?: unknown }).response
     : payload;
   if (!source || typeof source !== "object") return;
-  const model = (source as { model?: unknown }).model;
-  if (typeof model === "string" && model.trim()) logCtx.resolvedModel = model;
-  const serviceTier = (source as { service_tier?: unknown }).service_tier;
-  if (typeof serviceTier === "string" && serviceTier.trim()) logCtx.responseServiceTier = serviceTier;
+  if (!logCtx.sensitiveHandoff) {
+    const model = (source as { model?: unknown }).model;
+    if (typeof model === "string" && model.trim()) logCtx.resolvedModel = model;
+    const serviceTier = (source as { service_tier?: unknown }).service_tier;
+    if (typeof serviceTier === "string" && serviceTier.trim()) logCtx.responseServiceTier = serviceTier;
+  }
   const usage = usageFromResponsesPayload((source as { usage?: unknown }).usage);
   if (usage) {
     logCtx.usage = usage;
@@ -394,7 +398,7 @@ export function inspectResponseLogJson(logCtx: RequestLogContext, text: string):
     /* body may not be JSON; request log metadata is best-effort only */
   }
   captureUpstreamError(logCtx, text);
-  if (isUsageDebugEnabled() && logCtx.usageDebugBodyKind === undefined) {
+  if (!logCtx.sensitiveHandoff && isUsageDebugEnabled() && logCtx.usageDebugBodyKind === undefined) {
     logCtx.usageDebugBodyKind = "json";
     logCtx.usageDebugBodySample = truncateForDebug(text);
   }
@@ -402,7 +406,7 @@ export function inspectResponseLogJson(logCtx: RequestLogContext, text: string):
 
 export function inspectResponseLogSsePayload(logCtx: RequestLogContext, payload: string | null): void {
   if (!payload || payload.trim() === "[DONE]") return;
-  const debugEnabled = isUsageDebugEnabled();
+  const debugEnabled = !logCtx.sensitiveHandoff && isUsageDebugEnabled();
   const sseAlreadyMarked = logCtx.usageDebugBodyKind === "sse";
   try {
     applyResponseLogMetadata(logCtx, JSON.parse(payload));
@@ -430,7 +434,7 @@ export function inspectResponseLogSsePayload(logCtx: RequestLogContext, payload:
  * run it through redactSecretString so secrets never reach /api/logs. Pure; safe on any text.
  */
 function captureUpstreamError(logCtx: RequestLogContext, text: string | null): void {
-  if (!text || logCtx.upstreamError) return;
+  if (!text || (!logCtx.sensitiveHandoff && logCtx.upstreamError)) return;
   try {
     const json = JSON.parse(text) as {
       type?: unknown;
@@ -442,6 +446,7 @@ function captureUpstreamError(logCtx: RequestLogContext, text: string | null): v
       };
     };
     captureTerminalHttpStatus(logCtx, json);
+    if (logCtx.sensitiveHandoff) return;
     const message = json?.error?.message
       ?? json?.last_error?.message
       ?? json?.response?.error?.message;
@@ -458,6 +463,7 @@ function captureUpstreamError(logCtx: RequestLogContext, text: string | null): v
       logCtx.upstreamError = redactSecretString(incompleteReasonLabel(reason.trim())).slice(0, 500);
     }
   } catch {
+    if (logCtx.sensitiveHandoff) return;
     const trimmed = text.trim();
     if (trimmed) {
       logCtx.upstreamError = redactSecretString(trimmed).slice(0, 500);
@@ -491,7 +497,7 @@ function captureTerminalHttpStatus(
   logCtx.terminalHttpStatus = httpStatusFromTerminalError({
     type: typeof error.type === "string" ? error.type : undefined,
     code: error.code === null || typeof error.code === "string" ? error.code : undefined,
-    message: typeof error.message === "string" ? error.message : undefined,
+    message: !logCtx.sensitiveHandoff && typeof error.message === "string" ? error.message : undefined,
   });
 }
 
@@ -526,12 +532,13 @@ export function addFinalRequestLog(
   meta?: Pick<RequestLogEntry, "terminalStatus" | "closeReason">,
   addLog: (entry: RequestLogEntry) => void = addRequestLog,
 ): void {
+  const upstreamError = logCtx.sensitiveHandoff ? undefined : logCtx.upstreamError;
   // Mid-stream web-search aborts used to emit response.failed and land as 502/upstream_server_error.
   // Prefer the client-close classification whenever the captured reason says so.
-  const effectiveStatus = status >= 500 && logCtx.upstreamError && isClientClosedMessage(logCtx.upstreamError)
+  const effectiveStatus = status >= 500 && upstreamError && isClientClosedMessage(upstreamError)
     ? 499
     : status;
-  const errorCode = requestLogErrorCode(effectiveStatus, logCtx.upstreamError);
+  const errorCode = requestLogErrorCode(effectiveStatus, upstreamError);
   // A response.failed whose classified status is 499 is still a client cancel, not an upstream
   // terminal failure — keep /api/logs closeReason aligned with that.
   const closeReason = effectiveStatus === 499
@@ -574,15 +581,15 @@ export function addFinalRequestLog(
     ...(logCtx.configuredServiceTier ? { configuredServiceTier: logCtx.configuredServiceTier } : {}),
     ...(logCtx.configuredSpeedLabel ? { configuredSpeedLabel: logCtx.configuredSpeedLabel } : {}),
     ...(logCtx.modelSupportsServiceTier !== undefined ? { modelSupportsServiceTier: logCtx.modelSupportsServiceTier } : {}),
-    ...(logCtx.responseServiceTier ? { responseServiceTier: logCtx.responseServiceTier } : {}),
-    ...(logCtx.resolvedModel ? { resolvedModel: logCtx.resolvedModel } : {}),
+    ...(!logCtx.sensitiveHandoff && logCtx.responseServiceTier ? { responseServiceTier: logCtx.responseServiceTier } : {}),
+    ...(!logCtx.sensitiveHandoff && logCtx.resolvedModel ? { resolvedModel: logCtx.resolvedModel } : {}),
     status: effectiveStatus,
     durationMs: Date.now() - start,
     ...(logCtx.firstOutputMs !== undefined ? { firstOutputMs: logCtx.firstOutputMs } : {}),
     ...(errorCode ? { errorCode } : {}),
     ...(meta?.terminalStatus ? { terminalStatus: meta.terminalStatus } : {}),
     ...(closeReason ? { closeReason } : {}),
-    ...(logCtx.upstreamError ? { upstreamError: logCtx.upstreamError } : {}),
+    ...(upstreamError ? { upstreamError } : {}),
     usageStatus,
     ...(loggedUsage ? { usage: loggedUsage } : {}),
     ...(totalTokens !== undefined ? { totalTokens } : {}),
@@ -596,8 +603,8 @@ export function addFinalRequestLog(
       model: logCtx.model,
       upstreamContentType: logCtx.usageDebugContentType ?? null,
       upstreamStatus: effectiveStatus,
-      bodyKind: logCtx.usageDebugBodyKind ?? "none",
-      bodySample: logCtx.usageDebugBodySample ?? "",
+      bodyKind: logCtx.sensitiveHandoff ? "none" : (logCtx.usageDebugBodyKind ?? "none"),
+      bodySample: logCtx.sensitiveHandoff ? "" : (logCtx.usageDebugBodySample ?? ""),
       extractedUsage: loggedUsage ?? null,
     });
   }

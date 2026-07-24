@@ -57,7 +57,7 @@ namespaced selected id를 bare id로 바꿉니다.
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | on | 웹 검색 사이드카 옵션(아래 참조). |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | on | 비전 사이드카 옵션(아래 참조). |
 | `tokenGuardian?` | `OcxTokenGuardianConfig` | off | 선택형 proactive OAuth 갱신 및 Codex 계정 warmup 정책. 필드는 아래에 설명합니다. |
-| `corsAllowOrigins?` | `string[]` | `[]` | CORS에서 추가로 허용할 정확한 origin. loopback origin은 항상 허용합니다. |
+| `corsAllowOrigins?` | `string[]` | `[]` | CORS에서 추가로 허용할 정확한 origin. 데이터 플레인의 loopback origin은 기본 허용되지만, 다른 loopback origin에서 관리 API를 호출하려면 여기에 명시해야 합니다. |
 
 `maxConcurrentThreadsPerSession`은 `config.json` 키가 아니라 `PUT /api/v2`에서 쓰는 camel-case
 필드입니다. `ocx v2 threads <n>`은 대응하는 `max_concurrent_threads_per_session` 값을 Codex의

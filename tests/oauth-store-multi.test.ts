@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { hardenConfigDir } from "../src/config";
+import { inspectSecretPathAcl, resetHardenedStateForTests } from "../src/lib/windows-secret-acl";
 import {
   getAccountCredential,
   getAccountSet,
@@ -9,9 +11,11 @@ import {
   markAccountNeedsReauth,
   removeAccount,
   removeCredential,
+  nextAccountAfterFailure,
   saveAccountCredential,
   saveCredential,
   setActiveAccount,
+  setActiveAccountIfCurrent,
 } from "../src/oauth/store";
 
 const TEST_DIR = join(import.meta.dir, ".tmp-oauth-store-multi-test");
@@ -51,6 +55,36 @@ describe("multi-account auth store", () => {
     const raw = JSON.parse(readFileSync(authPath, "utf-8"));
     expect(Array.isArray(raw.xai.accounts)).toBe(true);
     expect(existsSync(`${authPath}.pre-multiauth`)).toBe(true);
+  });
+
+  test("legacy downgrade backup is hardened even when the config-directory path cache is stale", async () => {
+    if (process.platform !== "win32") return;
+    const authPath = join(TEST_DIR, "auth.json");
+    const backupPath = `${authPath}.pre-multiauth`;
+    resetHardenedStateForTests();
+    hardenConfigDir();
+
+    // Recreate the same path after it entered the process-local hardening cache. The backup
+    // itself must still be hardened; inheriting this replacement directory is not sufficient.
+    rmSync(TEST_DIR, { recursive: true });
+    mkdirSync(TEST_DIR, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({
+      xai: { access: "legacy-access", refresh: "legacy-refresh", expires: Date.now() + 1000 },
+    }));
+
+    try {
+      await saveCredential("xai", cred({ access: "replacement-access" }));
+      expect(existsSync(backupPath)).toBe(true);
+      expect(inspectSecretPathAcl(backupPath)).toEqual({ secure: true });
+    } finally {
+      resetHardenedStateForTests();
+    }
+  });
+
+  test("legacy downgrade backup never swallows a secret-bearing atomic temp residual", async () => {
+    const source = await Bun.file(join(import.meta.dir, "..", "src", "oauth", "store.ts")).text();
+    expect(source).toContain("AtomicWriteSecretResidualError");
+    expect(source).toContain("if (error instanceof AtomicWriteSecretResidualError) throw error;");
   });
 
   test("legacy credential WITHOUT identity gets a deterministic account id across loads", async () => {
@@ -120,6 +154,23 @@ describe("multi-account auth store", () => {
     expect(await setActiveAccount("anthropic", "nope")).toBe(false);
   });
 
+  test("quota failover previews the next healthy account and commits only with a current-account CAS", async () => {
+    await saveCredential("cline", cred({ email: "a@example.com", accountId: "acct-a", access: "access-a" }));
+    await saveCredential("cline", cred({ email: "b@example.com", accountId: "acct-b", access: "access-b" }));
+    await saveCredential("cline", cred({ email: "c@example.com", accountId: "acct-c", access: "access-c" }));
+    const set = getAccountSet("cline")!;
+    const active = set.activeAccountId;
+    const skipped = set.accounts.find(a => a.credential.accountId === "acct-a")!.id;
+
+    const next = nextAccountAfterFailure("cline", active, new Set([active, skipped]));
+    expect(next).not.toBeNull();
+    expect(next?.credential.accountId).toBe("acct-b");
+    expect(getAccountSet("cline")?.activeAccountId).toBe(active);
+    expect(await setActiveAccountIfCurrent("cline", active, next!.id)).toBe(true);
+    expect(getAccountSet("cline")?.activeAccountId).toBe(next?.id);
+    expect(await setActiveAccountIfCurrent("cline", active, skipped)).toBe(false);
+  });
+
   test("saveAccountCredential persists refresh for a non-active account without switching active", async () => {
     await saveCredential("xai", cred({ email: "a@example.com", accountId: "acct-a" }));
     await saveCredential("xai", cred({ email: "b@example.com", accountId: "acct-b", access: "access-b" }));
@@ -148,6 +199,34 @@ describe("multi-account auth store", () => {
     await removeCredential("anthropic"); // active is b
     expect(listAccounts("anthropic").length).toBe(1);
     expect(getCredential("anthropic")?.access).toBe("access-a");
+  });
+
+  test("removeCredential advances a persisted login fence even when no credential exists", async () => {
+    const fencePath = join(TEST_DIR, "auth.login-fences.json");
+
+    await removeCredential("xai");
+
+    expect(existsSync(fencePath)).toBe(true);
+    const first = JSON.parse(readFileSync(fencePath, "utf8"));
+    expect(first).toMatchObject({ version: 1, generations: { xai: 1 } });
+    expect(first.epoch).toMatch(/^[0-9a-f-]{36}$/i);
+
+    await removeCredential("xai");
+    const second = JSON.parse(readFileSync(fencePath, "utf8"));
+    expect(second.epoch).toBe(first.epoch);
+    expect(second.generations.xai).toBe(2);
+    if (process.platform === "win32") {
+      expect(inspectSecretPathAcl(fencePath)).toEqual({ secure: true });
+    }
+  });
+
+  test("a corrupt login fence fails closed before an existing credential is removed", async () => {
+    await saveCredential("xai", cred({ accountId: "acct-xai" }));
+    writeFileSync(join(TEST_DIR, "auth.login-fences.json"), "{not-json");
+
+    await expect(removeCredential("xai")).rejects.toThrow(/login fence/i);
+
+    expect(getCredential("xai")?.access).toBe("access-1");
   });
 
   test("needsReauth flag persists and clears on fresh save", async () => {

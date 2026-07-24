@@ -184,6 +184,8 @@ export interface OcxRequestOptions {
   parallelToolCalls?: boolean;
   reasoning?: string;
   hideThinkingSummary?: boolean;
+  /** True only when the caller explicitly requested `reasoning.summary: "none"`. */
+  hideRawReasoningSummary?: boolean;
   serviceTier?: string;
   presencePenalty?: number;
   frequencyPenalty?: number;
@@ -360,6 +362,8 @@ export interface OcxConfig {
    * Codex's spawn_agent only advertises the first 5 routed models, so this picks which 5 appear.
    */
   subagentModels?: string[];
+  /** Opt-in V2 cross-provider subagent plaintext handoff bridge. Default: disabled. */
+  subagentBridge?: { enabled: boolean };
   injectionModel?: string;
   /**
    * Optional reasoning effort the delegation prompt tells the agent to pass in spawn_agent calls
@@ -478,7 +482,7 @@ export interface OcxConfig {
   combos?: Record<string, OcxComboConfig>;
   /** Background proactive token refresh ("Token Guardian"). Off by default; see OcxTokenGuardianConfig. */
   tokenGuardian?: OcxTokenGuardianConfig;
-  /** Additional origins allowed for CORS (e.g. ["https://clisu-oracle.tail19a2d7.ts.net"]). Loopback origins are always allowed. */
+  /** Additional exact CORS origins. Data-plane loopback origins are accepted by default; cross-loopback management origins must be listed. */
   corsAllowOrigins?: string[];
 }
 
@@ -593,6 +597,11 @@ export interface OcxProviderConfig {
    * link-local, or unique-local upstreams. Metadata endpoints remain blocked.
    */
   allowPrivateNetwork?: boolean;
+  /**
+   * Explicitly promote openai-chat `reasoning_content` into the native Responses reasoning-summary
+   * channel. Raw reasoning can be long or sensitive, so the default is intentionally hidden.
+   */
+  showRawReasoning?: boolean;
   /** Keep provider settings on disk but exclude it from routing and model/catalog listings. */
   disabled?: boolean;
   /**
@@ -653,6 +662,8 @@ export interface OcxProviderConfig {
   note?: string;
   /** Strip one trailing bracketed suffix from model ids before sending them upstream. */
   modelSuffixBracketStrip?: boolean;
+  /** Prefix a clean local model id before sending it upstream (for namespaced vendor wire ids). */
+  modelIdPrefix?: string;
   /**
    * Override the guardian's proactive-refresh policy for this provider. When unset, the provider's
    * built-in risk-tiered default applies (see OAUTH_PROVIDERS in src/oauth/index.ts). Set "proactive"
@@ -746,7 +757,7 @@ export interface OcxProviderConfig {
   unsafeAllowNativeLocalExec?: boolean;
   /**
    * Cursor adapter only: native local exec policy mode (exec-policy.ts).
-   * "codex-sandbox" (default) allows server-driven local exec only when the
+   * "off" is the fail-closed default. "codex-sandbox" allows server-driven local exec only when the
    * request's instructions/developer text declares the Codex danger-full-access
    * sandbox (approves the normal full-access flow, denies undeclared requests);
    * "off" rejects all server-driven local exec; "on" always allows (same as legacy

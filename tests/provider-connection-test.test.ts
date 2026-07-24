@@ -134,6 +134,30 @@ describe("POST /api/providers/test (WP040 connectivity probe)", () => {
     expect(body.models).toBe(3);
   });
 
+  test("Cline uses and accepts the recommended-models catalog shape", async () => {
+    let requestedUrl = "";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requestedUrl = String(input);
+      return Response.json({
+        recommended: [{ id: "anthropic/claude-opus-4.6" }],
+        free: [{ id: "kwaipilot/kat-coder-pro" }],
+        clinePass: [],
+      });
+    }) as typeof fetch;
+    const config = baseConfig({
+      cline: {
+        adapter: "openai-chat",
+        baseUrl: "https://api.cline.bot/api/v1",
+        authMode: "key",
+        apiKey: "cline-test-key",
+      },
+    });
+    const { body } = await probe(config, "cline");
+    expect(requestedUrl).toBe("https://api.cline.bot/api/v1/ai/cline/recommended-models");
+    expect(body.ok).toBe(true);
+    expect(body.models).toBe(2);
+  });
+
   test("malformed 2xx data is an explicit failure, not a silent pass", async () => {
     globalThis.fetch = (async () => new Response(JSON.stringify({ nope: true }), {
       status: 200,

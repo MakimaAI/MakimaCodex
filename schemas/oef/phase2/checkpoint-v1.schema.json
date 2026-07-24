@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "checkpoint_id": {
+      "type": "string",
+      "pattern": "^checkpoint:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "WORKSPACE_SNAPSHOT",
+        "RUNTIME_SESSION",
+        "VERIFICATION_BASELINE",
+        "MANUAL_CHECKPOINT"
+      ]
+    },
+    "attempt_id": {
+      "type": "string",
+      "pattern": "^attempt:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "workspace": {
+      "type": "object",
+      "properties": {
+        "commit_or_snapshot": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "diff_hash": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "commit_or_snapshot",
+        "diff_hash"
+      ],
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "native_session_id_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^secret-ref:[A-Za-z0-9][A-Za-z0-9._:@/-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resumable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "native_session_id_ref",
+        "resumable"
+      ],
+      "additionalProperties": false
+    },
+    "progress": {
+      "type": "object",
+      "properties": {
+        "completed_steps": {
+          "maxItems": 10000,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      },
+      "required": [
+        "completed_steps"
+      ],
+      "additionalProperties": false
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "checkpoint_id",
+    "type",
+    "attempt_id",
+    "sequence",
+    "workspace",
+    "runtime",
+    "progress",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase2/checkpoint-v1.schema.json"
+}

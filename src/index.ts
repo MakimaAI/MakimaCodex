@@ -8,6 +8,7 @@ export { createGoogleAdapter } from "./adapters/google";
 export { createOpenAIChatAdapter } from "./adapters/openai-chat";
 export { createResponsesPassthroughAdapter } from "./adapters/openai-responses";
 export { loadConfig, saveConfig } from "./config";
+export * from "./oef";
 export type { ProviderAdapter } from "./adapters/base";
 export type {
   OcxConfig,

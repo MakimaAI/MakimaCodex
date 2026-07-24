@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "workflow_id": "software-development",
+  "version": "1.0.0",
+  "stages": [
+    { "id": "intake" },
+    { "id": "specification" },
+    { "id": "planning" },
+    { "id": "execution" },
+    { "id": "verification" },
+    { "id": "review" },
+    { "id": "merge" },
+    { "id": "done", "terminal": true }
+  ],
+  "transitions": [
+    { "from": "intake", "to": "specification" },
+    { "from": "specification", "to": "planning", "guards": ["contract.approved"] },
+    { "from": "planning", "to": "execution", "guards": ["plan.exists", "budget.available"] },
+    { "from": "execution", "to": "verification" },
+    { "from": "verification", "to": "review", "guards": ["required-evidence.present"] },
+    { "from": "review", "to": "merge", "guards": ["verdict.accepted"] },
+    { "from": "merge", "to": "done", "guards": ["verdict.accepted"] }
+  ]
+}

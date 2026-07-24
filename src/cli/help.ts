@@ -51,6 +51,32 @@ const helpEntries: Record<string, HelpEntry> = {
   },
   ensure: { usage: "ocx ensure", summary: "Ensure the proxy is running and Codex config/cache are current." },
   sync: { usage: "ocx sync", summary: "Fetch provider models and inject them into Codex config." },
+  subagents: {
+    usage: "ocx subagents bridge <install|status|remove>",
+    summary: "Install, inspect, or safely remove the routed subagent bridge plugin.",
+    details: ["After install, run `ocx restart` and start a new task so Codex loads the MCP tool."],
+  },
+  route: {
+    usage: "ocx route <fingerprint|candidates|plan|show|explain|validate|activate|fallback|outcome> [options] [--json]",
+    summary: "Compile task intelligence and produce, validate, activate, inspect, or replay Phase 5 routing decisions.",
+  },
+  team: {
+    usage: "ocx team <compose|show> [task-or-team-id] [--json]",
+    summary: "Compose and inspect bounded Phase 5 role DAGs.",
+  },
+  "oef-phase5-demo": {
+    usage: "ocx oef-phase5-demo --root <artifact-directory> [--json]",
+    summary: "Run the deterministic multi-role Phase 5 acceptance scenario.",
+  },
+  memory: {
+    usage: "ocx memory <search|show|provenance|explain-query|correct|deprecate|forget|reindex|health> [options] [--json]",
+    summary: "Query and govern the local-first Phase 6 Memory OS.",
+    details: ["Search requires at least one explicit --scope; memory content is returned as evidence, never as system instruction."],
+  },
+  "oef-phase6-demo": {
+    usage: "ocx oef-phase6-demo --root <artifact-directory> [--json]",
+    summary: "Run the Phase 6 revision, recall, provenance, and injection-dedup acceptance scenario.",
+  },
   "sync-cache": { usage: "ocx sync-cache", summary: "Refresh Codex's model cache from the active catalog." },
   status: { usage: "ocx status", summary: "Check proxy server status." },
   doctor: { usage: "ocx doctor", summary: "Diagnose environment/network issues (paths, WSL /mnt, proxy env, ChatGPT reachability)." },
@@ -94,9 +120,41 @@ const helpEntries: Record<string, HelpEntry> = {
     ],
   },
   models: {
-    usage: "ocx models [--provider <name>] [--json]",
-    summary: "List available models from configured providers.",
-    details: ["Shows statically configured models. Providers with liveModels may have additional models at runtime."],
+    usage: "ocx models [--provider <name>] [--json] | ocx models <scan|list|show|aliases|probe|screen|qualify|compare|scorecard|recommend|requalify|quarantine> ... [--json]",
+    summary: "List available models from configured providers or use the OEF Model Lab discovery and qualification surface.",
+    details: [
+      "Without a lab subcommand, shows configured provider models (legacy behavior).",
+      "Model Lab recommendations are evidence only; they never modify production routing.",
+      "Private prompts, hidden assertions, and evaluator policy are omitted from CLI output.",
+    ],
+  },
+  benchmark: {
+    usage: "ocx benchmark <list|show|validate|run> [suite@version] [--home <path>] [--json]",
+    summary: "Inspect redacted OEF Model Lab benchmark metadata and validate versioned suites.",
+  },
+  "oef-phase4-demo": {
+    usage: "ocx oef-phase4-demo --root <path> [--json]",
+    summary: "Run the durable three-configuration Phase 4 acceptance demonstration.",
+  },
+  task: {
+    usage: "ocx task <create|show|transition|migrate-workflow|timeline|block|unblock|cancel|reopen> ... [--json]",
+    summary: "Manage persistent OEF Phase 1 tasks and workflow stages.",
+  },
+  contract: {
+    usage: "ocx contract <create|propose|approve|reject> --task <id> ... [--json]",
+    summary: "Create and approve immutable, versioned task contracts.",
+  },
+  evidence: {
+    usage: "ocx evidence add --task <id> --criterion <key> --type <type> --file <path> [--commit <sha>] | evidence verify ...",
+    summary: "Record artifact-backed criterion evidence and verify it.",
+  },
+  verdict: {
+    usage: "ocx verdict issue --task <id> --decision <decision> --rationale <text> [--commit <sha>] [--json]",
+    summary: "Issue a policy-governed verdict bound to the active contract and evidence.",
+  },
+  integrity: {
+    usage: "ocx integrity verify <task-id> [--json]",
+    summary: "Verify event, artifact, and active-contract integrity.",
   },
   claude: {
     usage: "ocx claude [claude args...]",
@@ -146,6 +204,7 @@ Usage:
   ocx codex-shim <sub>        Auto-start proxy when \`codex\` launches (install|status|uninstall|remove)
   ocx ensure                  Ensure the proxy is running and Codex config/cache are current
   ocx sync                    Fetch models from providers and inject into Codex config
+  ocx subagents bridge <sub>  Install, inspect, or remove the routed subagent bridge
   ocx sync-cache              Refresh Codex's model cache from the active catalog
   ocx status                  Check proxy server status
   ocx doctor                  Diagnose environment/network issues (WSL, proxy, ChatGPT reachability)
@@ -160,6 +219,14 @@ Usage:
   ocx provider <sub>          Manage providers (list|add|remove|show|set-default)
   ocx account <sub>           Accounts/keys (list|current|use|refresh|auto-switch|remove|add-key)
   ocx models [--json]         List available models from configured providers
+  ocx route <sub>             Compile and operate Phase 5 routing plans
+  ocx team <sub>              Compose and inspect Phase 5 role teams
+  ocx memory <sub>            Query and govern the Phase 6 Memory OS
+  ocx task <sub>              Manage persistent OEF tasks and workflow stages
+  ocx contract <sub>          Manage immutable task contract revisions
+  ocx evidence <sub>          Record and verify criterion evidence
+  ocx verdict issue           Issue a policy-governed verdict
+  ocx integrity verify <id>   Verify task audit and artifact integrity
   ocx claude [args...]        Launch Claude Code wired to the proxy (model discovery on)
   ocx help [command]          Show help
   ocx --version | -v          Print version

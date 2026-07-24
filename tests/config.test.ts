@@ -82,6 +82,26 @@ describe("opencodex config defaults", () => {
     expect(codexAutoStartEnabled({})).toBe(true);
   });
 
+  test("subagent bridge is schema-validated and defaults off", () => {
+    expect(getDefaultConfig().subagentBridge).toEqual({ enabled: false });
+
+    writeConfig({
+      port: 12345,
+      providers: { custom: { adapter: "openai-chat", baseUrl: "https://example.test/v1" } },
+      defaultProvider: "custom",
+      subagentBridge: { enabled: true },
+    });
+    expect(loadConfig().subagentBridge).toEqual({ enabled: true });
+
+    writeConfig({
+      port: 12345,
+      providers: { custom: { adapter: "openai-chat", baseUrl: "https://example.test/v1" } },
+      defaultProvider: "custom",
+      subagentBridge: { enabled: "yes" },
+    });
+    expect(readConfigDiagnostics().error).toContain("subagentBridge.enabled");
+  });
+
   test("Codex autostart can be disabled explicitly", () => {
     expect(codexAutoStartEnabled({ codexAutoStart: false })).toBe(false);
     expect(codexAutoStartEnabled({ codexAutoStart: true })).toBe(true);
@@ -105,6 +125,34 @@ describe("opencodex config defaults", () => {
       },
       codexAutoStart: false,
     });
+  });
+
+  test("showRawReasoning accepts booleans and rejects every other value", () => {
+    writeConfig({
+      port: 12345,
+      providers: {
+        custom: { adapter: "openai-chat", baseUrl: "https://example.test/v1", showRawReasoning: true },
+      },
+      defaultProvider: "custom",
+    });
+    expect(readConfigDiagnostics()).toMatchObject({
+      source: "file",
+      error: null,
+      config: { providers: { custom: { showRawReasoning: true } } },
+    });
+
+    for (const invalid of ["true", 1, null, {}, []]) {
+      writeConfig({
+        port: 12345,
+        providers: {
+          custom: { adapter: "openai-chat", baseUrl: "https://example.test/v1", showRawReasoning: invalid },
+        },
+        defaultProvider: "custom",
+      });
+      const diagnostics = readConfigDiagnostics();
+      expect(diagnostics.source).toBe("fallback");
+      expect(diagnostics.error).toContain("showRawReasoning");
+    }
   });
 
   test("accepts OpenAI account mode only on the canonical forward provider", () => {

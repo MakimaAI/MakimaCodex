@@ -76,6 +76,12 @@ export function bridgeToResponsesSSE(
     responseId?: string;
     stallTimeoutSec?: number;
     hideThinkingSummary?: boolean;
+    /** Replace adapter/provider error text with status-only metadata for recovered handoffs. */
+    sensitiveHandoff?: boolean;
+    /** Promote adapter raw reasoning deltas into the native reasoning summary channel. */
+    promoteRawReasoningToSummary?: boolean;
+    /** Explicit request-level suppression; takes precedence over promotion. */
+    hideRawReasoningSummary?: boolean;
     /**
      * Remote compaction v2 turn: accumulate all assistant text and, on done, emit ONE synthetic
      * `{type:"compaction", encrypted_content:"ocx1:"+base64(text)}` output item before
@@ -216,6 +222,8 @@ export function bridgeToResponsesSSE(
       let currentMsg: { itemId: string; outputIndex: number; text: string } | null = null;
       let currentReasoning: { itemId: string; outputIndex: number; text: string } | null = null;
       let currentRawReasoning: { itemId: string; outputIndex: number; text: string } | null = null;
+      const rawReasoningPromoted = options?.promoteRawReasoningToSummary === true
+        && options?.hideRawReasoningSummary !== true;
       // Anthropic extended-thinking round-trip state: the signature signs the CURRENT thinking
       // block; redacted blocks are opaque payloads replayed verbatim. Attached to the reasoning
       // item as an ocxr1 encrypted_content envelope on close. hiddenThinkingText collects the
@@ -329,10 +337,25 @@ export function bridgeToResponsesSSE(
 
       const closeCurrentRawReasoning = () => {
         if (!currentRawReasoning) return;
-        const item = {
-          type: "reasoning", id: currentRawReasoning.itemId, summary: [],
-          content: [{ type: "reasoning_text", text: currentRawReasoning.text }],
-        };
+        if (rawReasoningPromoted) {
+          emit("response.reasoning_summary_text.done", {
+            item_id: currentRawReasoning.itemId, output_index: currentRawReasoning.outputIndex,
+            summary_index: 0, text: currentRawReasoning.text,
+          });
+          emit("response.reasoning_summary_part.done", {
+            item_id: currentRawReasoning.itemId, output_index: currentRawReasoning.outputIndex,
+            summary_index: 0, part: { type: "summary_text", text: currentRawReasoning.text },
+          });
+        }
+        const item = rawReasoningPromoted
+          ? {
+              type: "reasoning", id: currentRawReasoning.itemId,
+              summary: [{ type: "summary_text", text: currentRawReasoning.text }],
+            }
+          : {
+              type: "reasoning", id: currentRawReasoning.itemId, summary: [],
+              content: [{ type: "reasoning_text", text: currentRawReasoning.text }],
+            };
         emit("response.output_item.done", { output_index: currentRawReasoning.outputIndex, item });
         finishedItems.push(item as OutputItem);
         outputIndex++;
@@ -505,21 +528,46 @@ export function bridgeToResponsesSSE(
               break;
             }
             case "reasoning_raw_delta": {
-              if (options?.hideThinkingSummary) { hiddenRawReasoningText += event.text; break; }
+              if (options?.hideRawReasoningSummary === true
+                || (!rawReasoningPromoted && options?.hideThinkingSummary)) {
+                // Hidden reasoning still occupies a later output item. Close any currently open
+                // item before buffering it so the envelope cannot reuse that item's output index.
+                if (currentMsg) closeCurrentMessage();
+                if (currentReasoning) closeCurrentReasoning();
+                if (currentRawReasoning) closeCurrentRawReasoning();
+                if (currentToolCall) closeCurrentToolCall();
+                hiddenRawReasoningText += event.text;
+                break;
+              }
               if (currentMsg) closeCurrentMessage();
               if (currentReasoning) closeCurrentReasoning();
               if (currentToolCall) closeCurrentToolCall();
               if (!currentRawReasoning) {
                 const itemId = `rs_${uuid()}`;
-                const item = { type: "reasoning", id: itemId, summary: [] as never[], content: [] as { type: string; text: string }[] };
+                const item = rawReasoningPromoted
+                  ? { type: "reasoning", id: itemId, summary: [] as { type: string; text: string }[] }
+                  : { type: "reasoning", id: itemId, summary: [] as never[], content: [] as { type: string; text: string }[] };
                 emit("response.output_item.added", { output_index: outputIndex, item });
+                if (rawReasoningPromoted) {
+                  emit("response.reasoning_summary_part.added", {
+                    item_id: itemId, output_index: outputIndex, summary_index: 0,
+                    part: { type: "summary_text", text: "" },
+                  });
+                }
                 currentRawReasoning = { itemId, outputIndex, text: "" };
               }
               currentRawReasoning.text += event.text;
-              emit("response.reasoning_text.delta", {
-                item_id: currentRawReasoning.itemId, output_index: currentRawReasoning.outputIndex,
-                content_index: 0, delta: event.text,
-              });
+              if (rawReasoningPromoted) {
+                emit("response.reasoning_summary_text.delta", {
+                  item_id: currentRawReasoning.itemId, output_index: currentRawReasoning.outputIndex,
+                  summary_index: 0, delta: event.text,
+                });
+              } else {
+                emit("response.reasoning_text.delta", {
+                  item_id: currentRawReasoning.itemId, output_index: currentRawReasoning.outputIndex,
+                  content_index: 0, delta: event.text,
+                });
+              }
               break;
             }
             case "tool_call_start": {
@@ -651,14 +699,17 @@ export function bridgeToResponsesSSE(
               if (currentToolCall) closeCurrentToolCall();
               if (currentWebSearch) closeCurrentWebSearch("failed", []);
               const failure = adapterFailureFromMessage(event.message);
+              const publicError = options?.sensitiveHandoff
+                ? { ...failure.error, message: `Provider error ${failure.httpStatus}` }
+                : failure.error;
               emit("response.failed", {
                 response: {
                   ...responseSnapshot("failed", finishedItems),
                   // Partial consumption from a mid-stream upstream failure: surfaced so the request
                   // log can record real tokens instead of usageStatus "unreported" with 0.
                   ...(event.usage ? { usage: responsesUsage(event.usage) } : {}),
-                  error: failure.error,
-                  last_error: failure.error,
+                  error: publicError,
+                  last_error: publicError,
                 },
               });
               reportTerminal("failed");
@@ -668,13 +719,20 @@ export function bridgeToResponsesSSE(
           }
         }
       } catch (err) {
+        if (currentMsg) closeCurrentMessage();
+        if (currentReasoning) closeCurrentReasoning();
+        if (currentRawReasoning) closeCurrentRawReasoning();
         flushHiddenRawReasoning();
+        if (currentToolCall) closeCurrentToolCall();
         if (currentWebSearch) closeCurrentWebSearch("failed", []);
+        const publicMessage = options?.sensitiveHandoff
+          ? "Provider error 500"
+          : (err instanceof Error ? err.message : String(err));
         emit("response.failed", {
           response: {
             ...responseSnapshot("failed", finishedItems),
-            error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
-            last_error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
+            error: responseError(500, "proxy_error", publicMessage),
+            last_error: responseError(500, "proxy_error", publicMessage),
           },
         });
         reportTerminal("failed");
@@ -726,6 +784,10 @@ export function buildResponseJSON(
   modelId: string,
   options?: {
     hideThinkingSummary?: boolean;
+    /** Replace adapter/provider error text with status-only metadata for recovered handoffs. */
+    sensitiveHandoff?: boolean;
+    promoteRawReasoningToSummary?: boolean;
+    hideRawReasoningSummary?: boolean;
     toolNsMap?: Map<string, { namespace: string; name: string }>;
     freeformToolNames?: Set<string>;
     toolSearchToolNames?: Set<string>;
@@ -791,11 +853,22 @@ export function buildResponseJSON(
   };
   const flushRawReasoning = () => {
     if (!currentRawReasoning) return;
-    if (options?.hideThinkingSummary === true) {
+    const promoted = options?.promoteRawReasoningToSummary === true
+      && options?.hideRawReasoningSummary !== true;
+    if (options?.hideRawReasoningSummary === true
+      || (!promoted && options?.hideThinkingSummary === true)) {
       // Same contract as the streaming path: no visible reasoning, txt-only envelope round-trip.
       output.push({
         type: "reasoning", id: `rs_${uuid()}`, summary: [],
         encrypted_content: encodeReasoningEnvelope({ txt: currentRawReasoning }),
+      });
+      currentRawReasoning = "";
+      return;
+    }
+    if (promoted) {
+      output.push({
+        type: "reasoning", id: `rs_${uuid()}`,
+        summary: [{ type: "summary_text", text: currentRawReasoning }],
       });
       currentRawReasoning = "";
       return;
@@ -922,12 +995,19 @@ export function buildResponseJSON(
     output.push({ type: "compaction", id: `cmp_${uuid()}`, encrypted_content: encodeCompactionSummary(compactionText) });
   }
 
+  const publicFailure = errorMessage && options?.sensitiveHandoff
+    ? adapterFailureFromMessage(errorMessage)
+    : undefined;
   return {
     id: responseId, object: "response",
     created_at: Math.floor(Date.now() / 1000),
     status: errorMessage ? "failed" : "completed",
     model: modelId, output,
-    ...(errorMessage ? { error: { message: errorMessage } } : {}),
+    ...(errorMessage
+      ? { error: publicFailure
+          ? { ...publicFailure.error, message: `Provider error ${publicFailure.httpStatus}` }
+          : { message: errorMessage } }
+      : {}),
     usage: responsesUsage(usage),
   };
 }

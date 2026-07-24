@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "model_version_id": {
+      "type": "string",
+      "pattern": "^model-version:[A-Za-z0-9][A-Za-z0-9._/@-]*$"
+    },
+    "family_id": {
+      "type": "string",
+      "pattern": "^model-family:[A-Za-z0-9][A-Za-z0-9._/@-]*$"
+    },
+    "provider_id": {
+      "type": "string",
+      "pattern": "^provider:[A-Za-z0-9][A-Za-z0-9._/@-]*$"
+    },
+    "provider_model_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "release": {
+      "type": "object",
+      "properties": {
+        "first_seen_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+        },
+        "provider_release_date": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "knowledge_cutoff": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "first_seen_at",
+        "provider_release_date",
+        "knowledge_cutoff"
+      ],
+      "additionalProperties": false
+    },
+    "modalities": {
+      "type": "object",
+      "properties": {
+        "text_input": {
+          "type": "boolean"
+        },
+        "image_input": {
+          "type": "boolean"
+        },
+        "text_output": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "text_input",
+        "image_input",
+        "text_output"
+      ],
+      "additionalProperties": false
+    },
+    "context": {
+      "type": "object",
+      "properties": {
+        "advertised_tokens": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed_safe_tokens": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "advertised_tokens",
+        "observed_safe_tokens"
+      ],
+      "additionalProperties": false
+    },
+    "features": {
+      "type": "object",
+      "properties": {
+        "tool_calling_claimed": {
+          "type": "boolean"
+        },
+        "structured_output_claimed": {
+          "type": "boolean"
+        },
+        "streaming_claimed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "tool_calling_claimed",
+        "structured_output_claimed",
+        "streaming_claimed"
+      ],
+      "additionalProperties": false
+    },
+    "commercial": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "input_cost_per_million": {
+              "type": "number",
+              "minimum": 0
+            },
+            "output_cost_per_million": {
+              "type": "number",
+              "minimum": 0
+            },
+            "currency": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 3
+            }
+          },
+          "required": [
+            "input_cost_per_million",
+            "output_cost_per_million",
+            "currency"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lifecycle_status": {
+      "type": "string",
+      "enum": [
+        "DISCOVERED",
+        "METADATA_VALIDATED",
+        "COMPATIBILITY_PROBED",
+        "SCREENED",
+        "ROLE_QUALIFIED",
+        "SHADOW_READY",
+        "CANARY_READY",
+        "ACTIVE",
+        "DEGRADED",
+        "QUARANTINED",
+        "DEPRECATED",
+        "RETIRED"
+      ]
+    },
+    "provenance": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "source_type": {
+            "type": "string",
+            "enum": [
+              "provider-api",
+              "official-documentation",
+              "official-release-note",
+              "runtime-documentation",
+              "community-report",
+              "local-observation",
+              "benchmark-result",
+              "human-confirmed"
+            ]
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+          },
+          "content_hash": {
+            "type": "string",
+            "pattern": "^sha256:[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "source_type",
+          "observed_at",
+          "content_hash"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "metadata_hash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "model_version_id",
+    "family_id",
+    "provider_id",
+    "provider_model_name",
+    "release",
+    "modalities",
+    "context",
+    "features",
+    "commercial",
+    "lifecycle_status",
+    "provenance",
+    "metadata_hash"
+  ],
+  "additionalProperties": false,
+  "$id": "https://opencodex.local/schemas/oef/phase4/model-version-v1.schema.json"
+}

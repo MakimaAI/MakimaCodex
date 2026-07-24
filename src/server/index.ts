@@ -95,6 +95,7 @@ import {
   assertServerAuthConfig,
   corsHeaders,
   hasValidApiAuth,
+  isAllowedManagementRequestOrigin,
   isAllowedRequestOrigin,
   isApiAuthRequired,
   isLoopbackHostname,
@@ -122,6 +123,18 @@ import { buildDesktop3pRegistry } from "../claude/desktop-3p";
 import { handleImages } from "./images";
 import { handleSearch } from "./search";
 import { fetchAllModels, handleManagementAPI, VERSION } from "./management-api";
+import {
+  normalizedActualBindHostname,
+  SUBAGENT_BRIDGE_HEALTH_PROTOCOL,
+  subagentBridgeRuntimeEligible,
+} from "../subagent-bridge/runtime";
+import {
+  createSubagentBridgeHealthProof,
+  createSubagentBridgeRandomValue,
+  isSubagentBridgeRandomValue,
+  SubagentBridgeReplayGuard,
+} from "../subagent-bridge/auth";
+import { readSecureSubagentBridgeToken } from "../subagent-bridge/lifecycle";
 
 const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
 const WEBSOCKET_IDLE_TIMEOUT_SECONDS = 0;
@@ -182,13 +195,16 @@ export function startServer(port?: number) {
   hydrateRequestLogsFromDisk();
 
   const listenPort = port ?? config.port ?? 10100;
+  let healthPort = listenPort;
   setCorsOrigin(listenPort);
 
   // Canonicalize an explicit "localhost" bind to IPv4 so it matches the injected base_url (which
   // resolves localhost→127.0.0.1): on Windows `localhost` resolves ::1-first, but the injected URL
   // is 127.0.0.1, so binding literal "localhost" would reintroduce the F4 refusal. Wildcards
   // (0.0.0.0/::) and specific hosts are left untouched so intentional exposure is preserved.
-  const bindHost = /^localhost$/i.test(config.hostname ?? "") ? "127.0.0.1" : (config.hostname ?? "127.0.0.1");
+  const bindHost = normalizedActualBindHostname(config.hostname);
+  const subagentBridgeInstanceId = createSubagentBridgeRandomValue();
+  const subagentBridgeReplayGuard = new SubagentBridgeReplayGuard();
 
   const server: Server<WsData> = Bun.serve<WsData>({
     port: listenPort,
@@ -199,7 +215,10 @@ export function startServer(port?: number) {
       markActivity(`${req.method} ${url.pathname}`);
 
       if (req.method === "OPTIONS") {
-        if (!isAllowedRequestOrigin(req, config)) {
+        const originAllowed = url.pathname.startsWith("/api/")
+          ? isAllowedManagementRequestOrigin(req, config)
+          : isAllowedRequestOrigin(req, config);
+        if (!originAllowed) {
           return new Response(null, { status: 403, headers: corsHeaders() });
         }
         return new Response(null, { status: 204, headers: corsHeaders(req, config) });
@@ -234,10 +253,51 @@ export function startServer(port?: number) {
 
       if (url.pathname === "/healthz" && req.method === "GET") {
         // service/pid/port let CLI liveness reject foreign 200s and verify pid identity.
-        return jsonResponse({ status: "ok", service: "opencodex", version: VERSION, uptime: process.uptime(), pid: process.pid, port: listenPort }, 200, req, config);
+        const eligible = subagentBridgeRuntimeEligible(config, bindHost);
+        const subagentBridge: Record<string, unknown> = {
+          protocol: SUBAGENT_BRIDGE_HEALTH_PROTOCOL,
+          eligible,
+        };
+        const challenges = url.searchParams.getAll("challenge");
+        const challenge = challenges.length === 1 ? challenges[0] : null;
+        if (eligible && isSubagentBridgeRandomValue(challenge)) {
+          const token = readSecureSubagentBridgeToken();
+          if (token) {
+            const proof = createSubagentBridgeHealthProof({
+              token,
+              protocol: SUBAGENT_BRIDGE_HEALTH_PROTOCOL,
+              instanceId: subagentBridgeInstanceId,
+              nonce: challenge,
+              pid: process.pid,
+              port: healthPort,
+            });
+            if (proof) Object.assign(subagentBridge, { instanceId: subagentBridgeInstanceId, proof });
+          }
+        }
+        return jsonResponse({
+          status: "ok",
+          service: "opencodex",
+          version: VERSION,
+          uptime: process.uptime(),
+          pid: process.pid,
+          port: healthPort,
+          subagentBridge,
+        }, 200, req, config);
+      }
+
+      if (url.pathname === "/internal/subagent-handoffs") {
+        const { handleSubagentHandoffRequest } = await import("../subagent-bridge/http");
+        return withCors(await handleSubagentHandoffRequest(req, {
+          runtimeEligible: subagentBridgeRuntimeEligible(config, bindHost),
+          instanceId: subagentBridgeInstanceId,
+          replayGuard: subagentBridgeReplayGuard,
+        }), req, config);
       }
 
       if (url.pathname.startsWith("/api/")) {
+        if (!isAllowedManagementRequestOrigin(req, config)) {
+          return jsonResponse({ error: "cross-origin request blocked" }, 403, req, config);
+        }
         const apiAuthError = requireApiAuth(req, config, "management");
         if (apiAuthError) return withCors(apiAuthError, req, config);
         const mgmtResponse = await handleManagementAPI(req, url, config);
@@ -294,7 +354,10 @@ export function startServer(port?: number) {
           // Disabled natives stay in the catalog shape with visibility "hide" (mirrors the
           // on-disk sync; codex-rs keeps them out of the picker itself).
           const maMode = config.multiAgentMode === "v1" || config.multiAgentMode === "v2" ? config.multiAgentMode : "default";
-          const entries = buildCatalogEntries(loadCatalogTemplate(), nativeSlugs, goOrdered, config.subagentModels, websocketsEnabled(config), maMode as "v1" | "default" | "v2", exactComboCatalogSlugs(config));
+          const bridgeV2Slugs = config.subagentBridge?.enabled === true && maMode !== "v1"
+            ? (config.subagentModels ?? []).filter(slug => slug.includes("/"))
+            : [];
+          const entries = buildCatalogEntries(loadCatalogTemplate(), nativeSlugs, goOrdered, config.subagentModels, websocketsEnabled(config), maMode as "v1" | "default" | "v2", exactComboCatalogSlugs(config), bridgeV2Slugs);
           return jsonResponse({ models: applyNativeVisibility(entries, disabledNativeSlugs(config)) }, 200, req, config);
         }
         // OpenAI list shape: native gpt bare + routed models namespaced "<provider>/<id>"
@@ -613,6 +676,7 @@ export function startServer(port?: number) {
 
   setServerRef(server);
   const actualPort = server.port ?? listenPort;
+  healthPort = actualPort;
   setCorsOrigin(actualPort);
 
   console.log(`🚀 opencodex proxy running on http://localhost:${actualPort}`);

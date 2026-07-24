@@ -73,3 +73,14 @@ export function sortPresets(presets: CatalogPreset[]): CatalogPreset[] {
   return [...presets].sort((a, b) =>
     a.label.localeCompare(b.label, undefined, { sensitivity: "base" }) || a.id.localeCompare(b.id));
 }
+
+export type ProviderPresetDescriptionKey = "prov.clineDesc" | "prov.clinePassDesc";
+
+/** Localized descriptions for provider-specific account and billing contracts. */
+export function providerPresetDescriptionKey(
+  preset: Pick<CatalogPreset, "id">,
+): ProviderPresetDescriptionKey | null {
+  if (preset.id === "cline") return "prov.clineDesc";
+  if (preset.id === "cline-pass") return "prov.clinePassDesc";
+  return null;
+}

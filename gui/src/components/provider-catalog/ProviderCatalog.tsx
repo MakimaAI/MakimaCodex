@@ -9,6 +9,7 @@ import { useT } from "../../i18n";
 import {
   bucketPresets,
   filterPresets,
+  providerPresetDescriptionKey,
   type CatalogPreset,
 } from "./provider-presets";
 
@@ -86,6 +87,11 @@ export default function ProviderCatalog({
     return <>{free}{auth}</>;
   };
 
+  const description = (p: CatalogPreset): string | undefined => {
+    const key = providerPresetDescriptionKey(p);
+    return key ? t(key) : p.note;
+  };
+
   return (
     <div className="provider-catalog">
       <div className="provider-catalog-tabs" role="tablist">
@@ -123,7 +129,7 @@ export default function ProviderCatalog({
           <button key={p.id} className="list-row" onClick={() => onSelectPreset(p)}>
             <div>
               <div className="title">{p.label}</div>
-              <div className="sub"><code className="chip">{p.adapter}</code>{p.note ? ` · ${p.note}` : ""}</div>
+              <div className="sub"><code className="chip">{p.adapter}</code>{description(p) ? ` · ${description(p)}` : ""}</div>
             </div>
             <div className="provider-catalog-badges">{badges(p)}</div>
           </button>

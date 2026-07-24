@@ -58,7 +58,7 @@ differing backup and rewrites known legacy namespaced selected ids to bare ids.
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | on | Web-search sidecar options (see below). |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | on | Vision sidecar options (see below). |
 | `tokenGuardian?` | `OcxTokenGuardianConfig` | off | Optional proactive OAuth refresh and Codex-account warmup policy; fields are listed below. |
-| `corsAllowOrigins?` | `string[]` | `[]` | Additional exact origins allowed by CORS. Loopback origins are always allowed. |
+| `corsAllowOrigins?` | `string[]` | `[]` | Additional exact CORS origins. Data-plane loopback origins are accepted by default; cross-loopback management origins must be listed explicitly. |
 
 `maxConcurrentThreadsPerSession` is the camel-case field used by `PUT /api/v2`, not a
 `config.json` key. `ocx v2 threads <n>` persists the corresponding

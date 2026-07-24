@@ -27,7 +27,7 @@ export default function AddCodexAccountModal({
   const onAddedRef = useRef(onAdded);
   const onCloseRef = useRef(onClose);
   const previousFocusRef = useRef<HTMLElement | null>(null);
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
     onAddedRef.current = onAdded;
@@ -179,32 +179,37 @@ export default function AddCodexAccountModal({
     }
   };
 
-  // Focus-trap: focus first interactive element on mount, restore on unmount.
+  // Native modal semantics provide focus trapping; restore the invoking control on unmount.
   useEffect(() => {
     previousFocusRef.current = document.activeElement as HTMLElement | null;
     const dialog = dialogRef.current;
-    if (dialog) {
-      const focusable = dialog.querySelector<HTMLElement>(
-        "input:not([disabled]), button:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
-      );
-      if (focusable) focusable.focus();
-    }
+    if (dialog && !dialog.open) dialog.showModal();
     return () => {
+      if (dialog && dialog.open) dialog.close();
       previousFocusRef.current?.focus();
     };
   }, []);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeModal(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+  const handleCancel = useCallback((event: React.SyntheticEvent<HTMLDialogElement>) => {
+    event.preventDefault();
+    closeModal();
+  }, [closeModal]);
+
+  const handleBackdropClick = useCallback((event: React.MouseEvent<HTMLDialogElement>) => {
+    if (event.target === event.currentTarget) closeModal();
   }, [closeModal]);
 
   const dialogLabel = reauthAccountId ? t("codexAuth.reauthenticate") : t("codexAuth.addTitle");
 
   return (
-    <div role="dialog" aria-modal="true" aria-label={dialogLabel} className="modal-overlay" onClick={closeModal}>
-      <div ref={dialogRef} className="modal-card" onClick={e => e.stopPropagation()} style={{ maxWidth: 440 }}>
+    <dialog
+      ref={dialogRef}
+      aria-label={dialogLabel}
+      className="modal-overlay"
+      onCancel={handleCancel}
+      onClick={handleBackdropClick}
+    >
+      <div className="modal-card" onClick={e => e.stopPropagation()} style={{ maxWidth: 440 }}>
         {step === "pick" && (
           <>
             <h3 style={{ marginBottom: 4 }}>{t("codexAuth.addTitle")}</h3>
@@ -254,6 +259,6 @@ export default function AddCodexAccountModal({
           </>
         )}
       </div>
-    </div>
+    </dialog>
   );
 }
