@@ -205,4 +205,131 @@ describe("durable operations", () => {
     expect(tables).toEqual(["operation_attempts", "operation_effect_receipts", "operation_jobs"]);
     database.close(); target.close();
   });
+
+  test("rejects an expired lease owner cancellation but permits a verified capability override", () => {
+    const verifier: CancellationCapabilityVerifier = { verify: () => ({ actor: "human:owner", expires_at: "2026-07-24T12:05:00.000Z" }) };
+    const target = store(verifier); const job = enqueue(target);
+    target.claim({ scope_id: scopeA, owner: "worker:a", now: t0, lease_ms: 1_000 });
+    const afterLease = "2026-07-24T12:00:01.001Z";
+    expect(() => target.cancel({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", now: afterLease })).toThrow("OPERATION_LEASE_EXPIRED");
+    expect(target.cancel({ scope_id: scopeA, job_id: job.job_id, capability: "verified", actor: "human:owner", now: afterLease }).state).toBe("CANCELLED");
+    target.close();
+  });
+
+  test("rejects a cancellation capability that expires exactly at cancellation time", () => {
+    const verifier: CancellationCapabilityVerifier = { verify: () => ({ actor: "human:owner", expires_at: t0 }) };
+    const target = store(verifier); const job = enqueue(target);
+    expect(() => target.cancel({ scope_id: scopeA, job_id: job.job_id, capability: "boundary", actor: "human:owner", now: t0 })).toThrow("OPERATION_CANCELLATION_CAPABILITY_INVALID");
+    target.close();
+  });
+
+  test("hashes dangerous-key payloads distinctly and detects dangerous-key payload tampering", () => {
+    const target = store();
+    const first = enqueue(target, { idempotency_key: "key:dangerous-one", payload: JSON.parse('{"__proto__":"one","constructor":"two","prototype":"three"}') });
+    const second = enqueue(target, { idempotency_key: "key:dangerous-two", payload: JSON.parse('{"__proto__":"four","constructor":"two","prototype":"three"}') });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    const hashes = database.query("SELECT job_id, payload_hash FROM operation_jobs WHERE scope_id=? AND job_id IN (?, ?) ORDER BY job_id").all(scopeA, first.job_id, second.job_id) as Array<{ job_id: string; payload_hash: string }>;
+    expect(hashes).toHaveLength(2);
+    expect(hashes[0]!.payload_hash).not.toBe(hashes[1]!.payload_hash);
+    database.query("UPDATE operation_jobs SET payload_json=? WHERE scope_id=? AND job_id=?").run('{"__proto__":"tampered","constructor":"two","prototype":"three"}', scopeA, first.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: first.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects fractional and negative decoded attempt counts", () => {
+    const target = store(); const fractional = enqueue(target, { idempotency_key: "key:fractional" }); const negative = enqueue(target, { idempotency_key: "key:negative" });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET attempt_count=0.5 WHERE scope_id=? AND job_id=?").run(scopeA, fractional.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: fractional.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.exec("PRAGMA ignore_check_constraints=ON");
+    database.query("UPDATE operation_jobs SET attempt_count=-1 WHERE scope_id=? AND job_id=?").run(scopeA, negative.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: negative.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects PENDING decoded jobs that retain lease fields", () => {
+    const target = store(); const job = enqueue(target); const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET lease_owner='worker:a', lease_expires_at='2026-07-24T12:00:01.000Z', lease_acquired_at=? WHERE scope_id=? AND job_id=?").run(t0, scopeA, job.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects RUNNING decoded jobs without complete lease ownership and timing", () => {
+    const target = store(); const job = enqueue(target); const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET state='RUNNING', lease_owner=NULL, lease_expires_at=NULL, lease_acquired_at=NULL, run_started_at=NULL WHERE scope_id=? AND job_id=?").run(scopeA, job.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects terminal decoded jobs that retain lease fields", () => {
+    const target = store(); const job = enqueue(target); const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET state='CANCELLED', lease_owner='worker:a', lease_expires_at='2026-07-24T12:00:01.000Z', lease_acquired_at=?, run_started_at=? WHERE scope_id=? AND job_id=?").run(t0, t0, scopeA, job.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects extra keys in a decoded job row", () => {
+    const target = store(); const job = enqueue(target); const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.exec("ALTER TABLE operation_jobs ADD COLUMN injected_job_key TEXT");
+    database.query("UPDATE operation_jobs SET injected_job_key='unexpected' WHERE scope_id=? AND job_id=?").run(scopeA, job.job_id);
+    database.close(); target.close();
+    const reopened = new SqliteOperationsStore({ databasePath: join(roots[0]!, "operations.sqlite") });
+    expect(() => reopened.get({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    reopened.close();
+  });
+
+  test("rejects extra keys in a decoded attempt snapshot", () => {
+    const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id); target.fail({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "Request timed out", artifact_ref: null }, now: t0 });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    const row = database.query("SELECT payload_json FROM operation_attempts WHERE scope_id=? AND job_id=?").get(scopeA, job.job_id) as { payload_json: string };
+    const tampered = JSON.parse(row.payload_json) as Record<string, unknown>; tampered.injected_attempt_key = "unexpected";
+    database.query("UPDATE operation_attempts SET payload_json=? WHERE scope_id=? AND job_id=?").run(JSON.stringify(tampered), scopeA, job.job_id);
+    expect(() => target.attempts({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects extra keys in a decoded receipt snapshot", () => {
+    const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id); target.succeed({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", effect: { output: "ok" }, now: t0 });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    const row = database.query("SELECT payload_json FROM operation_effect_receipts WHERE scope_id=? AND job_id=?").get(scopeA, job.job_id) as { payload_json: string };
+    const tampered = JSON.parse(row.payload_json) as Record<string, unknown>; tampered.injected_receipt_key = "unexpected";
+    database.query("UPDATE operation_effect_receipts SET payload_json=? WHERE scope_id=? AND job_id=?").run(JSON.stringify(tampered), scopeA, job.job_id);
+    expect(() => target.effectReceipt({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects decoded attempt outcome and failure combinations that are impossible", () => {
+    const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id); target.fail({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "Request timed out", artifact_ref: null }, now: t0 });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    const row = database.query("SELECT payload_json FROM operation_attempts WHERE scope_id=? AND job_id=?").get(scopeA, job.job_id) as { payload_json: string };
+    const tampered = JSON.parse(row.payload_json) as Record<string, unknown>; tampered.failure = null;
+    database.query("UPDATE operation_attempts SET failure_json=NULL, payload_json=? WHERE scope_id=? AND job_id=?").run(JSON.stringify(tampered), scopeA, job.job_id);
+    expect(() => target.attempts({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects read-side attempt artifacts from another scope after consistent JSON tampering", () => {
+    const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id); target.fail({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "Request timed out", artifact_ref: "artifact:scope:alpha:log-1" }, now: t0 });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    const row = database.query("SELECT payload_json FROM operation_attempts WHERE scope_id=? AND job_id=?").get(scopeA, job.job_id) as { payload_json: string };
+    const tampered = JSON.parse(row.payload_json) as { failure: { artifact_ref: string } }; tampered.failure.artifact_ref = "artifact:scope:beta:log-1";
+    const failure = { code: "NETWORK", summary: "Request timed out", artifact_ref: "artifact:scope:beta:log-1" };
+    database.query("UPDATE operation_attempts SET failure_json=?, payload_json=? WHERE scope_id=? AND job_id=?").run(JSON.stringify(failure), JSON.stringify(tampered), scopeA, job.job_id);
+    expect(() => target.attempts({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects causal time regression for pending and retry-pending cancellation and persists the verified actor", () => {
+    const verifier: CancellationCapabilityVerifier = { verify: () => ({ actor: "human:owner", expires_at: "2026-07-24T12:05:00.000Z" }) };
+    const target = store(verifier); const pending = enqueue(target, { idempotency_key: "key:pending-cancel" });
+    expect(() => target.cancel({ scope_id: scopeA, job_id: pending.job_id, capability: "verified", actor: "human:owner", now: "2026-07-24T11:59:59.999Z" })).toThrow("OPERATION_TIME_CAUSALITY_INVALID");
+    target.cancel({ scope_id: scopeA, job_id: pending.job_id, capability: "verified", actor: "human:owner", now: t0 });
+    expect(target.attempts({ scope_id: scopeA, job_id: pending.job_id })[0]?.actor).toBe("human:owner");
+    const retry = enqueue(target, { idempotency_key: "key:retry-cancel" }); claimAndStart(target, retry.job_id);
+    target.fail({ scope_id: scopeA, job_id: retry.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "Request timed out", artifact_ref: null }, now: "2026-07-24T12:00:00.001Z" });
+    expect(() => target.cancel({ scope_id: scopeA, job_id: retry.job_id, capability: "verified", actor: "human:owner", now: t0 })).toThrow("OPERATION_TIME_CAUSALITY_INVALID");
+    target.cancel({ scope_id: scopeA, job_id: retry.job_id, capability: "verified", actor: "human:owner", now: "2026-07-24T12:00:00.001Z" });
+    expect(target.attempts({ scope_id: scopeA, job_id: retry.job_id })[1]?.actor).toBe("human:owner");
+    target.close();
+  });
 });
