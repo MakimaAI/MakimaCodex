@@ -152,6 +152,12 @@ describe("durable operations", () => {
     expect(parseOperationFailure({ code: "NETWORK", summary: "Request timed out", artifact_ref: "artifact:scope:alpha:log-1" }).artifact_ref).toBe("artifact:scope:alpha:log-1");
   });
 
+  test("rejects failure artifact references outside the job scope", () => {
+    const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id);
+    expect(() => target.fail({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "Request timed out", artifact_ref: "artifact:scope:beta:log-1" }, now: t0 })).toThrow("OPERATION_FAILURE_ARTIFACT_SCOPE_INVALID");
+    target.close();
+  });
+
   test("preserves dangerous-looking JSON keys and hashes distinct descriptors distinctly", () => {
     const first = canonicalEffectDescriptor(JSON.parse('{"__proto__":"one","constructor":"two","prototype":"three"}'));
     const second = canonicalEffectDescriptor(JSON.parse('{"__proto__":"four","constructor":"two","prototype":"three"}'));
