@@ -134,7 +134,7 @@ describe("Phase 7 failure observations and taxonomy", () => {
     expect(corrected.canonical_hash).not.toBe(original.canonical_hash);
     expect(original.failure.summary).toContain("503");
     expect(Object.isFrozen(corrected)).toBe(true);
-    expect(() => correctFailureObservation(corrected, {}, { expected_revision: 1, reason: "stale correction", actor: human, at: "2026-07-24T10:31:00.000Z" })).toThrow("FAILURE_OBSERVATION_REVISION_CONFLICT");
+    expect(() => correctFailureObservation(corrected, {}, { expected_revision: 1, reason: "stale correction", actor: human, at: "2026-07-24T10:31:00.000Z", resolve_predecessor: () => original })).toThrow("FAILURE_OBSERVATION_REVISION_CONFLICT");
     expect(() => correctFailureObservation(original, { scope: { type: "REPOSITORY", id: "repo:foreign" } } as FailureObservationCorrectionPatch, { expected_revision: 1, reason: "scope rewrite", actor: human, at: "2026-07-24T10:31:00.000Z" })).toThrow("FAILURE_OBSERVATION_CORRECTION_FORBIDDEN_FIELD");
     const inheritedCorrection = Object.create({ failure: { ...original.failure, summary: "inherited mutation" } }) as FailureObservationCorrectionPatch;
     expect(() => correctFailureObservation(original, inheritedCorrection, { expected_revision: 1, reason: "prototype rewrite", actor: human, at: "2026-07-24T10:31:00.000Z" })).toThrow("FAILURE_OBSERVATION_CORRECTION_FORBIDDEN_FIELD");
@@ -146,9 +146,18 @@ describe("Phase 7 failure observations and taxonomy", () => {
     const corrected = correctFailureObservation(original, {}, { expected_revision: 1, reason: "metadata correction", actor: human, at: "2026-07-24T10:30:00.000Z" });
     const { canonical_hash: _hash, ...payload } = corrected;
     const missingPrevious = { ...payload, previous_revision_id: null };
-    expect(() => parseFailureObservation({ ...missingPrevious, canonical_hash: canonicalSha256(missingPrevious) })).toThrow("Observation correction lineage is invalid");
+    expect(() => parseFailureObservation({ ...missingPrevious, canonical_hash: canonicalSha256(missingPrevious) }, () => original)).toThrow("Observation correction lineage is invalid");
     const wrongPrevious = { ...payload, previous_revision_id: "observation-revision:wrong" };
-    expect(() => parseFailureObservation({ ...wrongPrevious, canonical_hash: canonicalSha256(wrongPrevious) })).toThrow("Observation correction lineage is invalid");
+    expect(() => parseFailureObservation({ ...wrongPrevious, canonical_hash: canonicalSha256(wrongPrevious) }, () => original)).toThrow("Observation correction lineage is invalid");
+  });
+
+  test("requires and authenticates the actual predecessor for revised observation parsing", () => {
+    const original = createFailureObservation(observationInput());
+    const corrected = correctFailureObservation(original, { failure: { ...original.failure, summary: "Corrected HTTP 502" } }, { expected_revision: 1, reason: "corrected status", actor: human, at: "2026-07-24T10:30:00.000Z" });
+    expect(() => parseFailureObservation(corrected)).toThrow("FAILURE_OBSERVATION_PREDECESSOR_REQUIRED");
+    const forgedPredecessor = createFailureObservation(observationInput({ failure: { ...observationInput().failure, summary: "Forged predecessor" } }));
+    expect(() => parseFailureObservation(corrected, () => forgedPredecessor)).toThrow("FAILURE_OBSERVATION_PREDECESSOR_MISMATCH");
+    expect(parseFailureObservation(corrected, revisionId => revisionId === original.revision_id ? original : undefined)).toEqual(corrected);
   });
 });
 
@@ -250,7 +259,7 @@ describe("Phase 7 incident revisions and authority", () => {
     expect(current.hypotheses.filter(item => item.status === "ACTIVE")).toHaveLength(5);
     expect(() => addIncidentHypothesis(current, { hypothesis_id: "hypothesis:6", statement: "Sixth cause", causal_mechanism: "Sixth causal mechanism", falsifiable_prediction: "Sixth prediction", disproof_conditions: ["Sixth disproof"], proposed_by: human }, { expected_revision: current.revision, actor: human, at: "2026-07-24T10:20:00.000Z" })).toThrow("INCIDENT_ACTIVE_HYPOTHESIS_LIMIT");
     expect(() => resolveIncidentHypothesis(current, "hypothesis:1", "SUPPORTED", { expected_revision: current.revision, actor: { type: "agent", id: "agent:1" }, at: "2026-07-24T10:21:00.000Z", evidence_refs: ["artifact:self"] })).toThrow("HYPOTHESIS_SELF_CONFIRMATION_FORBIDDEN");
-    const resolved = resolveIncidentHypothesis(current, "hypothesis:1", "SUPPORTED", { expected_revision: current.revision, actor: verifier, at: "2026-07-24T10:21:00.000Z", evidence_refs: ["artifact:independent"] });
+    const resolved = resolveIncidentHypothesis(current, "hypothesis:1", "SUPPORTED", { expected_revision: current.revision, actor: verifier, at: "2026-07-24T10:21:00.000Z", evidence_refs: ["artifact:repo:makima:independent"] });
     expect(resolved.hypotheses.find(item => item.hypothesis_id === "hypothesis:1")?.status).toBe("SUPPORTED");
   });
 
@@ -287,6 +296,13 @@ describe("Phase 7 incident revisions and authority", () => {
     expect(() => confirmIncidentRootCause(rejected, { hypothesis_id: "hypothesis:rejected", statement: "Rejected cause", mechanism: "Rejected mechanism changes startup", conditions: complete, authority: { kind: "INDEPENDENT_REVIEW", actor: verifier } }, { expected_revision: 3, at: "2026-07-24T10:20:00.000Z" })).toThrow("ROOT_CAUSE_HYPOTHESIS_NOT_SUPPORTED");
   });
 
+  test("requires incident-scoped evidence to support or reject hypotheses", () => {
+    const supportCandidate = addIncidentHypothesis(incident(), { hypothesis_id: "hypothesis:foreign-support", statement: "Foreign support cause", causal_mechanism: "Foreign support changes startup", falsifiable_prediction: "Removing it starts runtime", disproof_conditions: ["Runtime still fails"], proposed_by: { type: "agent", id: "agent:foreign-support" } }, { expected_revision: 1, actor: human, at: "2026-07-24T10:10:00.000Z" });
+    expect(() => resolveIncidentHypothesis(supportCandidate, "hypothesis:foreign-support", "SUPPORTED", { expected_revision: 2, actor: verifier, at: "2026-07-24T10:11:00.000Z", evidence_refs: ["artifact:repo:foreign:support"] })).toThrow("HYPOTHESIS_EVIDENCE_SCOPE_MISMATCH");
+    const rejectCandidate = addIncidentHypothesis(incident(), { hypothesis_id: "hypothesis:unscoped-reject", statement: "Unscoped reject cause", causal_mechanism: "Unscoped reject changes startup", falsifiable_prediction: "Removing it starts runtime", disproof_conditions: ["Runtime still fails"], proposed_by: { type: "agent", id: "agent:unscoped-reject" } }, { expected_revision: 1, actor: human, at: "2026-07-24T10:10:00.000Z" });
+    expect(() => resolveIncidentHypothesis(rejectCandidate, "hypothesis:unscoped-reject", "REJECTED", { expected_revision: 2, actor: verifier, at: "2026-07-24T10:11:00.000Z", evidence_refs: ["artifact:unscoped"] })).toThrow("HYPOTHESIS_EVIDENCE_SCOPE_MISMATCH");
+  });
+
   test("rejects unresolved contradictory evidence before confirmation", () => {
     const active = addIncidentHypothesis(incident(), { hypothesis_id: "hypothesis:contradicted", statement: "Runtime protocol mismatch", causal_mechanism: "The runtime rejects an unsupported protocol version", falsifiable_prediction: "A compatible protocol starts", disproof_conditions: ["The same mismatch succeeds"], proposed_by: { type: "agent", id: "agent:contradicted" } }, { expected_revision: 1, actor: human, at: "2026-07-24T10:10:00.000Z" });
     const supported = resolveIncidentHypothesis(active, "hypothesis:contradicted", "SUPPORTED", { expected_revision: 2, actor: verifier, at: "2026-07-24T10:11:00.000Z", evidence_refs: ["artifact:repo:makima:support"] });
@@ -296,6 +312,13 @@ describe("Phase 7 incident revisions and authority", () => {
     expect(() => confirmIncidentRootCause(contradicted, claim, { expected_revision: 4, at: "2026-07-24T10:20:00.000Z" })).toThrow("ROOT_CAUSE_UNRESOLVED_CONTRADICTION");
     const resolved = resolveIncidentHypothesisContradiction(contradicted, "hypothesis:contradicted", "contradiction:one", { expected_revision: 4, actor: verifier, at: "2026-07-24T10:13:00.000Z", rationale: "The successful run used a different protocol", evidence_refs: ["artifact:repo:makima:resolution"] });
     expect(confirmIncidentRootCause(resolved, claim, { expected_revision: 5, at: "2026-07-24T10:20:00.000Z" }).root_cause.state).toBe("CONFIRMED");
+  });
+
+  test("requires scoped evidence to resolve a contradiction", () => {
+    const active = addIncidentHypothesis(incident(), { hypothesis_id: "hypothesis:resolution-evidence", statement: "Evidence cause", causal_mechanism: "Evidence mechanism changes startup", falsifiable_prediction: "Removing it starts runtime", disproof_conditions: ["Runtime still fails"], proposed_by: { type: "agent", id: "agent:resolution-evidence" } }, { expected_revision: 1, actor: human, at: "2026-07-24T10:10:00.000Z" });
+    const supported = resolveIncidentHypothesis(active, "hypothesis:resolution-evidence", "SUPPORTED", { expected_revision: 2, actor: verifier, at: "2026-07-24T10:11:00.000Z", evidence_refs: ["artifact:repo:makima:support"] });
+    const contradicted = recordIncidentHypothesisContradiction(supported, "hypothesis:resolution-evidence", { contradiction_id: "contradiction:resolution-evidence", statement: "Counterexample exists", evidence_refs: ["artifact:repo:makima:against"] }, { expected_revision: 3, actor: human, at: "2026-07-24T10:12:00.000Z" });
+    expect(() => resolveIncidentHypothesisContradiction(contradicted, "hypothesis:resolution-evidence", "contradiction:resolution-evidence", { expected_revision: 4, actor: verifier, at: "2026-07-24T10:13:00.000Z", rationale: "Claimed resolution", evidence_refs: [] })).toThrow("HYPOTHESIS_CONTRADICTION_RESOLUTION_EVIDENCE_REQUIRED");
   });
 
   test("supersedes an accepted root cause only through a fresh gated adjudication", () => {
@@ -312,6 +335,19 @@ describe("Phase 7 incident revisions and authority", () => {
     expect(confirmed.root_cause.statement).toBe("First cause");
   });
 
+  test("new contradictory evidence disputes and reopens the latest confirmed incident revision", () => {
+    const active = addIncidentHypothesis(incident(), { hypothesis_id: "hypothesis:post-confirmation", statement: "Confirmed cause", causal_mechanism: "Confirmed mechanism changes startup", falsifiable_prediction: "Removing it starts runtime", disproof_conditions: ["Runtime still fails"], proposed_by: { type: "agent", id: "agent:post-confirmation" } }, { expected_revision: 1, actor: human, at: "2026-07-24T10:10:00.000Z" });
+    const supported = resolveIncidentHypothesis(active, "hypothesis:post-confirmation", "SUPPORTED", { expected_revision: 2, actor: verifier, at: "2026-07-24T10:11:00.000Z", evidence_refs: ["artifact:repo:makima:support"] });
+    const complete = ROOT_CAUSE_CONFIRMATION_CONDITIONS.map(condition => ({ condition, evidence_refs: [`artifact:repo:makima:${condition}`] }));
+    const confirmed = confirmIncidentRootCause(supported, { hypothesis_id: "hypothesis:post-confirmation", statement: "Confirmed cause", mechanism: "Confirmed mechanism changes startup", conditions: complete, authority: { kind: "INDEPENDENT_REVIEW", actor: verifier } }, { expected_revision: 3, at: "2026-07-24T10:20:00.000Z" });
+    const closed = appendIncidentRevision(confirmed, { status: "CLOSED", stage: "RESOLVED" }, { expected_revision: 4, reason: "accepted cause remediated", actor: human, at: "2026-07-24T10:21:00.000Z" });
+    const disputed = recordIncidentHypothesisContradiction(closed, "hypothesis:post-confirmation", { contradiction_id: "contradiction:post-confirmation", statement: "The failure persisted after removing the cause", evidence_refs: ["artifact:repo:makima:post-confirmation"] }, { expected_revision: 5, actor: human, at: "2026-07-24T10:22:00.000Z" });
+    expect(disputed).toMatchObject({ revision: 6, status: "OPEN", stage: "INVESTIGATING", root_cause: { state: "DISPUTED", adjudication_id: confirmed.root_cause.adjudication_id } });
+    expect(disputed.root_cause.disputed_by_contradiction_ids).toContain("contradiction:post-confirmation");
+    expect(disputed.previous_revision_hash).toBe(closed.revision_hash);
+    expect(closed).toMatchObject({ status: "CLOSED", root_cause: { state: "CONFIRMED" } });
+  });
+
   test("generic incident patches cannot replace adjudicated collections", () => {
     const current = incident();
     const options = { expected_revision: 1, reason: "bypass", actor: human, at: "2026-07-24T10:10:00.000Z" };
@@ -321,6 +357,9 @@ describe("Phase 7 incident revisions and authority", () => {
     const withHypothesis = addIncidentHypothesis(current, { hypothesis_id: "hypothesis:prototype", statement: "Prototype cause", causal_mechanism: "Prototype mechanism changes startup", falsifiable_prediction: "Removing prototype cause starts runtime", disproof_conditions: ["Runtime still fails"], proposed_by: { type: "agent", id: "agent:prototype" } }, { expected_revision: 1, actor: human, at: "2026-07-24T10:09:00.000Z" });
     const inheritedPatch = Object.create({ hypotheses: [] }) as IncidentRevisionPatch;
     expect(() => appendIncidentRevision(withHypothesis, inheritedPatch, { ...options, expected_revision: 2 })).toThrow("INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD");
+    const hiddenPatch: IncidentRevisionPatch = {};
+    Object.defineProperty(hiddenPatch, "root_cause", { value: current.root_cause, enumerable: false });
+    expect(() => appendIncidentRevision(current, hiddenPatch, options)).toThrow("INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD");
   });
 
   test("allows explicitly accepted probable external causes without claiming confirmation", () => {

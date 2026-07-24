@@ -2,7 +2,7 @@ import { z } from "zod";
 import { canonicalSha256 } from "../../phase1/core/contract/task-contract";
 import { actorSchema, type Actor } from "../../phase1/core/shared/actor";
 import { assertNoPhase1Secret, assertNoStructuredPhase1Secret } from "../../phase1/core/security/secrets";
-import { parseFailureObservation, type FailureObservation } from "./failure-observation";
+import { parseFailureObservation, type FailureObservation, type FailureObservationPredecessorResolver } from "./failure-observation";
 import {
   deepFreezePhase7,
   phase7HashSchema,
@@ -15,7 +15,7 @@ import {
 export const INCIDENT_STATUSES = ["OPEN", "MONITORING", "CLOSED"] as const;
 export const INCIDENT_STAGES = ["TRIAGE", "INVESTIGATING", "MITIGATING", "RESOLVED"] as const;
 export const INCIDENT_REPRODUCTION_STATES = ["NOT_ATTEMPTED", "REPRODUCIBLE", "INTERMITTENT", "NON_REPRODUCIBLE"] as const;
-export const INCIDENT_ROOT_CAUSE_STATES = ["UNCONFIRMED", "PROBABLE", "CONFIRMED"] as const;
+export const INCIDENT_ROOT_CAUSE_STATES = ["UNCONFIRMED", "PROBABLE", "CONFIRMED", "DISPUTED"] as const;
 export const INCIDENT_CONTAINMENT_STATES = ["NOT_STARTED", "IN_PROGRESS", "CONTAINED", "RELEASED"] as const;
 export const INCIDENT_SEVERITIES = ["SEV0", "SEV1", "SEV2", "SEV3", "SEV4"] as const;
 export const INCIDENT_PRIORITIES = ["URGENT", "HIGH", "NORMAL", "LOW"] as const;
@@ -48,6 +48,8 @@ const rootCauseSchema = z.object({
   confirmation_conditions: z.array(z.enum(ROOT_CAUSE_CONFIRMATION_CONDITIONS)).optional(),
   adjudication_id: phase7IdentifierSchema.nullable(),
   supersedes_adjudication_id: phase7IdentifierSchema.nullable(),
+  disputed_by_contradiction_ids: z.array(phase7IdentifierSchema).min(1).max(64)
+    .refine(values => new Set(values).size === values.length, "Disputing contradiction IDs cannot contain duplicates").optional(),
 }).strict().superRefine((value, context) => {
   if (value.state === "UNCONFIRMED" && (value.statement !== null || value.mechanism !== null || value.evidence_refs.length > 0 || value.hypothesis_id !== null || value.acceptance !== null || value.confirmation_conditions !== undefined || value.adjudication_id !== null || value.supersedes_adjudication_id !== null)) {
     context.addIssue({ code: "custom", message: "Unconfirmed root cause cannot carry an accepted conclusion" });
@@ -63,6 +65,9 @@ const rootCauseSchema = z.object({
   }
   if (value.adjudication_id !== null && value.adjudication_id === value.supersedes_adjudication_id) {
     context.addIssue({ code: "custom", path: ["supersedes_adjudication_id"], message: "Root cause cannot supersede itself" });
+  }
+  if ((value.state === "DISPUTED") !== (value.disputed_by_contradiction_ids !== undefined)) {
+    context.addIssue({ code: "custom", path: ["disputed_by_contradiction_ids"], message: "Disputed root cause requires contradiction lineage" });
   }
 });
 
@@ -158,10 +163,10 @@ export interface AppendIncidentRevisionOptions {
   at: string;
 }
 
-export function createIncident(input: IncidentInput, observationInputs: readonly FailureObservation[]): Incident {
+export function createIncident(input: IncidentInput, observationInputs: readonly FailureObservation[], resolveObservationPredecessor?: FailureObservationPredecessorResolver): Incident {
   if (input.root_cause.state !== "UNCONFIRMED") throw new Error("ROOT_CAUSE_INITIAL_STATE_FORBIDDEN");
   if (observationInputs.length === 0) throw new Error("INCIDENT_OBSERVATION_REQUIRED");
-  const observations = observationInputs.map(parseFailureObservation);
+  const observations = observationInputs.map(observation => parseFailureObservation(observation, resolveObservationPredecessor));
   if (observations.some(observation => !samePhase7Scope(input.scope, observation.scope))) throw new Error("INCIDENT_SCOPE_MISMATCH");
   const payload = incidentRevisionPayloadSchema.parse({
     schema_version: 1,
@@ -186,7 +191,7 @@ export function parseIncident(input: unknown): Incident {
 export function appendIncidentRevision(currentInput: Incident, patch: IncidentRevisionPatch, options: AppendIncidentRevisionOptions): Incident {
   assertPlainPatch(patch, "INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD");
   const allowed = new Set(["title", "status", "stage", "reproduction", "containment", "severity", "priority", "confidence", "owner"]);
-  if (Object.keys(patch).some(key => !allowed.has(key))) throw new Error("INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD");
+  if (Reflect.ownKeys(patch).some(key => typeof key !== "string" || !allowed.has(key))) throw new Error("INCIDENT_REVISION_PATCH_FORBIDDEN_FIELD");
   return appendIncidentRevisionInternal(currentInput, patch, options, false);
 }
 
@@ -222,15 +227,19 @@ function appendIncidentRevisionInternal(currentInput: Incident, patch: InternalI
   return immutableIncident({ ...payload, revision_hash: canonicalSha256(payload) });
 }
 
-export function attachFailureObservation(current: Incident, observationInput: FailureObservation, options: Omit<AppendIncidentRevisionOptions, "reason">): Incident {
-  const observation = parseFailureObservation(observationInput);
+export interface AttachFailureObservationOptions extends Omit<AppendIncidentRevisionOptions, "reason"> {
+  resolve_predecessor?: FailureObservationPredecessorResolver;
+}
+
+export function attachFailureObservation(current: Incident, observationInput: FailureObservation, options: AttachFailureObservationOptions): Incident {
+  const observation = parseFailureObservation(observationInput, options.resolve_predecessor);
   const parsedCurrent = parseIncident(current);
   if (!samePhase7Scope(parsedCurrent.scope, observation.scope)) throw new Error("INCIDENT_SCOPE_MISMATCH");
   if (parsedCurrent.observation_ids.includes(observation.revision_id)) throw new Error("INCIDENT_OBSERVATION_ALREADY_ATTACHED");
   return appendIncidentRevisionInternal(parsedCurrent, {
     observation_ids: [...parsedCurrent.observation_ids, observation.revision_id],
     ...(parsedCurrent.status === "CLOSED" ? { status: "OPEN" as const, stage: "INVESTIGATING" as const } : {}),
-  }, { ...options, reason: parsedCurrent.status === "CLOSED" ? "new observation reopened incident" : "attached failure observation" }, false);
+  }, { expected_revision: options.expected_revision, actor: options.actor, at: options.at, reason: parsedCurrent.status === "CLOSED" ? "new observation reopened incident" : "attached failure observation" }, false);
 }
 
 export interface IncidentHypothesisInput {
@@ -263,6 +272,7 @@ export function resolveIncidentHypothesis(
     throw new Error("HYPOTHESIS_SELF_CONFIRMATION_FORBIDDEN");
   }
   if (options.evidence_refs.length === 0) throw new Error("HYPOTHESIS_RESOLUTION_EVIDENCE_REQUIRED");
+  assertScopedEvidence(current, options.evidence_refs, "HYPOTHESIS_EVIDENCE_SCOPE_MISMATCH");
   const hypotheses = current.hypotheses.map(item => item.hypothesis_id === hypothesisId ? incidentHypothesisSchema.parse({
     ...item,
     status: resolution,
@@ -297,7 +307,17 @@ export function recordIncidentHypothesisContradiction(
     evidence_against: [...new Set([...item.evidence_against, ...input.evidence_refs])],
     contradictions: [...item.contradictions, contradiction],
   }) : item);
-  return appendIncidentRevisionInternal(current, { hypotheses }, { ...options, reason: "recorded hypothesis contradiction" }, false);
+  const disputesAcceptedCause = (current.root_cause.state === "CONFIRMED" || current.root_cause.state === "DISPUTED")
+    && current.root_cause.hypothesis_id === hypothesisId;
+  const rootCause = disputesAcceptedCause ? rootCauseSchema.parse({
+    ...current.root_cause,
+    state: "DISPUTED",
+    disputed_by_contradiction_ids: [...new Set([...(current.root_cause.disputed_by_contradiction_ids ?? []), input.contradiction_id])],
+  }) : current.root_cause;
+  return appendIncidentRevisionInternal(current, {
+    hypotheses,
+    ...(disputesAcceptedCause ? { root_cause: rootCause, status: "OPEN" as const, stage: "INVESTIGATING" as const } : {}),
+  }, { ...options, reason: disputesAcceptedCause ? "contradictory evidence disputed accepted root cause" : "recorded hypothesis contradiction" }, false);
 }
 
 export function resolveIncidentHypothesisContradiction(
@@ -310,6 +330,7 @@ export function resolveIncidentHypothesisContradiction(
   const hypothesis = current.hypotheses.find(item => item.hypothesis_id === hypothesisId);
   const contradiction = hypothesis?.contradictions.find(item => item.contradiction_id === contradictionId);
   if (!hypothesis || !contradiction || contradiction.status !== "UNRESOLVED") throw new Error("INCIDENT_CONTRADICTION_NOT_UNRESOLVED");
+  if (options.evidence_refs.length === 0) throw new Error("HYPOTHESIS_CONTRADICTION_RESOLUTION_EVIDENCE_REQUIRED");
   assertScopedEvidence(current, options.evidence_refs, "HYPOTHESIS_EVIDENCE_SCOPE_MISMATCH");
   const hypotheses = current.hypotheses.map(item => item.hypothesis_id === hypothesisId ? incidentHypothesisSchema.parse({
     ...item,
@@ -425,6 +446,9 @@ function assertIncidentSecretSafe(value: unknown): void {
 }
 
 function assertPlainPatch(value: unknown, code: string): asserts value is Record<string, unknown> {
-  if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype || Object.getOwnPropertySymbols(value).length > 0) throw new Error(code);
-  if (Object.keys(value).some(key => !Object.getOwnPropertyDescriptor(value, key) || !("value" in Object.getOwnPropertyDescriptor(value, key)!))) throw new Error(code);
+  if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) throw new Error(code);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== "string" || !descriptor?.enumerable || !("value" in descriptor)) throw new Error(code);
+  }
 }

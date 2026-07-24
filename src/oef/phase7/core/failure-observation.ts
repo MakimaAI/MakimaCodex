@@ -9,6 +9,7 @@ import {
   phase7ScopeSchema,
   phase7SemverSchema,
   phase7TimestampSchema,
+  samePhase7Scope,
 } from "./shared";
 import { isValidFailureType } from "./taxonomy";
 
@@ -74,12 +75,14 @@ export type FailureObservationInput = Omit<z.input<typeof failureObservationPayl
 export type FailureObservationCorrectionPatch = Partial<Pick<FailureObservation,
   "provenance_ids" | "artifact_refs" | "failure" | "environment" | "sensitivity" | "redaction" | "observed_at"
 >>;
+export type FailureObservationPredecessorResolver = (revisionId: string) => unknown;
 
 export interface CorrectFailureObservationOptions {
   expected_revision: number;
   reason: string;
   actor: Actor;
   at: string;
+  resolve_predecessor?: FailureObservationPredecessorResolver;
 }
 
 export function createFailureObservation(input: FailureObservationInput): FailureObservation {
@@ -102,7 +105,7 @@ export function correctFailureObservation(
   patch: FailureObservationCorrectionPatch,
   options: CorrectFailureObservationOptions,
 ): FailureObservation {
-  const current = parseFailureObservation(currentInput);
+  const current = parseFailureObservation(currentInput, options.resolve_predecessor);
   if (current.revision !== options.expected_revision) throw new Error("FAILURE_OBSERVATION_REVISION_CONFLICT");
   assertPlainPatch(patch, "FAILURE_OBSERVATION_CORRECTION_FORBIDDEN_FIELD");
   const allowed = new Set(["provenance_ids", "artifact_refs", "failure", "environment", "sensitivity", "redaction", "observed_at"]);
@@ -139,12 +142,37 @@ export function correctFailureObservation(
   return deepFreezePhase7(failureObservationSchema.parse({ ...payload, canonical_hash: canonicalSha256(payload) }));
 }
 
-export function parseFailureObservation(input: unknown): FailureObservation {
+export function parseFailureObservation(input: unknown, resolvePredecessor?: FailureObservationPredecessorResolver): FailureObservation {
+  return parseFailureObservationInternal(input, resolvePredecessor, new Set());
+}
+
+function parseFailureObservationInternal(input: unknown, resolvePredecessor: FailureObservationPredecessorResolver | undefined, visiting: Set<string>): FailureObservation {
   const value = failureObservationSchema.parse(input);
   assertArtifactScope(value);
   assertObservationSecretSafe(value);
   const { canonical_hash, ...payload } = value;
   if (canonicalSha256(payload) !== canonical_hash) throw new Error("FAILURE_OBSERVATION_HASH_MISMATCH");
+  if (value.revision > 1) {
+    if (!resolvePredecessor) throw new Error("FAILURE_OBSERVATION_PREDECESSOR_REQUIRED");
+    if (visiting.has(value.revision_id)) throw new Error("FAILURE_OBSERVATION_PREDECESSOR_MISMATCH");
+    visiting.add(value.revision_id);
+    const predecessorInput = resolvePredecessor(value.previous_revision_id!);
+    if (predecessorInput === undefined || predecessorInput === null) throw new Error("FAILURE_OBSERVATION_PREDECESSOR_NOT_FOUND");
+    const predecessor = parseFailureObservationInternal(predecessorInput, resolvePredecessor, visiting);
+    visiting.delete(value.revision_id);
+    const sameSourceIdentity = predecessor.observation_id === value.observation_id
+      && predecessor.source_phase === value.source_phase
+      && predecessor.task_id === value.task_id
+      && predecessor.execution_id === value.execution_id
+      && predecessor.attempt_id === value.attempt_id
+      && samePhase7Scope(predecessor.scope, value.scope);
+    if (!sameSourceIdentity
+      || predecessor.revision + 1 !== value.revision
+      || predecessor.revision_id !== value.previous_revision_id
+      || predecessor.canonical_hash !== value.previous_observation_hash) {
+      throw new Error("FAILURE_OBSERVATION_PREDECESSOR_MISMATCH");
+    }
+  }
   return deepFreezePhase7(value);
 }
 
