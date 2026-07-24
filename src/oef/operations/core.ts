@@ -62,7 +62,7 @@ export function canonicalEffectDescriptor(value: unknown): { effect: Record<stri
   if (Object.keys(snapshot.value).length === 0) throw new Error("OPERATION_EFFECT_DESCRIPTOR_INVALID");
   return { effect: snapshot.value, effect_json: snapshot.json, effect_hash: canonicalSha256(canonicalJson(snapshot.value)) };
 }
-function canonicalJson(value: JsonValue): string {
+export function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`).join(",")}}`;

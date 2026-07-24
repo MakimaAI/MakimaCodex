@@ -56,7 +56,7 @@ describe("durable operations", () => {
     expect(alpha.job_id).not.toBe(beta.job_id);
     expect(target.get({ scope_id: scopeB, job_id: alpha.job_id })).toBeNull();
     expect(target.claim({ scope_id: scopeB, owner: "worker:b", now: t0, lease_ms: 1_000 })?.job_id).toBe(beta.job_id);
-    expect(() => target.cancel({ scope_id: scopeB, job_id: alpha.job_id, now: t0, cancellation_authority: { scope_id: scopeB, authority_id: "admin:b" } })).toThrow("OPERATION_NOT_FOUND");
+    expect(() => target.cancel({ scope_id: scopeB, job_id: alpha.job_id, now: t0, owner: "worker:b" })).toThrow("OPERATION_NOT_FOUND");
     target.close();
   });
 
