@@ -294,6 +294,11 @@ function harness(options: {
         identity_source: "runner-authenticated-launch-binding" as const,
         container_image_digest: HASH("3"),
         command_hash: canonicalSha256({ unit: input.unit.review_unit_id, context: input.context }),
+        portable_command_hash: canonicalSha256({
+          unit: input.unit.review_unit_id,
+          context: input.context,
+          portability_profile: "review-command-v1",
+        }),
         isolation_hash: canonicalSha256(isolation),
         launch_policy_id: input.binding.runtime_ref.id,
         output_hash: canonicalSha256(raw_output),

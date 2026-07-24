@@ -64,6 +64,7 @@ describe("Phase 6 security and forgetting", () => {
         trust: { minimum: "LOW" },
         temporal: { at: now },
         budget: { max_tokens: 800, max_records: 4 },
+        usage_mode: "CLI_RESEARCH",
       });
       expect(store.explainQuery(queryId)).not.toBeNull();
       store.forget(record.memory_id, { mode: "HARD_DELETE", reason: "owner-requested hard delete", at: now });
@@ -80,6 +81,8 @@ describe("Phase 6 security and forgetting", () => {
         minimum_trust: "LOW",
         at: now,
         limit: 10,
+        allowed_statuses: ["CANDIDATE", "OBSERVED", "CORROBORATED", "REPRODUCED", "VERIFIED", "PROMOTED"],
+        usage_mode: "CLI_RESEARCH",
       })).toHaveLength(0);
       expect(() => store.create(record)).toThrow("MEMORY_ID_TOMBSTONED");
     } finally {

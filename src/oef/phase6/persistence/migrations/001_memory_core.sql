@@ -76,6 +76,24 @@ CREATE TABLE IF NOT EXISTS memory_injection_ledger (
   PRIMARY KEY(execution_id, session_id, memory_revision_id)
 );
 
+CREATE TABLE IF NOT EXISTS memory_injection_deliveries (
+  delivery_id TEXT PRIMARY KEY,
+  execution_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  pack_id TEXT NOT NULL,
+  pack_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('PREPARED', 'DELIVERED')),
+  prepared_at TEXT NOT NULL,
+  delivered_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memory_injection_delivery_items (
+  delivery_id TEXT NOT NULL,
+  memory_revision_id TEXT NOT NULL,
+  PRIMARY KEY(delivery_id, memory_revision_id),
+  FOREIGN KEY(delivery_id) REFERENCES memory_injection_deliveries(delivery_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS memory_query_logs (
   query_id TEXT PRIMARY KEY,
   executed_at TEXT NOT NULL,

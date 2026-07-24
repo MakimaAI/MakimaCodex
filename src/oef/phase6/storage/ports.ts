@@ -5,7 +5,9 @@ import type {
   MemoryRelation,
   MemoryScope,
   MemorySensitivity,
+  MemoryStatus,
   MemoryTrustLevel,
+  MemoryUsageMode,
 } from "../core/domain";
 
 export interface MemoryMetadataQuery {
@@ -17,6 +19,8 @@ export interface MemoryMetadataQuery {
   minimum_trust: MemoryTrustLevel;
   at: string;
   limit: number;
+  allowed_statuses: MemoryStatus[];
+  usage_mode: MemoryUsageMode;
 }
 
 export interface LexicalMemoryQuery extends MemoryMetadataQuery {
@@ -36,6 +40,47 @@ export interface MemoryRecordStore {
   queryMetadata(query: MemoryMetadataQuery): MemoryRecord[];
   link(relation: MemoryRelation): void;
   createConflict(conflict: MemoryConflict): void;
+}
+
+export interface MemoryCanonicalReader {
+  getByRevisionId(revisionId: string): MemoryRecord | null;
+  isRecordVisible(record: MemoryRecord, query: MemoryMetadataQuery): boolean;
+}
+
+export interface MemoryLexicalIndex {
+  lexicalSearch(query: LexicalMemoryQuery): MemorySearchHit[];
+  queryMetadata(query: MemoryMetadataQuery): MemoryRecord[];
+}
+
+export interface MemoryConflictReader {
+  listConflictsFor(memoryIds: string[], visibility?: MemoryMetadataQuery): MemoryConflict[];
+  unresolvedConflictMemoryIds(memoryIds: string[]): string[];
+}
+
+export interface MemoryInjectionLedger {
+  wasInjected(input: { execution_id: string; session_id: string; revision_id: string }): boolean;
+  prepareInjection(input: {
+    delivery_id: string;
+    execution_id: string;
+    session_id: string;
+    revision_ids: string[];
+    pack_id: string;
+    pack_hash: string;
+    prepared_at: string;
+  }): void;
+  acknowledgeInjection(input: { delivery_id: string; pack_hash: string; acknowledged_at: string }): void;
+}
+
+export interface MemoryQueryAuditStore {
+  saveQueryExplanation(queryId: string, payload: unknown, executedAt: string): void;
+  saveContextPack(pack: { pack_id: string; query_id: string; pack_hash: string }, createdAt: string): void;
+}
+
+export interface MemoryRetrievalStore extends MemoryCanonicalReader, MemoryLexicalIndex, MemoryConflictReader, MemoryInjectionLedger, MemoryQueryAuditStore {}
+
+export interface MemoryTokenEstimator {
+  profile: { id: string; version: string; safety_margin: number; exact: boolean };
+  estimate(value: unknown): number;
 }
 
 export interface VectorMemoryIndex {

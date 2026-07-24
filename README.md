@@ -40,13 +40,16 @@
 
 ### Faz 6 — Katmanlı Memory OS
 
-- Yerel öncelikli, kapsam kontrollü, sürümlü ve kaynağı izlenebilir bellek sistemi oluşturuldu.
-- Yazma öncesi gizli bilgi temizleme, güven sınırları, güvenilir geri çağırma ve bağlam bütçeleme eklendi.
-- Çelişki yönetimi, unutma, sert silme, yeniden indeksleme, sağlık kontrolü ve açıklanabilir geri çağırma tamamlandı.
+- Yerel öncelikli, kapsam kontrollü, sürümlü ve kaynağı izlenebilir temel Memory OS dikey dilimi oluşturuldu.
+- Yazma öncesi gizli bilgi temizleme, güven sınırları, açıklanabilir geri çağırma ve yaklaşık bağlam bütçeleme eklendi.
+- Outbox ingestion, gerçek embedding, plugin backend, backup/encryption, legal purge ve tam hygiene incrementleri devam ediyor.
 
 ## Son Yapılan
 
-- Faz 6 Katmanlı Memory OS tamamlandı ve doğrulandı.
-- Proje `MakimaCodex` adıyla `MakimaAI` hesabına taşındı.
-- GitHub deposu herkese açık hale getirildi.
-- README yalnızca faz adımları ve son yapılan işlemler kalacak şekilde sadeleştirildi.
+- Faz 6.0.1 hardening paketi uygulandı.
+- Memory injection, `PREPARED → runtime ACK → DELIVERED` protokolüne geçirildi.
+- Otomatik üretim enjeksiyonu, çalışma zamanı teslim makbuzu sisteme bağlanana kadar kapalı tutuldu.
+- Boş rol ACL deny-all yapıldı; bitemporal validity, retrieval portları ve soft-forget effective state düzeltildi.
+- Güvenilmeyen indeks kayıtları kanonik depodan yeniden doğrulanıyor; gizli çatışmalar kimlik sızdırmadan işaretleniyor.
+- GitHub doğrulamasına zorunlu Docker sandbox kabulü ve iki koşunun birebir çıktı karşılaştırması eklendi.
+- Faz 6 temel dikey dilimi koşullu kabul edildi; tam Faz 6 henüz tamamlanmadı.

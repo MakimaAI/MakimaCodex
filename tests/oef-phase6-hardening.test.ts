@@ -48,6 +48,7 @@ function query(overrides: Record<string, unknown> = {}) {
     trust: { minimum: "LOW" },
     temporal: { at: now },
     budget: { max_tokens: 1_000, max_records: 10 },
+    usage_mode: "CLI_RESEARCH",
     explain: true,
     ...overrides,
   };
@@ -78,6 +79,26 @@ describe("Phase 6 hardening", () => {
       expect(store.getAuthorized(record.memory_id, authority)?.memory_id).toBe(record.memory_id);
       const authorized = await new api.MemoryRetrievalEngine({ store }).recall(query({ requester: authority }));
       expect(authorized.provenance.memory_revisions).toContain(record.revision_id);
+    } finally { store.close(); }
+  });
+
+  test("treats an empty role ACL as deny-all and wildcard as explicit allow", async () => {
+    const root = mkdtempSync(join(tmpdir(), "phase6-role-acl-")); roots.push(root);
+    const store = new api.SqliteMemoryStore({ databasePath: join(root, "memory.sqlite") });
+    try {
+      const denied = api.createMemoryRecord(input({ memory_id: "memory:deny-all", access: { sensitivity: "INTERNAL", read_roles: [] } }));
+      const wildcard = api.createMemoryRecord(input({ memory_id: "memory:wildcard", access: { sensitivity: "INTERNAL", read_roles: ["*"] } }));
+      store.create(denied);
+      store.create(wildcard);
+
+      const pack = await new api.MemoryRetrievalEngine({ store }).recall(query());
+      expect(pack.provenance.memory_revisions).not.toContain(denied.revision_id);
+      expect(pack.provenance.memory_revisions).toContain(wildcard.revision_id);
+      expect(() => store.getAuthorized(denied.memory_id, {
+        role: "backend-implementer",
+        authorized_scopes: [{ type: "REPOSITORY", id: "opencodex" }],
+        max_sensitivity: "INTERNAL",
+      })).toThrow("MEMORY_ROLE_ACCESS_DENIED");
     } finally { store.close(); }
   });
 
@@ -166,6 +187,23 @@ describe("Phase 6 hardening", () => {
     } finally { store.close(); }
   });
 
+  test("exposes soft forget as an explicit effective lifecycle overlay", () => {
+    const root = mkdtempSync(join(tmpdir(), "phase6-soft-forget-")); roots.push(root);
+    const store = new api.SqliteMemoryStore({ databasePath: join(root, "memory.sqlite") });
+    try {
+      const record = api.createMemoryRecord(input({ memory_id: "memory:soft-forget-view" }));
+      store.create(record);
+      store.forget(record.memory_id, { mode: "SOFT_FORGET", reason: "owner requested", at: now });
+
+      expect(store.get(record.memory_id)?.lifecycle.status).toBe("VERIFIED");
+      expect(store.getEffective(record.memory_id)).toMatchObject({
+        record: expect.objectContaining({ memory_id: record.memory_id }),
+        effective_lifecycle_status: "FORGOTTEN",
+        tombstone: { mode: "SOFT_FORGET", content_retained: true },
+      });
+    } finally { store.close(); }
+  });
+
   test("budgets the final serialized pack and admits vector-only candidates", async () => {
     const root = mkdtempSync(join(tmpdir(), "phase6-budget-vector-")); roots.push(root);
     const store = new api.SqliteMemoryStore({ databasePath: join(root, "memory.sqlite") });
@@ -178,10 +216,16 @@ describe("Phase 6 hardening", () => {
       const pack = await new api.MemoryRetrievalEngine({
         store,
         vectorIndex: { search: async () => [{ revision_id: record.revision_id, score: 0.99 }] },
-      }).recall(query({ text: "no lexical overlap zulu", budget: { max_tokens: 700, max_records: 5 } }));
+      }).recall(query({ text: "no lexical overlap zulu", budget: { max_tokens: 1_000, max_records: 5 } }));
       expect(pack.provenance.memory_revisions).toContain(record.revision_id);
-      expect(pack.budget.actual_tokens).toBeLessThanOrEqual(700);
-      expect(Math.ceil(JSON.stringify(pack).length / 4)).toBeLessThanOrEqual(700);
+      expect(pack.budget.actual_tokens).toBeLessThanOrEqual(1_000);
+      expect(Math.ceil(JSON.stringify(pack).length / 4)).toBeLessThanOrEqual(1_000);
+      expect(pack.budget.tokenizer_profile).toEqual({
+        id: "json-char-estimate",
+        version: "1.0.0",
+        safety_margin: 0.25,
+        exact: false,
+      });
     } finally { store.close(); }
   });
 
@@ -205,6 +249,8 @@ describe("Phase 6 hardening", () => {
       const pack = await new api.MemoryRetrievalEngine({ store }).recall(query());
       expect(pack.provenance.memory_revisions).toContain(visible.revision_id);
       expect(pack.sections.open_conflicts).toHaveLength(0);
+      expect(pack.sections.relevant_lessons.find((item: { memory_id: string }) => item.memory_id === visible.memory_id))
+        .toMatchObject({ conflict_status: "UNRESOLVED" });
       expect(JSON.stringify(pack)).not.toContain(hidden.memory_id);
       expect(() => store.createConflict({
         conflict_id: "memory-conflict:secret",

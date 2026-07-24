@@ -81,11 +81,14 @@ export async function runPhase6AcceptanceDemo(options: { root: string }): Promis
       trust: { minimum: "MEDIUM" },
       temporal: { at: "2026-07-24T12:00:00.000Z" },
       budget: { max_tokens: 1_500, max_records: 8 },
+      usage_mode: "AGENT_INJECTION",
       session: { execution_id: "execution:phase6-demo", session_id: "session:phase6-demo", context_reset: true },
       explain: true,
     };
-    const firstPack = await engine.recall(query);
-    const secondPack = await engine.recall({ ...query, query_id: "memory-query:phase6-demo-turn-2", session: { ...query.session!, context_reset: false } });
+    const prepared = await engine.prepareContextPack(query);
+    const firstPack = prepared.pack;
+    await engine.acknowledgeInjection({ delivery_id: prepared.delivery_id, pack_hash: firstPack.pack_hash });
+    const secondPack = (await engine.prepareContextPack({ ...query, query_id: "memory-query:phase6-demo-turn-2", session: { ...query.session!, context_reset: false } })).pack;
     const serializedPack = JSON.stringify(firstPack);
     const report = {
       status: "PASS",

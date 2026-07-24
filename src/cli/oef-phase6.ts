@@ -76,6 +76,7 @@ async function memoryCommand(store: SqliteMemoryStore, parsed: ParsedArgs): Prom
         max_tokens: integerOption(parsed, "max-tokens", 4_000),
         max_records: integerOption(parsed, "max-records", 12),
       },
+      usage_mode: "CLI_RESEARCH",
       explain: true,
     };
     return new MemoryRetrievalEngine({ store }).recall(query);

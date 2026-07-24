@@ -5,6 +5,15 @@ import { join } from "node:path";
 import { runPhase3AcceptanceDemo } from "../src/oef/phase3";
 
 const roots: string[] = [];
+const reviewSandboxImage = "mcr.microsoft.com/playwright@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a";
+const dockerDaemonAvailable = Bun.spawnSync(["docker", "info", "--format", "{{.ServerVersion}}"], {
+  stdout: "ignore",
+  stderr: "ignore",
+}).success;
+const dockerAvailable = dockerDaemonAvailable && Bun.spawnSync(["docker", "image", "inspect", reviewSandboxImage], {
+  stdout: "ignore",
+  stderr: "ignore",
+}).success;
 afterEach(async () => {
   for (const root of roots.splice(0)) {
     for (let attempt = 0; attempt < 40 && existsSync(root); attempt += 1) {
@@ -18,7 +27,7 @@ afterEach(async () => {
 });
 
 describe("Phase 3 end-to-end acceptance demo", () => {
-  test("finds the 403 regression, repairs it through Phase 2, delta-reviews, and issues Phase 1 ACCEPT", async () => {
+  test.skipIf(!dockerAvailable)("finds the 403 regression, repairs it through Phase 2, delta-reviews, and issues Phase 1 ACCEPT", async () => {
     const root = mkdtempSync(join(tmpdir(), "oef-phase3-acceptance-"));
     roots.push(root);
     const result = await runPhase3AcceptanceDemo({ root: join(root, "run") });

@@ -104,4 +104,19 @@ describe("Phase 6 memory domain", () => {
       at: now,
     })).toThrow("MEMORY_REVISION_CONFLICT");
   });
+
+  test("allows facts to become valid before the system observes them", () => {
+    const record = api.createMemoryRecord(lessonInput({
+      memory_id: "memory:backdated-validity",
+      temporal: {
+        observed_at: "2026-07-24T12:00:00.000Z",
+        valid_from: "2026-07-01T00:00:00.000Z",
+        valid_until: null,
+        last_verified_at: "2026-07-24T12:00:00.000Z",
+      },
+    }));
+
+    expect(record.temporal.valid_from).toBe("2026-07-01T00:00:00.000Z");
+    expect(record.temporal.observed_at).toBe("2026-07-24T12:00:00.000Z");
+  });
 });

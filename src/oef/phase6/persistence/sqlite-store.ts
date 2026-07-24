@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  MEMORY_STATUSES,
   assertMemoryPersistenceSafe,
   assertMemoryRecordIntegrity,
   memoryConflictSchema,
@@ -13,14 +12,11 @@ import {
   type MemoryConflict,
   type MemoryRecord,
   type MemoryRelation,
+  type MemoryStatus,
 } from "../core/domain";
-import type { LexicalMemoryQuery, MemoryMetadataQuery, MemoryRecordStore, MemorySearchHit } from "../storage/ports";
+import type { LexicalMemoryQuery, MemoryMetadataQuery, MemoryRecordStore, MemoryRetrievalStore, MemorySearchHit } from "../storage/ports";
 
-const ACTIVE_RECALL_STATUSES = MEMORY_STATUSES.filter(status =>
-  !["REJECTED", "DISPUTED", "SUPERSEDED", "DEPRECATED", "QUARANTINED", "EXPIRED", "FORGOTTEN"].includes(status),
-);
-
-export class SqliteMemoryStore implements MemoryRecordStore {
+export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStore {
   private readonly database: Database;
 
   constructor(options: { databasePath: string }) {
@@ -88,12 +84,26 @@ export class SqliteMemoryStore implements MemoryRecordStore {
   }
 
   getAuthorized(memoryId: string, authorization: MemoryAuthorizationContext, revision?: number): MemoryRecord | null {
-    const tombstone = this.database.query("SELECT memory_id FROM memory_tombstones WHERE memory_id=?").get(memoryId);
-    if (tombstone) throw new Error("MEMORY_FORGOTTEN");
+    const effective = this.getEffective(memoryId, revision);
+    if (!effective) return null;
+    if (effective.effective_lifecycle_status === "FORGOTTEN") throw new Error("MEMORY_FORGOTTEN");
+    this.assertRecordAuthorized(effective.record, authorization);
+    return effective.record;
+  }
+
+  getEffective(memoryId: string, revision?: number): {
+    record: MemoryRecord;
+    effective_lifecycle_status: MemoryStatus;
+    tombstone: { mode: string; content_retained: boolean } | null;
+  } | null {
     const record = this.get(memoryId, revision);
     if (!record) return null;
-    this.assertRecordAuthorized(record, authorization);
-    return record;
+    const row = this.database.query("SELECT mode, content_retained FROM memory_tombstones WHERE memory_id=?").get(memoryId) as { mode: string; content_retained: number } | null;
+    return {
+      record,
+      effective_lifecycle_status: row?.mode === "SOFT_FORGET" ? "FORGOTTEN" : record.lifecycle.status,
+      tombstone: row ? { mode: row.mode, content_retained: row.content_retained === 1 } : null,
+    };
   }
 
   isRecordVisible(record: MemoryRecord, query: MemoryMetadataQuery): boolean {
@@ -103,12 +113,14 @@ export class SqliteMemoryStore implements MemoryRecordStore {
         authorized_scopes: query.authorized_scopes,
         max_sensitivity: query.max_sensitivity,
       });
-      const current = this.get(record.memory_id);
-      return current?.revision_id === record.revision_id
-        && ACTIVE_RECALL_STATUSES.includes(record.lifecycle.status)
+      const current = this.getEffective(record.memory_id);
+      return current?.record.revision_id === record.revision_id
+        && current.effective_lifecycle_status === record.lifecycle.status
+        && query.allowed_statuses.includes(record.lifecycle.status)
+        && (query.usage_mode !== "GOVERNANCE_INSTRUCTION" || (record.layer === "GOVERNANCE" && record.change.actor.type === "human"))
         && trustRank(record.trust.level) >= trustRank(query.minimum_trust)
-        && record.temporal.valid_from <= query.at
-        && (record.temporal.valid_until === null || record.temporal.valid_until > query.at)
+        && Date.parse(record.temporal.valid_from) <= Date.parse(query.at)
+        && (record.temporal.valid_until === null || Date.parse(record.temporal.valid_until) > Date.parse(query.at))
         && (query.layers.length === 0 || query.layers.includes(record.layer))
         && query.scopes.every(scope => record.scopes.some(candidate => candidate.type === scope.type && candidate.id === scope.id));
     } catch {
@@ -154,6 +166,19 @@ export class SqliteMemoryStore implements MemoryRecordStore {
       }));
   }
 
+  unresolvedConflictMemoryIds(memoryIds: string[]): string[] {
+    if (memoryIds.length === 0) return [];
+    const selected = new Set(memoryIds);
+    const conflicted = new Set<string>();
+    const rows = this.database.query("SELECT payload_json FROM memory_conflicts WHERE status='UNRESOLVED'").all() as Array<{ payload_json: string }>;
+    for (const row of rows) {
+      const conflict = memoryConflictSchema.parse(JSON.parse(row.payload_json));
+      if (!conflict.memory_ids.some(memoryId => selected.has(memoryId))) continue;
+      for (const memoryId of conflict.memory_ids) if (selected.has(memoryId)) conflicted.add(memoryId);
+    }
+    return [...conflicted].sort();
+  }
+
   provenance(memoryId: string): { memory_id: string; revision_id: string; source_refs: string[]; relations: MemoryRecord["relations"]; revisions: Array<{ revision_id: string; revision_number: number; previous_revision_id: string | null; source_refs: string[]; content_hash: string; provenance_hash: string; changed_at: string; changed_by: MemoryRecord["change"]["actor"]; reason: string }> } | null {
     const record = this.get(memoryId);
     if (!record) return null;
@@ -185,12 +210,55 @@ export class SqliteMemoryStore implements MemoryRecordStore {
   }
 
   wasInjected(input: { execution_id: string; session_id: string; revision_id: string }): boolean {
-    return Boolean(this.database.query("SELECT 1 FROM memory_injection_ledger WHERE execution_id=? AND session_id=? AND memory_revision_id=?").get(input.execution_id, input.session_id, input.revision_id));
+    return Boolean(this.database.query(`SELECT 1
+      FROM memory_injection_ledger ledger
+      JOIN memory_injection_deliveries delivery
+        ON delivery.execution_id=ledger.execution_id
+       AND delivery.session_id=ledger.session_id
+       AND delivery.pack_hash=ledger.pack_hash
+       AND delivery.status='DELIVERED'
+      JOIN memory_injection_delivery_items item
+        ON item.delivery_id=delivery.delivery_id
+       AND item.memory_revision_id=ledger.memory_revision_id
+      WHERE ledger.execution_id=? AND ledger.session_id=? AND ledger.memory_revision_id=?`)
+      .get(input.execution_id, input.session_id, input.revision_id));
   }
 
-  recordInjection(input: { execution_id: string; session_id: string; revision_id: string; pack_hash: string; injected_at: string }): void {
-    this.database.query("INSERT OR IGNORE INTO memory_injection_ledger (execution_id, session_id, memory_revision_id, pack_hash, injected_at) VALUES (?, ?, ?, ?, ?)")
-      .run(input.execution_id, input.session_id, input.revision_id, input.pack_hash, input.injected_at);
+  prepareInjection(input: { delivery_id: string; execution_id: string; session_id: string; revision_ids: string[]; pack_id: string; pack_hash: string; prepared_at: string }): void {
+    assertMemoryPersistenceSafe(input);
+    this.transaction(() => {
+      const existing = this.database.query("SELECT execution_id, session_id, pack_id, pack_hash FROM memory_injection_deliveries WHERE delivery_id=?").get(input.delivery_id) as { execution_id: string; session_id: string; pack_id: string; pack_hash: string } | null;
+      if (existing) {
+        if (existing.execution_id !== input.execution_id || existing.session_id !== input.session_id || existing.pack_id !== input.pack_id || existing.pack_hash !== input.pack_hash) {
+          throw new Error("MEMORY_INJECTION_DELIVERY_CONFLICT");
+        }
+        return;
+      }
+      this.database.query("INSERT INTO memory_injection_deliveries (delivery_id, execution_id, session_id, pack_id, pack_hash, status, prepared_at) VALUES (?, ?, ?, ?, ?, 'PREPARED', ?)")
+        .run(input.delivery_id, input.execution_id, input.session_id, input.pack_id, input.pack_hash, input.prepared_at);
+      const insert = this.database.query("INSERT INTO memory_injection_delivery_items (delivery_id, memory_revision_id) VALUES (?, ?)");
+      for (const revisionId of [...new Set(input.revision_ids)]) insert.run(input.delivery_id, revisionId);
+    });
+  }
+
+  acknowledgeInjection(input: { delivery_id: string; pack_hash: string; acknowledged_at: string }): void {
+    assertMemoryPersistenceSafe(input);
+    if (!Number.isFinite(Date.parse(input.acknowledged_at))) throw new Error("MEMORY_INJECTION_ACK_INVALID");
+    this.transaction(() => {
+      const delivery = this.database.query("SELECT execution_id, session_id, pack_hash, status FROM memory_injection_deliveries WHERE delivery_id=?").get(input.delivery_id) as { execution_id: string; session_id: string; pack_hash: string; status: string } | null;
+      if (!delivery) throw new Error("MEMORY_INJECTION_DELIVERY_NOT_FOUND");
+      if (delivery.pack_hash !== input.pack_hash) throw new Error("MEMORY_INJECTION_PACK_HASH_MISMATCH");
+      if (delivery.status === "DELIVERED") return;
+      const revisions = this.database.query("SELECT memory_revision_id FROM memory_injection_delivery_items WHERE delivery_id=? ORDER BY memory_revision_id").all(input.delivery_id) as Array<{ memory_revision_id: string }>;
+      const insert = this.database.query(`INSERT INTO memory_injection_ledger
+        (execution_id, session_id, memory_revision_id, pack_hash, injected_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(execution_id, session_id, memory_revision_id)
+        DO UPDATE SET pack_hash=excluded.pack_hash, injected_at=excluded.injected_at`);
+      for (const revision of revisions) insert.run(delivery.execution_id, delivery.session_id, revision.memory_revision_id, delivery.pack_hash, input.acknowledged_at);
+      this.database.query("UPDATE memory_injection_deliveries SET status='DELIVERED', delivered_at=? WHERE delivery_id=? AND status='PREPARED'")
+        .run(input.acknowledged_at, input.delivery_id);
+    });
   }
 
   saveQueryExplanation(queryId: string, payload: unknown, executedAt: string): void {
@@ -241,7 +309,11 @@ export class SqliteMemoryStore implements MemoryRecordStore {
         this.database.query("UPDATE memory_records SET lifecycle_status='FORGOTTEN' WHERE memory_id=?").run(memoryId);
       } else {
         const revisions = this.database.query("SELECT revision_id FROM memory_revisions WHERE memory_id=?").all(memoryId) as Array<{ revision_id: string }>;
-        for (const revision of revisions) this.database.query("DELETE FROM memory_injection_ledger WHERE memory_revision_id=?").run(revision.revision_id);
+        for (const revision of revisions) {
+          this.database.query("DELETE FROM memory_injection_ledger WHERE memory_revision_id=?").run(revision.revision_id);
+          const deliveries = this.database.query("SELECT delivery_id FROM memory_injection_delivery_items WHERE memory_revision_id=?").all(revision.revision_id) as Array<{ delivery_id: string }>;
+          for (const delivery of deliveries) this.database.query("DELETE FROM memory_injection_deliveries WHERE delivery_id=?").run(delivery.delivery_id);
+        }
         for (const table of ["memory_context_packs", "memory_query_logs"] as const) {
           const id = table === "memory_context_packs" ? "pack_id" : "query_id";
           const rows = this.database.query(`SELECT ${id} AS id, payload_json FROM ${table}`).all() as Array<{ id: string; payload_json: string }>;
@@ -334,17 +406,21 @@ export class SqliteMemoryStore implements MemoryRecordStore {
   }
 
   private searchCurrent(query: MemoryMetadataQuery, ftsQuery: string | null): MemorySearchHit[] {
+    if (query.allowed_statuses.length === 0) return [];
     const parameters: Array<string | number | null> = [];
     const joins = ftsQuery ? "JOIN memory_fts ON memory_fts.revision_id=r.current_revision_id" : "";
     const predicates = [
-      `r.lifecycle_status IN (${ACTIVE_RECALL_STATUSES.map(() => "?").join(",")})`,
+      `r.lifecycle_status IN (${query.allowed_statuses.map(() => "?").join(",")})`,
       `r.trust_rank >= ?`,
       `r.sensitivity_rank <= ?`,
-      `r.valid_from <= ?`,
-      `(r.valid_until IS NULL OR r.valid_until > ?)`,
-      `(NOT EXISTS (SELECT 1 FROM memory_revision_roles rr0 WHERE rr0.revision_id=r.current_revision_id) OR EXISTS (SELECT 1 FROM memory_revision_roles rr WHERE rr.revision_id=r.current_revision_id AND rr.role_id=?))`,
+      `julianday(r.valid_from) <= julianday(?)`,
+      `(r.valid_until IS NULL OR julianday(r.valid_until) > julianday(?))`,
+      `EXISTS (SELECT 1 FROM memory_revision_roles rr WHERE rr.revision_id=r.current_revision_id AND (rr.role_id=? OR rr.role_id='*'))`,
     ];
-    parameters.push(...ACTIVE_RECALL_STATUSES, trustRank(query.minimum_trust), sensitivityRank(query.max_sensitivity), query.at, query.at, query.role);
+    parameters.push(...query.allowed_statuses, trustRank(query.minimum_trust), sensitivityRank(query.max_sensitivity), query.at, query.at, query.role);
+    if (query.usage_mode === "GOVERNANCE_INSTRUCTION") {
+      predicates.push("r.layer='GOVERNANCE'", "json_extract(r.payload_json, '$.change.actor.type')='human'");
+    }
     if (query.layers.length > 0) {
       predicates.push(`r.layer IN (${query.layers.map(() => "?").join(",")})`);
       parameters.push(...query.layers);
@@ -376,7 +452,7 @@ export class SqliteMemoryStore implements MemoryRecordStore {
   private assertRecordAuthorized(record: MemoryRecord, authorization: MemoryAuthorizationContext): void {
     const allowed = new Set(authorization.authorized_scopes.map(scope => `${scope.type}:${scope.id}`));
     if (record.scopes.some(scope => !allowed.has(`${scope.type}:${scope.id}`))) throw new Error("MEMORY_SCOPE_ACCESS_DENIED");
-    if (record.access.read_roles.length > 0 && !record.access.read_roles.includes(authorization.role)) throw new Error("MEMORY_ROLE_ACCESS_DENIED");
+    if (!record.access.read_roles.includes("*") && !record.access.read_roles.includes(authorization.role)) throw new Error("MEMORY_ROLE_ACCESS_DENIED");
     if (sensitivityRank(record.access.sensitivity) > sensitivityRank(authorization.max_sensitivity)) throw new Error("MEMORY_SENSITIVITY_ACCESS_DENIED");
   }
 }

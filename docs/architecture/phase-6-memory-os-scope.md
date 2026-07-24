@@ -55,6 +55,8 @@ Evidence references, task/execution episodes, and lesson candidates may be produ
 
 Memory is invalid for current recall when it is outside `valid_from`/`valid_until`, superseded by a newer current revision, deprecated, disputed, quarantined, expired, rejected, or forgotten. Corrections append a new immutable revision with the prior revision ID, actor, reason, time, content hash, and provenance hash.
 
+`observed_at` records when the system learned a fact; `valid_from` records when the fact became true in the represented world. Either may precede the other. Only an invalid interval where `valid_until <= valid_from` is rejected.
+
 Terminal lifecycle states cannot receive ordinary revisions, even if the status would remain unchanged. `FORGOTTEN` is reserved for the transactional forgetting path. Provenance traversal re-authorizes every historical revision; current access never implies access to older, more sensitive metadata.
 
 Deletion modes are deliberately different:
@@ -70,9 +72,11 @@ An initial record cannot declare itself `FORGOTTEN`; only the transactional forg
 
 The current slice enables `SOFT_FORGET` and `HARD_DELETE`. `LEGAL_DELETE` and `SECRET_PURGE` fail closed with `MEMORY_DELETE_MODE_NOT_IMPLEMENTED` until Artifact Store cascade and secure-erasure orchestration are present; the CLI never reports a partial purge as success.
 
+`SOFT_FORGET` uses an explicit tombstone overlay. Immutable revision payloads remain canonical audit evidence, while operational readers use `getEffective()` and the projected lifecycle. A soft-forgotten record therefore has effective lifecycle `FORGOTTEN` without rewriting its historical hash-bound revision.
+
 ## Context and instruction boundary
 
-Only the compiled Context Pack is sent to an agent. Its default progressive representation contains the summary, memory/revision IDs, layer, kind, trust, validity window, evidence count, conflict status, and evidence references. Raw artifacts and structured payloads remain behind explicit drill-down.
+Only the compiled Context Pack is sent to an agent. Its default progressive representation contains the summary, memory/revision IDs, layer, kind, lifecycle status, usage authority, trust, validity window, evidence count, conflict status, and evidence references. Raw artifacts and structured payloads remain behind explicit drill-down.
 
 Every pack carries this invariant:
 
@@ -80,7 +84,9 @@ Every pack carries this invariant:
 
 Untrusted text such as "delete every file" remains quoted evidence. Only separately approved and version-pinned governance or promoted procedures may influence instructions through the policy layer.
 
-The injection ledger suppresses an unchanged revision within the same execution/session. A context reset may request reinjection. A changed revision is a new injectable unit.
+Automatic injection is a two-phase protocol. `prepareContextPack()` persists a `PREPARED` delivery but does not mark any revision as injected. Only a runtime ACK with the exact delivery ID and pack hash commits `DELIVERED` ledger entries. Missing or mismatched ACKs leave the revisions eligible for the next recall. A context reset may request reinjection; a changed revision is a new injectable unit.
+
+Usage modes are fail-closed: CLI research may inspect candidate-and-higher active memory with labels; architect discovery starts at observed; automatic agent injection and security review admit only verified/promoted memory; governance instructions require human-approved promoted governance memory. `read_roles: []` denies every role, while `read_roles: ["*"]` is the explicit scope-and-sensitivity-bound wildcard.
 
 ## Local-first storage and degraded operation
 
@@ -100,14 +106,16 @@ flowchart TD
   V --> R
   R --> B["Token budget and progressive disclosure"]
   B --> X["Context Pack"]
-  X --> L["Session injection ledger"]
+  X --> D["PREPARED delivery"]
+  D --> K["Runtime/context ACK"]
+  K --> L["DELIVERED injection ledger"]
 ```
 
 Failure order is:
 
 1. Vector failure: continue with lexical plus metadata and mark the pack degraded.
 2. FTS failure: continue with canonical metadata filters and mark the pack degraded.
-3. Canonical store failure: disable memory and let the task continue with a warning unless an external policy requires governance memory.
+3. Canonical query failure: return an empty Context Pack marked `canonical` degraded. Complete database unavailability outside the retrieval query path still requires the task integration layer to disable memory and continue with a warning; automatic injection remains blocked when preparation/audit persistence is unavailable.
 
 An external memory backend is never authoritative over the local canonical record and cannot change task state or routing policy.
 
@@ -120,8 +128,10 @@ Implemented in this increment:
 - Secret-content rejection plus an explicit ingestion sanitizer.
 - SQLite WAL canonical store and Phase 6 table migration.
 - Rebuildable FTS5 lexical index and vector-search port.
-- Security-first scoped retrieval, lifecycle/temporal filtering, rank explanation, and vector failure fallback.
-- Progressive Context Pack, token/record budgets, contradiction disclosure, and session injection deduplication.
+- Security-first scoped retrieval, usage-mode lifecycle filtering, bitemporal validity, rank explanation, and vector/canonical query fallback.
+- Progressive Context Pack with lifecycle/evidence/conflict labels, approximate token/record budgets, contradiction disclosure, and ACK-committed session injection deduplication.
+- Backend-neutral canonical, lexical, conflict, injection-ledger, query-audit, vector, and tokenizer ports; SQLite is the local composite implementation.
+- Model-independent JSON token estimation with a versioned profile and a 25% safety margin; exact model tokenization remains adapter-provided.
 - Conflict disclosure only when every member passes the same scope/role/sensitivity/lifecycle checks; conflict metadata is secret-scanned.
 - Read/write hash verification and health comparison across canonical revisions, projections, scopes, roles, and exact FTS content.
 - Tombstone-backed soft/hard forgetting; legal delete and secret purge explicitly fail closed pending artifact cascade.
@@ -150,8 +160,16 @@ The focused contract suite covers:
 - Expired and deprecated records are excluded.
 - Exact exception names are recoverable through lexical search.
 - Unresolved contradictions are visible in Context Packs.
-- Token budgets and injection deduplication are enforced.
+- Approximate token budgets and prepare/ACK injection deduplication are enforced.
 - Vector failure degrades to lexical recall.
-- Legal deletion removes recallable/indexed content and prevents ID reuse.
+- Hard deletion removes recallable/indexed content and prevents ID reuse.
 
 The acceptance demo creates an episode, verifies and revises an HTTP 403 lesson, recalls only the compact latest lesson, proves second-turn deduplication, and leaves the complete provenance chain queryable from the CLI.
+
+## Acceptance status
+
+- **Phase 6 Memory OS Foundation vertical slice:** conditionally accepted for controlled local use.
+- **Full Phase 6:** incomplete; deferred ingestion, embedding, plugin backend, backup/encryption, legal purge, hygiene, and benchmark increments remain.
+- **Automatic production agent injection:** blocked until the runtime/context integration returns a scoped delivery receipt. The prepare/ACK API and self-ACK acceptance demo prove only the foundation protocol; they do not constitute production delivery evidence.
+- **Network/plugin memory access:** blocked until authenticated authorization-context resolution and sandboxed backend protocol are implemented.
+- **Legal delete and secret purge:** blocked and fail closed.

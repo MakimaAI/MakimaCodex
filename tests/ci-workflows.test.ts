@@ -35,6 +35,25 @@ describe("GitHub Actions hardening", () => {
     expect(workflow).toContain("bun run build");
   });
 
+  test("Phase 6 CI publishes commit-bound reproducible acceptance evidence", async () => {
+    const workflow = await readText(".github/workflows/phase6-foundation.yml");
+
+    expect(workflow).toContain("name: Phase 6 Foundation Evidence");
+    expect(workflow).toContain("timeout-minutes: 30");
+    expect(workflow).toContain("docker info");
+    expect(workflow).toContain("docker pull mcr.microsoft.com/playwright@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a");
+    expect(workflow).toContain("bun test --isolate tests/oef-phase3-acceptance-demo.test.ts");
+    expect(workflow).toContain("bun test --isolate tests/oef-phase6-*.test.ts");
+    expect(workflow).toContain("Phase 1-5 representative regression");
+    expect(count(workflow, "oef-phase6-demo --root .artifacts/phase6 --json")).toBe(2);
+    expect(count(workflow, "cmp .artifacts/phase6/")).toBe(2);
+    expect(workflow).toContain('"$GITHUB_SHA" "$GITHUB_RUN_ID"');
+    expect(workflow).toContain("sha256sum -c SHA256SUMS");
+    expect(workflow).toContain("phase6-evidence-${{ github.sha }}");
+    expect(workflow).toContain("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a");
+    expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
+  });
+
   test("service lifecycle is least-privilege, bounded, and cannot swallow health failures", async () => {
     const workflow = await readText(".github/workflows/service-lifecycle.yml");
 
