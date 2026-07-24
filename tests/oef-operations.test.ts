@@ -332,4 +332,40 @@ describe("durable operations", () => {
     expect(target.attempts({ scope_id: scopeA, job_id: retry.job_id })[1]?.actor).toBe("human:owner");
     target.close();
   });
+
+  test("rejects active leases whose expiry is before or equal to acquisition", () => {
+    const target = store(); const equal = enqueue(target, { idempotency_key: "key:lease-expiry-equal" }); const before = enqueue(target, { idempotency_key: "key:lease-expiry-before" });
+    target.claim({ scope_id: scopeA, owner: "worker:a", now: t0, lease_ms: 5_000 });
+    target.claim({ scope_id: scopeA, owner: "worker:b", now: t0, lease_ms: 5_000 });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET lease_expires_at=? WHERE scope_id=? AND job_id=?").run(t0, scopeA, equal.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: equal.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.query("UPDATE operation_jobs SET lease_expires_at='2026-07-24T11:59:59.999Z' WHERE scope_id=? AND job_id=?").run(scopeA, before.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: before.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects active leases acquired after their updated time", () => {
+    const target = store(); const job = enqueue(target); target.claim({ scope_id: scopeA, owner: "worker:a", now: t0, lease_ms: 5_000 });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET lease_acquired_at='2026-07-24T12:00:00.001Z' WHERE scope_id=? AND job_id=?").run(scopeA, job.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects RUNNING jobs started after their updated time", () => {
+    const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id);
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET run_started_at='2026-07-24T12:00:00.001Z' WHERE scope_id=? AND job_id=?").run(scopeA, job.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects active leases whose expiry is at or before their updated time", () => {
+    const target = store(); const job = enqueue(target); target.claim({ scope_id: scopeA, owner: "worker:a", now: t0, lease_ms: 5_000 });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET updated_at='2026-07-24T12:00:00.001Z', lease_expires_at='2026-07-24T12:00:00.001Z' WHERE scope_id=? AND job_id=?").run(scopeA, job.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
 });
