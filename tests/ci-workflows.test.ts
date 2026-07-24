@@ -43,6 +43,7 @@ describe("GitHub Actions hardening", () => {
     expect(workflow).toContain("docker info");
     expect(workflow).toContain("docker pull mcr.microsoft.com/playwright@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a");
     expect(workflow).toContain("bun test --isolate tests/oef-phase3-acceptance-demo.test.ts");
+    expect(count(workflow, '"tests/oef-phase2-architecture.test.ts"')).toBe(2);
     expect(workflow).toContain("bun test --isolate tests/oef-phase6-*.test.ts");
     expect(workflow).toContain("Phase 1-5 representative regression");
     expect(count(workflow, "oef-phase6-demo --root .artifacts/phase6 --json")).toBe(2);

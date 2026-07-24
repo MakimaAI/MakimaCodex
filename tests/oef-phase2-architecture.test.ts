@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { runnerClientFromHome } from "../src/oef/phase2";
 
@@ -46,6 +46,7 @@ describe("Phase 2 architecture and public surface", () => {
 
   test("includes and starts the persistent runner daemon from an npm package path containing spaces", async () => {
     const workRoot = join(repo, "work");
+    mkdirSync(workRoot, { recursive: true });
     const temporary = mkdtempSync(join(workRoot, "phase2 package path with spaces "));
     const result = Bun.spawnSync(["npm", "pack", "--json", "--pack-destination", temporary], { cwd: repo, stdout: "pipe", stderr: "pipe" });
     expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
