@@ -44,6 +44,12 @@
 - Yazma öncesi gizli bilgi temizleme, güven sınırları, açıklanabilir geri çağırma ve yaklaşık bağlam bütçeleme eklendi.
 - Outbox ingestion, gerçek embedding, plugin backend, backup/encryption, legal purge ve tam hygiene incrementleri devam ediyor.
 
+### Faz 7 — Olay Zekâsı Temeli
+
+- Phase 2 hata manifestinden kapsam bağlı gözlem, kararlı imza ve append-only olay kaydı üreten temel dikey dilim eklendi.
+- Güvenli korelasyon, ayrı önem/öncelik/güven eksenleri, yetki sınırlı containment önerileri, sabitlenmiş yerel replay ve kanıta bağlı kapanış kapıları oluşturuldu.
+- Güvenli kapanış Phase 6 adayları üretir; bellek yazma arızası ortak operasyon kuyruğuna aktarılır. Üretim onarımı, canlı sandbox/inceleme, web araştırması ve tam Phase 7 yüzeyi henüz uygulanmadı.
+
 ## Son Yapılan
 
 - Faz 6.0.1 hardening paketi uygulandı.
@@ -53,3 +59,6 @@
 - Güvenilmeyen indeks kayıtları kanonik depodan yeniden doğrulanıyor; gizli çatışmalar kimlik sızdırmadan işaretleniyor.
 - GitHub doğrulamasına zorunlu Docker sandbox kabulü ve iki koşunun birebir çıktı karşılaştırması eklendi.
 - Faz 6 temel dikey dilimi koşullu kabul edildi; tam Faz 6 henüz tamamlanmadı.
+- Faz 7 olay zekâsı foundation dikey dilimi SQLite/WAL kayıt defteri, Phase 2 collector, deterministik 403 kabulü, CLI JSON yüzeyi ve SHA-sabit CI kanıtıyla eklendi.
+- Otomatik yürütme yalnızca geri alınabilir A0–A2 yerel kayıt etkileriyle sınırlı; HIGH/CRITICAL eşleşmeler otomatik birleştirilmiyor.
+- Remediation yalnızca öneri olarak saklanıyor; üretim onarımı veya deployment yapılmıyor. Tam Faz 7 ertelenmiş incrementleri mimari kapsam belgesinde açıkça listeleniyor.

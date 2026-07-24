@@ -49,6 +49,7 @@
     "oef:phase4:demo": "bun run src/cli/index.ts oef-phase4-demo",
     "oef:phase5:demo": "bun run src/cli/index.ts oef-phase5-demo",
     "oef:phase6:demo": "bun run src/cli/index.ts oef-phase6-demo",
+    "oef:phase7:demo": "bun run src/cli/index.ts oef-phase7-demo",
     "coverage:oef:core": "bun scripts/oef-phase1-core-coverage.ts",
     "coverage:oef:wide": "bun scripts/oef-phase1-wide-coverage.ts",
     "coverage:oef": "bun run coverage:oef:wide && bun run coverage:oef:core",

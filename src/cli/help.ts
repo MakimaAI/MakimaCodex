@@ -77,6 +77,15 @@ const helpEntries: Record<string, HelpEntry> = {
     usage: "ocx oef-phase6-demo --root <artifact-directory> [--json]",
     summary: "Run the Phase 6 revision, recall, provenance, and injection-dedup acceptance scenario.",
   },
+  incident: {
+    usage: "ocx incident <ingest|list|show|timeline|triage|root-cause|close|reopen|provenance|explain|health|demo> [options] [--json]",
+    summary: "Operate the Phase 7 incident-intelligence foundation registry.",
+    details: ["Research, repair, deployment, plugin fleets, and the full Phase 7 command surface remain deferred."],
+  },
+  "oef-phase7-demo": {
+    usage: "ocx oef-phase7-demo --root <artifact-directory> --commit-sha <sha> [--json]",
+    summary: "Run the deterministic Phase 7 foundation acceptance scenario without production repair or deployment.",
+  },
   "sync-cache": { usage: "ocx sync-cache", summary: "Refresh Codex's model cache from the active catalog." },
   status: { usage: "ocx status", summary: "Check proxy server status." },
   doctor: { usage: "ocx doctor", summary: "Diagnose environment/network issues (paths, WSL /mnt, proxy env, ChatGPT reachability)." },
@@ -222,6 +231,7 @@ Usage:
   ocx route <sub>             Compile and operate Phase 5 routing plans
   ocx team <sub>              Compose and inspect Phase 5 role teams
   ocx memory <sub>            Query and govern the Phase 6 Memory OS
+  ocx incident <sub>          Operate the Phase 7 incident-intelligence foundation
   ocx task <sub>              Manage persistent OEF tasks and workflow stages
   ocx contract <sub>          Manage immutable task contract revisions
   ocx evidence <sub>          Record and verify criterion evidence
