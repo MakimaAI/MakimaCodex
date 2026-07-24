@@ -2,13 +2,14 @@ import { z } from "zod";
 import { canonicalSha256 } from "../../phase1/core/contract/task-contract";
 import { assertNoPhase1Secret, assertNoStructuredPhase1Secret } from "../../phase1/core/security/secrets";
 import { FAILURE_CATEGORIES } from "../core/failure-observation";
-import { deepFreezePhase7, phase7SemverSchema } from "../core/shared";
+import { deepFreezePhase7, phase7ScopeSchema, phase7SemverSchema } from "../core/shared";
 import { isValidFailureType } from "../core/taxonomy";
 
 export const SIGNATURE_PROFILE = deepFreezePhase7({ id: "opencodex.failure-signature", version: "1.0.0" as const });
 
 const signatureInputSchema = z.object({
   profile: z.object({ id: z.literal(SIGNATURE_PROFILE.id), version: phase7SemverSchema }).strict(),
+  scope: phase7ScopeSchema,
   message: z.string().trim().min(1).max(100_000),
   category: z.enum(FAILURE_CATEGORIES),
   code: z.string().trim().min(3).max(256).refine(isValidFailureType),
@@ -50,7 +51,9 @@ export function normalizeFailureText(input: string): string {
   value = value.replace(/\b(pid|process(?:[_ -]?id)?)\s*[:=#]?\s*\d+\b/gi, "$1=<pid>");
   value = value.replace(/\b(port)\s*[:=#]?\s*\d{2,5}\b/gi, "$1=<port>");
   value = value.replace(/(https?:\/\/[^\s/:]+):\d{2,5}\b/gi, "$1:<port>");
+  value = value.replace(/\b([A-Za-z0-9_.-]+\.[A-Za-z0-9]+)\(\d+\s*,\s*\d+\)/g, "$1:<line>:<column>");
   value = value.replace(/\b([A-Za-z0-9_.-]+\.[A-Za-z0-9]+):\d+:\d+\b/g, "$1:<line>:<column>");
+  value = value.replace(/\b([A-Za-z0-9_.-]+\.[A-Za-z0-9]+):\d+\b/g, "$1:<line>");
   value = value.replace(/\b(line)\s+\d+(?:\s*[,;:]\s*(?:column|col)\s+\d+)?\b/gi, "$1 <line> column <column>");
   value = value.replace(/\b(retr(?:y|ies)|attempt)\s*(?:#|number)?\s*\d+\s*(?:\/|of)\s*\d+\b/gi, "$1 <retry>/<retry-limit>");
   value = value.replace(/\b(retr(?:y|ies)|attempt)\s*(?:#|number)?\s*\d+\b/gi, "$1 <retry>");
@@ -62,6 +65,12 @@ export function signFailure(input: FailureSignatureInput): FailureSignatures {
   if (value.profile.version !== SIGNATURE_PROFILE.version) throw new Error("SIGNATURE_PROFILE_UNSUPPORTED");
   assertSignatureSecretSafe(value);
   const normalizedText = normalizeFailureText(value.message);
+  const environmentFingerprint = canonicalSha256({
+    profile: value.profile,
+    provider: value.provider,
+    runtime: value.runtime,
+    environment: value.environment,
+  });
   const preservedContext = {
     category: value.category,
     code: value.code,
@@ -79,10 +88,10 @@ export function signFailure(input: FailureSignatureInput): FailureSignatures {
     .replace(/\b\d+\b/g, "<number>");
   return deepFreezePhase7({
     profile: SIGNATURE_PROFILE,
-    exact_hash: canonicalSha256({ profile: value.profile, message: value.message, context: preservedContext, environment: value.environment }),
-    normalized_signature: canonicalSha256({ profile: value.profile, normalized_text: normalizedText, context: preservedContext }),
-    structural_signature: canonicalSha256({ profile: value.profile, structural_text: structuralText, context: preservedContext }),
-    environment_fingerprint: canonicalSha256({ profile: value.profile, environment: value.environment }),
+    exact_hash: canonicalSha256({ profile: value.profile, scope: value.scope, message: value.message, context: preservedContext, environment: value.environment }),
+    normalized_signature: canonicalSha256({ profile: value.profile, scope: value.scope, environment_fingerprint: environmentFingerprint, normalized_text: normalizedText, context: preservedContext }),
+    structural_signature: canonicalSha256({ profile: value.profile, scope: value.scope, environment_fingerprint: environmentFingerprint, structural_text: structuralText, context: preservedContext }),
+    environment_fingerprint: environmentFingerprint,
     normalized_text: normalizedText,
   });
 }
