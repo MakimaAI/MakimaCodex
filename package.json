@@ -41,7 +41,7 @@
     "dev:gui": "cd gui && bun run dev",
     "start": "bun run src/cli/index.ts start",
     "test": "bun test --isolate ./tests/",
-    "typecheck": "bun x tsc --noEmit",
+    "typecheck": "bun x tsc --noEmit && bun x tsc --project tsconfig.operations-api.json",
     "privacy:scan": "bun scripts/privacy-scan.ts",
     "oef:demo": "bun run src/cli/index.ts oef-demo",
     "oef:phase2:demo": "bun scripts/oef-phase2-acceptance-demo.ts",
