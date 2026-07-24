@@ -1,15 +1,17 @@
-<h3 align="center">make codex open!</h3>
-<p align="center"><b>Universal provider proxy for OpenAI Codex &amp; Claude Code</b> — use any LLM with Codex CLI, App, SDK, and Claude Code.</p>
+<h1 align="center">MakimaCodex</h1>
+<p align="center"><b>MakimaAI's governed multi-model agent platform</b> — route, review, remember, and execute with any supported LLM.</p>
 <p align="center"><code>npm install -g @bitkyc08/opencodex</code> · <code>ocx start</code> · <b>localhost:10100</b></p>
+
+<p align="center"><sub>Created and maintained by <b>MakimaAI</b>. MakimaCodex is an independent evolution of OpenCodex; original attribution and the MIT license are preserved.</sub></p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@bitkyc08/opencodex"><img src="https://img.shields.io/npm/v/@bitkyc08/opencodex?color=cb3837&label=npm&logo=npm" alt="npm version"></a>
-  <a href="https://github.com/lidge-jun/opencodex/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/@bitkyc08/opencodex?color=blue" alt="license"></a>
+  <a href="https://github.com/MakimaAI/MakimaCodex/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/@bitkyc08/opencodex?color=blue" alt="license"></a>
   <img src="https://img.shields.io/node/v/@bitkyc08/opencodex?logo=node.js&label=node" alt="node version">
 </p>
 
 <p align="center">
-  <img src="assets/banner.png" alt="opencodex — Universal provider proxy for Codex, use any LLM" width="820">
+  <img src="assets/banner.png" alt="MakimaCodex — governed multi-model agent platform" width="820">
 </p>
 
 <p align="center">
@@ -22,7 +24,9 @@
 
 Use Claude, Gemini, Grok, GLM, DeepSeek, Kimi, Qwen, Ollama, or any other LLM with Codex — and with **Claude Code** — without waiting for anyone to add support.
 
-opencodex is a lightweight local proxy that translates Codex's Responses API into whatever your provider speaks. Streaming, tool calls, reasoning tokens, images — everything works, in both directions.
+MakimaCodex is a governed agent platform built around a lightweight local proxy that translates Codex's Responses API into whatever your provider speaks. It adds execution, evidence, review, routing, team composition, and layered Memory OS capabilities while retaining streaming, tool calls, reasoning tokens, and image support.
+
+> **Repository ownership:** This MakimaCodex repository and its original extensions are owned and maintained by MakimaAI. The upstream OpenCodex notices and license remain in place for the code this project builds upon. The npm package and `ocx` command keep their compatibility names until a separate MakimaCodex package is published.
 
 <p align="center">
   <img src="assets/demo.gif" alt="opencodex demo — running a task in the Codex app on a routed non-OpenAI model" width="820">
