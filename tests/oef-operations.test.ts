@@ -2,9 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import {
   JOB_STATES, SqliteOperationsStore, assertOperationTimestamp, canonicalEffectDescriptor, leaseExpiry,
-  jobStateSchema, parseOperationFailure, retryAvailableAt, type FailureDetails, type RetryPolicy,
+  jobStateSchema, parseOperationFailure, retryAvailableAt, type CancellationCapabilityVerifier, type FailureDetails, type RetryPolicy,
 } from "../src/oef/operations";
 
 const roots: string[] = [];
@@ -18,9 +19,9 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
-function store(): SqliteOperationsStore {
+function store(cancellationCapabilityVerifier?: CancellationCapabilityVerifier): SqliteOperationsStore {
   const root = mkdtempSync(join(tmpdir(), "oef-operations-")); roots.push(root);
-  return new SqliteOperationsStore({ databasePath: join(root, "operations.sqlite") });
+  return new SqliteOperationsStore({ databasePath: join(root, "operations.sqlite"), cancellationCapabilityVerifier });
 }
 
 function enqueue(target: SqliteOperationsStore, overrides: Record<string, unknown> = {}) {
@@ -81,7 +82,7 @@ describe("durable operations", () => {
   test("requires owner or scoped authority to cancel active work and preserves cancellation evidence", () => {
     const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id);
     expect(() => target.cancel({ scope_id: scopeA, job_id: job.job_id, now: t0, owner: "worker:b" })).toThrow("OPERATION_LEASE_OWNER_MISMATCH");
-    expect(target.cancel({ scope_id: scopeA, job_id: job.job_id, now: t0, cancellation_authority: { scope_id: scopeA, authority_id: "admin:a" } }).state).toBe("CANCELLED");
+    expect(target.cancel({ scope_id: scopeA, job_id: job.job_id, now: t0, owner: "worker:a" }).state).toBe("CANCELLED");
     expect(target.attempts({ scope_id: scopeA, job_id: job.job_id })[0]?.outcome).toBe("CANCELLED");
     expect(target.cancel({ scope_id: scopeA, job_id: job.job_id, now: t0 }).state).toBe("CANCELLED");
     target.close();
@@ -102,7 +103,7 @@ describe("durable operations", () => {
   test("uses the persisted retry policy for explicit failure and expiry recovery with capped date arithmetic", () => {
     const target = store(); const policy: RetryPolicy = { base_backoff_ms: 500, max_backoff_ms: 500 };
     const failed = enqueue(target, { retry_policy: policy }); claimAndStart(target, failed.job_id);
-    expect(target.fail({ scope_id: scopeA, job_id: failed.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "temporary network failure", artifact_ref: "artifact:network-1" }, now: t0 }).available_at).toBe("2026-07-24T12:00:00.500Z");
+    expect(target.fail({ scope_id: scopeA, job_id: failed.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "temporary network failure", artifact_ref: "artifact:scope:alpha:network-1" }, now: t0 }).available_at).toBe("2026-07-24T12:00:00.500Z");
     const expired = enqueue(target, { idempotency_key: "key:expired", retry_policy: policy }); claimAndStart(target, expired.job_id);
     expect(target.reconcileExpired({ scope_id: scopeA, now: "2026-07-24T12:00:05.001Z" })).toBe(1);
     expect(target.get({ scope_id: scopeA, job_id: expired.job_id })?.available_at).toBe("2026-07-24T12:00:05.501Z");
@@ -114,8 +115,8 @@ describe("durable operations", () => {
   test("stores only bounded sanitized failure snapshots and rejects raw failure evidence", () => {
     const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id);
     expect(() => parseOperationFailure({ code: "RAW", summary: "safe", raw_error: "untrusted raw log text" })).toThrow("OPERATION_FAILURE_INVALID");
-    target.fail({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "connection timed out", artifact_ref: "artifact:log-1" }, now: t0 });
-    expect(target.attempts({ scope_id: scopeA, job_id: job.job_id })[0]?.failure).toEqual({ code: "NETWORK", summary: "connection timed out", artifact_ref: "artifact:log-1" });
+    target.fail({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "connection timed out", artifact_ref: "artifact:scope:alpha:log-1" }, now: t0 });
+    expect(target.attempts({ scope_id: scopeA, job_id: job.job_id })[0]?.failure).toEqual({ code: "NETWORK", summary: "connection timed out", artifact_ref: "artifact:scope:alpha:log-1" });
     target.close();
   });
 
@@ -127,5 +128,75 @@ describe("durable operations", () => {
     expect(() => enqueue(target, { payload: { toJSON: () => ({ api_key: "abcdefghijklmnop" }) } })).toThrow("OPERATION_PAYLOAD_INVALID");
     expect(() => enqueue(target, { payload: { value: Number.NaN } })).toThrow("OPERATION_PAYLOAD_INVALID");
     target.close();
+  });
+
+  test("rejects forged cancellation capabilities and persists only a verified cancelling actor", () => {
+    const verifier: CancellationCapabilityVerifier = {
+      verify(input) {
+        if (input.capability !== "approved-capability" || input.scope_id !== scopeA || input.action !== "CANCEL" || input.actor !== "human:owner") return null;
+        return { actor: "human:owner", expires_at: "2026-07-24T12:05:00.000Z" };
+      },
+    };
+    const target = store(verifier); const job = enqueue(target); claimAndStart(target, job.job_id);
+    expect(() => target.cancel({ scope_id: scopeA, job_id: job.job_id, now: t0, capability: "forged", actor: "human:owner" })).toThrow("OPERATION_CANCELLATION_CAPABILITY_INVALID");
+    target.cancel({ scope_id: scopeA, job_id: job.job_id, now: t0, capability: "approved-capability", actor: "human:owner" });
+    const attempt = target.attempts({ scope_id: scopeA, job_id: job.job_id })[0]!;
+    expect(attempt.actor).toBe("human:owner");
+    expect(JSON.stringify(attempt)).not.toContain("approved-capability");
+    target.close();
+  });
+
+  test("rejects stack-shaped failure summaries while retaining scope-bound artifact references", () => {
+    expect(() => parseOperationFailure({ code: "NETWORK", summary: "Error: boom\n at worker.ts:1", artifact_ref: "artifact:scope:alpha:log-1" })).toThrow("OPERATION_FAILURE_INVALID");
+    expect(() => parseOperationFailure({ code: "NETWORK", summary: "tab\tseparated", artifact_ref: "artifact:scope:alpha:log-1" })).toThrow("OPERATION_FAILURE_INVALID");
+    expect(parseOperationFailure({ code: "NETWORK", summary: "Request timed out", artifact_ref: "artifact:scope:alpha:log-1" }).artifact_ref).toBe("artifact:scope:alpha:log-1");
+  });
+
+  test("preserves dangerous-looking JSON keys and hashes distinct descriptors distinctly", () => {
+    const first = canonicalEffectDescriptor(JSON.parse('{"__proto__":"one","constructor":"two","prototype":"three"}'));
+    const second = canonicalEffectDescriptor(JSON.parse('{"__proto__":"four","constructor":"two","prototype":"three"}'));
+    expect(first.effect["__proto__"]).toBe("one");
+    expect(first.effect.constructor).toBe("two");
+    expect(first.effect.prototype).toBe("three");
+    expect(first.effect_hash).not.toBe(second.effect_hash);
+  });
+
+  test("fails closed on tampered durable rows and exposes no persistence columns", () => {
+    const target = store(); const job = enqueue(target);
+    expect(target.get({ scope_id: scopeA, job_id: job.job_id })).not.toHaveProperty("payload_json");
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_jobs SET payload_json='{}' WHERE scope_id=? AND job_id=?").run(scopeA, job.job_id);
+    expect(() => target.get({ scope_id: scopeA, job_id: job.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("fails closed on tampered attempt and receipt columns", () => {
+    const target = store(); const failed = enqueue(target); claimAndStart(target, failed.job_id);
+    target.fail({ scope_id: scopeA, job_id: failed.job_id, owner: "worker:a", failure: { code: "NETWORK", summary: "Request timed out", artifact_ref: null }, now: t0 });
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    database.query("UPDATE operation_attempts SET actor='worker:forged' WHERE scope_id=? AND job_id=?").run(scopeA, failed.job_id);
+    expect(() => target.attempts({ scope_id: scopeA, job_id: failed.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    const succeeded = enqueue(target, { idempotency_key: "key:receipt" }); claimAndStart(target, succeeded.job_id);
+    target.succeed({ scope_id: scopeA, job_id: succeeded.job_id, owner: "worker:a", effect: { output: "ok" }, now: t0 });
+    database.query("UPDATE operation_effect_receipts SET effect_hash='sha256:forged' WHERE scope_id=? AND job_id=?").run(scopeA, succeeded.job_id);
+    expect(() => target.effectReceipt({ scope_id: scopeA, job_id: succeeded.job_id })).toThrow("OPERATION_PERSISTENCE_TAMPERED");
+    database.close(); target.close();
+  });
+
+  test("rejects causally regressing lifecycle times and lease-shortening heartbeats", () => {
+    const target = store(); const job = enqueue(target);
+    target.claim({ scope_id: scopeA, owner: "worker:a", now: t0, lease_ms: 5_000 });
+    expect(() => target.heartbeat({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", now: "2026-07-24T11:59:59.999Z", lease_ms: 5_000 })).toThrow("OPERATION_TIME_CAUSALITY_INVALID");
+    expect(() => target.heartbeat({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", now: "2026-07-24T12:00:01.000Z", lease_ms: 1_000 })).toThrow("OPERATION_LEASE_SHORTENING_REJECTED");
+    target.close();
+  });
+
+  test("creates only final scoped tables and records explicit non-retryable failures as FAILED", () => {
+    const target = store(); const job = enqueue(target); claimAndStart(target, job.job_id);
+    expect(target.fail({ scope_id: scopeA, job_id: job.job_id, owner: "worker:a", failure: { code: "PERMANENT", summary: "Input is invalid", artifact_ref: null }, retryable: false, now: t0 }).state).toBe("FAILED");
+    const database = new Database(join(roots[0]!, "operations.sqlite"));
+    const tables = (database.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'operation_%' ORDER BY name").all() as Array<{ name: string }>).map(row => row.name);
+    expect(tables).toEqual(["operation_attempts", "operation_effect_receipts", "operation_jobs"]);
+    database.close(); target.close();
   });
 });
