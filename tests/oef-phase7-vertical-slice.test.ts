@@ -12,8 +12,10 @@ describe("Phase 7 incident intelligence vertical slice", () => {
     expect(typeof phase7?.runPinnedReproduction).toBe("function");
     expect(typeof phase7?.createDeterministicPhase2ReplayAdapter).toBe("function");
     expect(typeof phase7?.runPhase7AcceptanceDemo).toBe("function");
-    expect(typeof (phase7?.SqliteIncidentRegistry as { prototype?: Record<string, unknown> })?.prototype?.persistIngestion).toBe("function");
+    expect((phase7?.SqliteIncidentRegistry as { prototype?: Record<string, unknown> })?.prototype?.persistIngestion).toBeUndefined();
     expect(typeof (phase7?.IncidentIntelligenceService as { prototype?: Record<string, unknown> })?.prototype?.ingest).toBe("function");
+    expect(typeof (phase7?.IncidentIntelligenceService as { prototype?: Record<string, unknown> })?.prototype?.reproduce).toBe("function");
+    expect((phase7?.IncidentIntelligenceService as { prototype?: Record<string, unknown> })?.prototype?.recordReproduction).toBeUndefined();
     expect(typeof (phase7?.IncidentIntelligenceService as { prototype?: Record<string, unknown> })?.prototype?.close).toBe("function");
   });
 });

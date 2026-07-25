@@ -180,9 +180,9 @@ describe("Phase 6 hardening", () => {
       expect(() => store.forget(record.memory_id, { mode: "HARD_DELETE", reason: "token=sk-proj-1234567890abcdef", at: now }))
         .toThrow("MEMORY_SECRET_CONTENT_FORBIDDEN");
       expect(() => store.forget(record.memory_id, { mode: "LEGAL_DELETE", reason: "request", at: now }))
-        .toThrow("MEMORY_DELETE_MODE_NOT_IMPLEMENTED");
+        .toThrow("MEMORY_DELETE_ARTIFACT_RECEIPT_REQUIRED");
       expect(() => store.forget(record.memory_id, { mode: "SECRET_PURGE", reason: "incident", at: now }))
-        .toThrow("MEMORY_DELETE_MODE_NOT_IMPLEMENTED");
+        .toThrow("MEMORY_DELETE_ARTIFACT_RECEIPT_REQUIRED");
       expect(store.get(record.memory_id)).not.toBeNull();
     } finally { store.close(); }
   });

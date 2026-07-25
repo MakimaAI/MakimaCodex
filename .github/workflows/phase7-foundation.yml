@@ -84,6 +84,11 @@ jobs:
           cmp .artifacts/phase7/phase7-demo-report-run-1.json .artifacts/phase7/phase7-demo-report-run-2.json
           printf '{"commit_sha":"%s","run_id":"%s","workflow":"phase7-foundation"}\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > .artifacts/phase7/ci-metadata.json
 
+      - name: Verify embedded report commit
+        run: >-
+          bun -e 'const report=await Bun.file(".artifacts/phase7/phase7-demo-report.json").json();
+          if (report.commit_sha !== process.env.GITHUB_SHA) throw new Error("PHASE7_REPORT_COMMIT_MISMATCH");'
+
       - name: Build and verify artifact hashes
         shell: bash
         run: |
@@ -95,6 +100,12 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: phase7-evidence-${{ github.sha }}
-          path: .artifacts/phase7/
+          path: |
+            .artifacts/phase7/phase7-demo-report.json
+            .artifacts/phase7/phase7-demo-report-run-1.json
+            .artifacts/phase7/phase7-demo-report-run-2.json
+            .artifacts/phase7/run-1.json
+            .artifacts/phase7/run-2.json
+            .artifacts/phase7/ci-metadata.json
           if-no-files-found: error
           retention-days: 30

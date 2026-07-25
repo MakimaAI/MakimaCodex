@@ -4,8 +4,15 @@ import { canonicalSha256 } from "../oef/phase1/core/contract/task-contract";
 import {
   MEMORY_SCOPE_TYPES,
   MEMORY_LAYERS,
+  LocalHashEmbeddingProvider,
+  LocalMemoryArtifactPurger,
+  MemoryCandidateService,
+  MemoryForgettingService,
+  MemoryHygieneService,
   MemoryRetrievalEngine,
+  SqliteMemoryBackupService,
   SqliteMemoryStore,
+  SqliteVectorMemoryIndex,
   appendMemoryRevision,
   runPhase6AcceptanceDemo,
   type MemoryLayer,
@@ -14,6 +21,7 @@ import {
   type MemoryScope,
   type MemorySensitivity,
   type MemoryTrustLevel,
+  type EmbeddingProfile,
 } from "../oef/phase6";
 
 interface ParsedArgs {
@@ -33,9 +41,20 @@ export async function cmdOefPhase6(group: string, args: string[]): Promise<numbe
     if (group !== "memory") throw new Error(`Unknown Phase 6 command group: ${group}`);
     const home = resolve(option(parsed, "home") ?? join(process.cwd(), ".opencodex", "memory"));
     mkdirSync(home, { recursive: true });
-    const store = new SqliteMemoryStore({ databasePath: join(home, "memory.sqlite") });
+    const databasePath = join(home, "memory.sqlite");
+    if (parsed.positionals[0] === "restore") {
+      const targetHome = resolve(required(parsed, "target-home"));
+      const value = new SqliteMemoryBackupService({ databasePath }).restore({
+        backup_directory: required(parsed, "backup"),
+        target_database_path: join(targetHome, "memory.sqlite"),
+        allow_overwrite: parsed.options.has("allow-overwrite"),
+      });
+      print(value, parsed.json);
+      return 0;
+    }
+    const store = new SqliteMemoryStore({ databasePath });
     try {
-      const value = await memoryCommand(store, parsed);
+      const value = await memoryCommand(store, parsed, databasePath);
       print(value, parsed.json);
       return 0;
     } finally {
@@ -47,10 +66,10 @@ export async function cmdOefPhase6(group: string, args: string[]): Promise<numbe
   }
 }
 
-async function memoryCommand(store: SqliteMemoryStore, parsed: ParsedArgs): Promise<unknown> {
+async function memoryCommand(store: SqliteMemoryStore, parsed: ParsedArgs, databasePath: string): Promise<unknown> {
   const command = parsed.positionals[0] ?? "help";
   if (command === "help") {
-    return { commands: ["search", "show", "provenance", "explain-query", "correct", "deprecate", "forget", "reindex", "health"], json_supported: true };
+    return { commands: ["search", "show", "provenance", "explain-query", "candidates", "promote", "correct", "deprecate", "forget", "hygiene", "health", "audit", "reindex", "reembed", "backup", "restore"], json_supported: true };
   }
   if (command === "search") {
     const text = positional(parsed, 1, "search text");
@@ -79,16 +98,71 @@ async function memoryCommand(store: SqliteMemoryStore, parsed: ParsedArgs): Prom
       usage_mode: "CLI_RESEARCH",
       explain: true,
     };
-    return new MemoryRetrievalEngine({ store }).recall(query);
+    const vector = new SqliteVectorMemoryIndex({ databasePath });
+    try { return new MemoryRetrievalEngine({ store, vectorIndex: vector }).recall(query); }
+    finally { vector.close(); }
   }
   if (command === "show") return store.getAuthorized(positional(parsed, 1, "memory id"), authorization(parsed), optionalInteger(parsed, "revision")) ?? fail("MEMORY_NOT_FOUND");
   if (command === "provenance") return store.provenanceAuthorized(positional(parsed, 1, "memory id"), authorization(parsed)) ?? fail("MEMORY_NOT_FOUND");
   if (command === "explain-query") return store.explainQueryAuthorized(positional(parsed, 1, "query id"), authorization(parsed)) ?? fail("MEMORY_QUERY_NOT_FOUND");
-  if (command === "health") return store.health();
+  if (command === "health") {
+    const vector = new SqliteVectorMemoryIndex({ databasePath });
+    try { return { ...store.health(), vector_index: vector.status() }; }
+    finally { vector.close(); }
+  }
+  if (command === "audit") {
+    const vector = new SqliteVectorMemoryIndex({ databasePath });
+    try {
+      const health = store.health();
+      const vectorStatus = vector.status();
+      return { status: health.canonical_store === "HEALTHY" && health.lexical_index === "HEALTHY" && ["HEALTHY", "EMPTY"].includes(String(vectorStatus.status)) ? "PASS" : "FAIL", ...health, vector_index: vectorStatus };
+    } finally { vector.close(); }
+  }
   if (command === "reindex") return store.reindexLexical();
+  if (command === "reembed") {
+    const profile = parseDataFile(required(parsed, "profile-file")) as EmbeddingProfile;
+    const vector = new SqliteVectorMemoryIndex({ databasePath, provider: new LocalHashEmbeddingProvider(profile) });
+    try { return await vector.rebuild({ at: new Date().toISOString() }); }
+    finally { vector.close(); }
+  }
+  if (command === "backup") {
+    const artifactManifestPath = option(parsed, "artifact-manifest");
+    const artifactRoot = resolve(option(parsed, "artifact-root") ?? process.cwd());
+    const manifest = artifactManifestPath ? parseDataFile(artifactManifestPath) as Record<string, string> : {};
+    return new SqliteMemoryBackupService({ databasePath }).create({
+      backup_root: required(parsed, "output"), at: new Date().toISOString(),
+      artifact_files: Object.entries(manifest).map(([reference, path]) => ({ reference, path: resolve(artifactRoot, path) })),
+    });
+  }
+  if (command === "hygiene") {
+    if (parsed.positionals[1] !== "run") throw new Error("Usage: memory hygiene run");
+    return new MemoryHygieneService(store).run({ at: option(parsed, "at") ?? new Date().toISOString() });
+  }
+  if (command === "candidates") {
+    const authority = authorization(parsed);
+    const rawStatus = option(parsed, "status")?.toUpperCase();
+    if (rawStatus && !["CANDIDATE", "PROMOTED", "REJECTED"].includes(rawStatus)) throw new Error("MEMORY_CANDIDATE_STATUS_INVALID");
+    return new MemoryCandidateService(store).list({ status: rawStatus as "CANDIDATE" | "PROMOTED" | "REJECTED" | undefined })
+      .filter(candidate => candidateVisible(candidate, authority));
+  }
+  if (command === "promote") {
+    const candidateId = positional(parsed, 1, "candidate id");
+    const authority = authorization(parsed);
+    const service = new MemoryCandidateService(store);
+    const candidate = store.getMemoryCandidate(candidateId) ?? fail("MEMORY_CANDIDATE_NOT_FOUND");
+    if (!candidateVisible(candidate, authority)) throw new Error("MEMORY_SCOPE_ACCESS_DENIED");
+    const actorType = (option(parsed, "actor-type") ?? "human").toLowerCase();
+    if (actorType !== "human" && actorType !== "verifier") throw new Error("MEMORY_PROMOTION_ACTOR_UNAUTHORIZED");
+    return service.promote(candidateId, {
+      actor: { type: actorType, id: option(parsed, "actor") ?? `${actorType}:local-owner` },
+      evidence_refs: values(parsed, "evidence"),
+      evaluation_ref: option(parsed, "evaluation"),
+      at: new Date().toISOString(),
+    });
+  }
   if (command === "correct") {
     const memoryId = positional(parsed, 1, "memory id");
-    const current = store.get(memoryId) ?? fail("MEMORY_NOT_FOUND");
+    const current = store.getAuthorized(memoryId, authorization(parsed)) ?? fail("MEMORY_NOT_FOUND");
     const patch = parseDataFile(required(parsed, "file"));
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new Error("MEMORY_CORRECTION_FILE_INVALID");
     const next = appendMemoryRevision(current, patch, {
@@ -102,7 +176,7 @@ async function memoryCommand(store: SqliteMemoryStore, parsed: ParsedArgs): Prom
   }
   if (command === "deprecate") {
     const memoryId = positional(parsed, 1, "memory id");
-    const current = store.get(memoryId) ?? fail("MEMORY_NOT_FOUND");
+    const current = store.getAuthorized(memoryId, authorization(parsed)) ?? fail("MEMORY_NOT_FOUND");
     const next = appendMemoryRevision(current, { lifecycle: { status: "DEPRECATED" } }, {
       expected_revision: current.revision_number,
       reason: required(parsed, "reason"),
@@ -114,10 +188,22 @@ async function memoryCommand(store: SqliteMemoryStore, parsed: ParsedArgs): Prom
   }
   if (command === "forget") {
     const memoryId = positional(parsed, 1, "memory id");
+    store.getAuthorized(memoryId, authorization(parsed)) ?? fail("MEMORY_NOT_FOUND");
     const mode = (option(parsed, "mode") ?? "soft-forget").replaceAll("-", "_").toUpperCase();
     if (!["SOFT_FORGET", "HARD_DELETE", "LEGAL_DELETE", "SECRET_PURGE"].includes(mode)) throw new Error("MEMORY_FORGET_MODE_INVALID");
-    store.forget(memoryId, { mode: mode as "SOFT_FORGET" | "HARD_DELETE" | "LEGAL_DELETE" | "SECRET_PURGE", reason: required(parsed, "reason"), at: new Date().toISOString() });
-    return { memory_id: memoryId, mode, forgotten: true };
+    const vector = new SqliteVectorMemoryIndex({ databasePath });
+    try {
+      const manifestPath = option(parsed, "artifact-manifest");
+      const purger = manifestPath ? new LocalMemoryArtifactPurger({
+        root: required(parsed, "artifact-root"),
+        manifest: parseDataFile(manifestPath) as Record<string, string>,
+      }) : undefined;
+      return new MemoryForgettingService({ store, derived_indexes: [vector], artifact_purger: purger }).forget(memoryId, {
+        mode: mode as "SOFT_FORGET" | "HARD_DELETE" | "LEGAL_DELETE" | "SECRET_PURGE",
+        reason: required(parsed, "reason"),
+        at: new Date().toISOString(),
+      });
+    } finally { vector.close(); }
   }
   return fail(`Unknown memory command: ${command}`);
 }
@@ -185,6 +271,14 @@ function sensitivity(value: string): Exclude<MemorySensitivity, "SECRET"> {
   const normalized = value.toUpperCase();
   if (!["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"].includes(normalized)) throw new Error("Invalid max sensitivity");
   return normalized as Exclude<MemorySensitivity, "SECRET">;
+}
+
+function candidateVisible(candidate: { scopes: MemoryScope[]; access: { sensitivity: Exclude<MemorySensitivity, "SECRET">; read_roles: string[] } }, authorization: MemoryAuthorizationContext): boolean {
+  const allowed = new Set(authorization.authorized_scopes.map(scope => `${scope.type}:${scope.id}`));
+  return candidate.scopes.every(scope => allowed.has(`${scope.type}:${scope.id}`))
+    && (candidate.access.read_roles.includes("*") || candidate.access.read_roles.includes(authorization.role))
+    && ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"].indexOf(candidate.access.sensitivity)
+      <= ["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"].indexOf(authorization.max_sensitivity);
 }
 
 function parseDataFile(pathInput: string): unknown {

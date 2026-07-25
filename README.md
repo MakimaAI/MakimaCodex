@@ -48,7 +48,7 @@
 
 - Phase 2 hata manifestinden kapsam bağlı gözlem, kararlı imza ve append-only olay kaydı üreten temel dikey dilim eklendi.
 - Güvenli korelasyon, ayrı önem/öncelik/güven eksenleri, yetki sınırlı containment önerileri, sabitlenmiş yerel replay ve kanıta bağlı kapanış kapıları oluşturuldu.
-- Güvenli kapanış Phase 6 adayları üretir; bellek yazma arızası ortak operasyon kuyruğuna aktarılır. Üretim onarımı, canlı sandbox/inceleme, web araştırması ve tam Phase 7 yüzeyi henüz uygulanmadı.
+- Güvenli kapanış revizyon-kapsamlı Phase 6 adayları ve değişmez bir bellek-yazma paketi üretir; yazma arızası ortak operasyon kuyruğunda paket kimliği/hash'i ile yeniden denenir. Foundation CLI yazma komutları kimlik doğrulanmış bir yetki çözücü gelene kadar `PHASE7_AUTHORIZATION_REQUIRED` döndürür. Üretim onarımı, canlı sandbox/inceleme, web araştırması ve tam Phase 7 yüzeyi henüz uygulanmadı.
 
 ## Son Yapılan
 

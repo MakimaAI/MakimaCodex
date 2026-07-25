@@ -62,6 +62,7 @@ export function reproductionManifest(overrides: Record<string, unknown> = {}): R
     scope: { type: "REPOSITORY", id: "repo:makima" },
     source_commit: PHASE7_COMMIT,
     image_digest: PHASE7_HASH,
+    expected_signature: PHASE7_HASH,
     seed: 403,
     attempts: 5,
     budgets: { timeout_ms: 30_000, max_output_bytes: 64_000, max_memory_mb: 512 },

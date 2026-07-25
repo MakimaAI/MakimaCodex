@@ -70,7 +70,7 @@ A tombstoned memory ID cannot be recreated accidentally.
 
 An initial record cannot declare itself `FORGOTTEN`; only the transactional forgetting command may create that state. Forgetting reasons are bounded and secret-scanned before mutation so tombstones remain content-free governance metadata rather than a credential sink.
 
-The current slice enables `SOFT_FORGET` and `HARD_DELETE`. `LEGAL_DELETE` and `SECRET_PURGE` fail closed with `MEMORY_DELETE_MODE_NOT_IMPLEMENTED` until Artifact Store cascade and secure-erasure orchestration are present; the CLI never reports a partial purge as success.
+All four modes are implemented. `LEGAL_DELETE` and `SECRET_PURGE` are available only through the durable deletion coordinator: it fences the root/revisions, plans historical and transitive-derived closure, accepts only opaque receipts issued by the trusted local purger, requires an exact per-artifact `PURGED` or verified-absence set, binds that set to a recomputed hash, resumes from its persisted crash stage, rejects new derived references, and performs a final closure scan. Direct store calls with fabricated receipt data fail closed.
 
 `SOFT_FORGET` uses an explicit tombstone overlay. Immutable revision payloads remain canonical audit evidence, while operational readers use `getEffective()` and the projected lifecycle. A soft-forgotten record therefore has effective lifecycle `FORGOTTEN` without rewriting its historical hash-bound revision.
 
@@ -119,7 +119,7 @@ Failure order is:
 
 An external memory backend is never authoritative over the local canonical record and cannot change task state or routing policy.
 
-## Current implementation slice
+## Current implementation
 
 Implemented in this increment:
 
@@ -127,27 +127,35 @@ Implemented in this increment:
 - Layer, scope, kind, lifecycle, trust, confidence, temporal validity, sensitivity, ACL, provenance, contradiction, and supersession fields.
 - Secret-content rejection plus an explicit ingestion sanitizer.
 - SQLite WAL canonical store and Phase 6 table migration.
-- Rebuildable FTS5 lexical index and vector-search port.
+- Rebuildable FTS5 lexical index, backend-neutral vector-search port, and a concrete deterministic local vector adapter.
+- Versioned embedding profiles, sensitivity ceilings, durable vector generations, atomic generation switching, and restart-safe re-embedding.
 - Security-first scoped retrieval, usage-mode lifecycle filtering, bitemporal validity, rank explanation, and vector/canonical query fallback.
 - Progressive Context Pack with lifecycle/evidence/conflict labels, approximate token/record budgets, contradiction disclosure, and ACK-committed session injection deduplication.
 - Backend-neutral canonical, lexical, conflict, injection-ledger, query-audit, vector, and tokenizer ports; SQLite is the local composite implementation.
 - Model-independent JSON token estimation with a versioned profile and a 25% safety margin; exact model tokenization remains adapter-provided.
 - Conflict disclosure only when every member passes the same scope/role/sensitivity/lifecycle checks; conflict metadata is secret-scanned.
 - Read/write hash verification and health comparison across canonical revisions, projections, scopes, roles, and exact FTS content.
-- Tombstone-backed soft/hard forgetting; legal delete and secret purge explicitly fail closed pending artifact cascade.
-- `ocx memory search|show|provenance|explain-query|correct|deprecate|forget|reindex|health`.
-- Deterministic Phase 6 lifecycle acceptance demo.
+- Durable, idempotent ingestion jobs with worker leases, lease recovery, bounded attempts, attempt records, retry, and dead-letter state.
+- Automatic Phase 2 evidence-to-episode compilation and verifier/human-gated lesson/procedure candidate promotion.
+- Tombstone-backed soft/hard forgetting plus durable deletion-job, per-artifact receipt, historical-provenance closure, transitive-derived-memory closure, and receipt-gated legal/secret purge across canonical projections, local vector entries, and registered local artifacts.
+- Basic hygiene execution that appends immutable `EXPIRED` revisions and reports duplicate groups.
+- Versioned, capability-allowlisted external backend protocol. External results remain untrusted observations with no instruction authority.
+- Hash-bound SQLite backup and verified restore with canonical/provenance/scope/vector source-health gates, lexical rebuild, derived-vector discard plus explicit re-embed requirement, copied artifact bytes with per-file hash and size verification, and no key material in the backup manifest.
+- Deterministic retrieval benchmark reporting retrieval precision, verified-memory precision, citation completeness, cross-scope leakage, and secret leakage.
+- Public JSON schemas for canonical record, conflict, source event, ingestion job, candidate, embedding profile, and plugin manifest.
+- `ocx memory search|show|provenance|explain-query|candidates|promote|correct|deprecate|forget|hygiene|health|audit|reindex|reembed|backup|restore`.
+- Deterministic Phase 6 lifecycle acceptance demo with ingestion, promotion, hybrid index, plugin boundary, backup, benchmark, provenance, and injection-dedup evidence.
 
-Deferred to subsequent Phase 6 increments:
+Remaining operational integrations (not advertised as active capabilities):
 
-- Phase 1–5 outbox collectors and durable per-record ingestion job queue.
-- Automatic episode compiler and gated lesson-candidate promotion workflow.
-- A concrete vector adapter, embedding profiles, re-embedding migration, and atomic index switch.
-- Entity/graph index, duplicate merge, retention scheduler, reverification, and full hygiene loop.
-- External backend/plugin protocol, permissions sandbox, and TencentDB/MemOS/Mem0 adapters.
-- Encryption-at-rest integration, backup/restore orchestration, legal-delete artifact cascade, property/fault suites, and retrieval benchmark corpus.
+- Concrete Phase 1–5 outbox collector adapters. The durable source-event/job contract is implemented; producers still need deployment-specific wiring.
+- Entity/graph retrieval, automated duplicate merge, full retention scheduling, and external reverification jobs.
+- Sandboxed vendor adapters for TencentDB, MemOS, and Mem0. The protocol and capability/scope guard exist; no vendor backend is enabled by default.
+- Application-level payload encryption and key rotation. Current local operation relies on OS/disk protection and never stores key material in the database or backup.
+- A large representative production benchmark corpus and live multi-runtime acceptance evidence.
+- Production execution-plane Context Pack delivery. The prepare/ACK contract exists, but Phase 2 runtime wiring must return the scoped delivery receipt before automatic production injection is enabled.
 
-These deferred items are not represented as active capabilities by the CLI or health output.
+These integrations are not represented as active capabilities by the CLI or health output.
 
 ## Acceptance evidence
 
@@ -162,14 +170,19 @@ The focused contract suite covers:
 - Unresolved contradictions are visible in Context Packs.
 - Approximate token budgets and prepare/ACK injection deduplication are enforced.
 - Vector failure degrades to lexical recall.
-- Hard deletion removes recallable/indexed content and prevents ID reuse.
+- Failed re-embedding does not replace the active vector generation.
+- Duplicate source events have zero duplicate-memory effect; expired leases recover; poison jobs reach dead letter without locking the queue.
+- Hard and legal deletion remove recallable/indexed content, registered local artifacts, and prevent ID reuse.
+- Backup database and artifact-byte hashes plus SQLite integrity are verified before restore; lexical projections rebuild after restore.
+- Plugin protocol/capability/scope violations fail closed, and external claims cannot become instructions or verified truth.
+- The deterministic benchmark meets the 80% retrieval, 90% verified-memory, 100% citation, zero scope leakage, and zero secret leakage gates.
 
-The acceptance demo creates an episode, verifies and revises an HTTP 403 lesson, recalls only the compact latest lesson, proves second-turn deduplication, and leaves the complete provenance chain queryable from the CLI.
+The acceptance demo durably ingests a Phase 2 evidence event, compiles an episode, gates and promotes a lesson candidate, verifies and revises an HTTP 403 lesson, builds a vector generation, recalls only compact current memory, proves second-turn deduplication, validates an untrusted plugin observation, produces a hash-bound backup, runs retrieval quality gates, and leaves the complete provenance chain queryable from the CLI.
 
 ## Acceptance status
 
-- **Phase 6 Memory OS Foundation vertical slice:** conditionally accepted for controlled local use.
-- **Full Phase 6:** incomplete; deferred ingestion, embedding, plugin backend, backup/encryption, legal purge, hygiene, and benchmark increments remain.
+- **Phase 6 Memory OS core exit gate:** accepted for controlled local use with functional, security, durability, retrieval-quality, functions-coverage, and lines-coverage checks represented by executable tests and the acceptance artifact. The requested true branch-coverage percentage remains unproven because Bun 1.3.14 exposes functions/lines but emits no branch counters.
+- **Production-wide rollout:** not yet authorized; deployment-specific outbox collectors, runtime delivery receipts, vendor sandbox adapters, application-level encryption/key rotation, and a representative production benchmark corpus remain operational prerequisites.
 - **Automatic production agent injection:** blocked until the runtime/context integration returns a scoped delivery receipt. The prepare/ACK API and self-ACK acceptance demo prove only the foundation protocol; they do not constitute production delivery evidence.
-- **Network/plugin memory access:** blocked until authenticated authorization-context resolution and sandboxed backend protocol are implemented.
-- **Legal delete and secret purge:** blocked and fail closed.
+- **Network/vendor plugin memory access:** blocked until authenticated authorization-context resolution and process sandboxing are deployed. The local protocol guard alone does not authorize a network plugin.
+- **Legal delete and secret purge:** available only through the receipt-gated forgetting service with an explicit artifact purger; direct store calls fail closed without the receipt.

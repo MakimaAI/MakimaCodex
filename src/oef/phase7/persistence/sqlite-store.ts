@@ -5,337 +5,181 @@ import { canonicalSha256 } from "../../phase1/core/contract/task-contract";
 import { assertNoPhase1Secret, assertNoStructuredPhase1Secret } from "../../phase1/core/security/secrets";
 import { parseFailureObservation, type FailureObservation } from "../core/failure-observation";
 import { parseIncident, type Incident } from "../core/incident";
+import { parsePlaybookCandidate, type PlaybookCandidate } from "../core/playbook-candidate";
 import { samePhase7Scope, type Phase7Scope } from "../core/shared";
 import type { FailureSignatures } from "../ingestion/signatures";
+import { parseReproductionManifest, parseReproductionResult, type ReproductionManifest, type ReproductionResult } from "../reproduction/manifest";
+import type { RegressionResultRecord, RemediationProposalRecord, ReviewVerdictRecord } from "../remediation/records";
+import { INCIDENT_RECORD_KINDS, assertMemoryBatchRecords, incidentRecordEnvelopeSchema, memoryWriteBatchSchema, recordIdentity, validateIncidentRecordData, type IncidentRecordEnvelope, type IncidentRecordKind, type MemoryWriteBatch } from "./typed-records";
 
-export interface IncidentRelation {
-  relation_id: string;
-  incident_id: string;
-  related_incident_id: string;
-  relation_type: "POSSIBLE_DUPLICATE";
-  reason: string;
-  created_at: string;
-}
-export interface IngestionPersistenceInput {
-  source_event_id: string;
-  source_hash: string;
-  observation: FailureObservation;
-  signatures: FailureSignatures;
-  provider: string;
-  runtime: string;
-  runtime_major: number;
-  incident: Incident;
-  relation: IncidentRelation | null;
-  correlation: "NEW" | "AUTO_CORRELATED" | "POSSIBLE_DUPLICATE";
-}
-export interface IngestionPersistenceResult {
-  created: boolean;
-  duplicate: boolean;
-  observation_id: string;
-  incident_id: string;
-  correlation: IngestionPersistenceInput["correlation"];
-  result_hash: string;
-}
-
-const recordTables = {
-  TRIAGE: "phase7_triage_records",
-  CONTAINMENT: "phase7_containment_records",
-  REPRODUCTION: "phase7_reproduction_results",
-  HYPOTHESIS_EVIDENCE: "phase7_hypothesis_evidence",
-  ROOT_CAUSE: "phase7_root_causes",
-  REMEDIATION: "phase7_remediation_proposals",
-  REGRESSION: "phase7_regression_results",
-  REVIEW: "phase7_review_verdicts",
-  PLAYBOOK: "phase7_playbook_candidates",
-} as const;
-export type IncidentRecordKind = keyof typeof recordTables;
+export interface IncidentRelation { relation_id: string; incident_id: string; related_incident_id: string; relation_type: "POSSIBLE_DUPLICATE"; scope: Phase7Scope; reason: string; created_at: string }
+export interface IngestionPersistenceInput { source_event_id: string; source_hash: string; observation: FailureObservation; signatures: FailureSignatures; provider: string; runtime: string; runtime_major: number; incident: Incident; relation: IncidentRelation | null; correlation: "NEW" | "AUTO_CORRELATED" | "POSSIBLE_DUPLICATE" }
+export interface IngestionPersistenceResult { created: boolean; duplicate: boolean; observation_id: string; incident_id: string; correlation: IngestionPersistenceInput["correlation"]; result_hash: string }
 export interface PersistedIncidentRecord { record_id: string; incident_id: string; scope_id: string; occurred_at: string; payload_hash: string; payload: Record<string, unknown> }
 
-export class SqliteIncidentRegistry {
-  private readonly database: Database;
-  constructor(options: { databasePath: string }) {
-    this.database = new Database(options.databasePath, { create: true, strict: true });
-    this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
-    this.database.exec(readFileSync(join(import.meta.dir, "migrations", "001_incident_registry.sql"), "utf8"));
-  }
-  close(): void { this.database.close(); }
-  transaction<T>(operation: () => T): T { return this.database.transaction(operation).immediate(); }
+const recordTables: Record<IncidentRecordKind, string> = {
+  TRIAGE: "phase7_triage_records", CONTAINMENT: "phase7_containment_records", REPRODUCTION_MANIFEST: "phase7_reproduction_manifests", REPRODUCTION: "phase7_reproduction_results",
+  HYPOTHESIS_EVIDENCE: "phase7_hypothesis_evidence", ROOT_CAUSE: "phase7_root_causes", REMEDIATION: "phase7_remediation_proposals", REGRESSION: "phase7_regression_results", REVIEW: "phase7_review_verdicts", PLAYBOOK: "phase7_playbook_candidates",
+};
+const writerToken = Symbol("phase7-registry-writer");
+const writers = new WeakMap<SqliteIncidentRegistry, Phase7RegistryWriter>();
 
-  persistIngestion(input: IngestionPersistenceInput): IngestionPersistenceResult {
-    const duplicate = this.existingIngestion(input.source_event_id, input.source_hash);
-    if (duplicate) return duplicate;
-    const observation = parseFailureObservation(input.observation);
-    const incident = parseIncident(input.incident);
-    if (input.relation) {
-      const related = this.getIncident(input.relation.related_incident_id);
-      if (input.correlation !== "POSSIBLE_DUPLICATE" || input.relation.incident_id !== incident.incident_id || input.relation.related_incident_id === incident.incident_id || !related || !samePhase7Scope(related.scope, incident.scope)) throw new Error("PHASE7_RELATION_SCOPE_MISMATCH");
-    } else if (input.correlation === "POSSIBLE_DUPLICATE") {
-      throw new Error("PHASE7_RELATION_REQUIRED");
-    }
-    if (!samePhase7Scope(observation.scope, incident.scope) || !incident.observation_ids.includes(observation.revision_id)) throw new Error("PHASE7_INGESTION_SCOPE_MISMATCH");
-    return this.transaction(() => {
-      const racedDuplicate = this.existingIngestion(input.source_event_id, input.source_hash);
-      if (racedDuplicate) return racedDuplicate;
-      this.insertObservation(observation);
-      this.insertSignature(input);
-      if (input.correlation === "AUTO_CORRELATED") {
-        const current = this.getIncidentRequired(incident.incident_id);
-        if (incident.revision !== current.revision + 1 || incident.previous_revision_hash !== current.revision_hash) throw new Error("PHASE7_INCIDENT_REVISION_CONFLICT");
-        this.insertIncidentRevision(incident);
-        this.database.query("UPDATE phase7_incidents SET current_revision=?, current_revision_hash=?, status=?, payload_json=? WHERE incident_id=? AND current_revision=?")
-          .run(incident.revision, incident.revision_hash, incident.status, JSON.stringify(incident), incident.incident_id, current.revision);
-      } else {
-        this.insertIncident(incident);
-      }
-      this.database.query("INSERT INTO phase7_incident_observations (incident_id, observation_revision_id, linked_at) VALUES (?, ?, ?)")
-        .run(incident.incident_id, observation.revision_id, observation.observed_at);
-      if (input.relation) this.insertRelation(input.relation);
-      this.appendAudit(incident.incident_id, "OBSERVATION_INGESTED", { observation_id: observation.observation_id, source_event_id: input.source_event_id }, observation.observed_at);
-      this.appendAudit(incident.incident_id, input.relation ? "INCIDENT_RELATED" : "INCIDENT_OPENED", { correlation: input.correlation, related_incident_id: input.relation?.related_incident_id ?? null }, observation.observed_at);
-      const base = { created: true, duplicate: false, observation_id: observation.observation_id, incident_id: incident.incident_id, correlation: input.correlation };
-      const result: IngestionPersistenceResult = { ...base, result_hash: canonicalSha256(base) };
-      this.database.query("INSERT INTO phase7_ingestions (source_event_id, source_hash, observation_id, incident_id, result_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(input.source_event_id, input.source_hash, result.observation_id, result.incident_id, result.result_hash, JSON.stringify(result));
-      return result;
-    });
+export class SqliteIncidentRegistry {
+  readonly #database: Database;
+  constructor(options: { databasePath: string }) {
+    this.#database = new Database(options.databasePath, { create: true, strict: true });
+    this.#database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    this.#database.exec(readFileSync(join(import.meta.dir, "migrations", "001_incident_registry.sql"), "utf8"));
+    writers.set(this, new Phase7RegistryWriter(writerToken, this.#database, this));
   }
+  close(): void { this.#database.close(); }
 
   findCorrelation(input: { scope: Phase7Scope; signatures: FailureSignatures; provider: string; runtime: string; runtime_major: number }): { incident: Incident; observation_id: string } | null {
-    const rows = this.database.query(`SELECT s.*, o.scope_type AS observation_scope_type, o.scope_id AS observation_scope_id, l.incident_id
-      FROM phase7_signatures s
-      JOIN phase7_observations o ON o.observation_id=s.observation_id
-      JOIN phase7_incident_observations l ON l.observation_revision_id=o.current_revision_id
-      WHERE o.scope_type=? AND o.scope_id=? ORDER BY l.incident_id, s.observation_id`)
-      .all(input.scope.type, input.scope.id) as Array<Record<string, unknown>>;
+    const rows = this.#database.query(`SELECT s.*, o.scope_type AS observation_scope_type, o.scope_id AS observation_scope_id, l.incident_id FROM phase7_signatures s JOIN phase7_observations o ON o.observation_id=s.observation_id JOIN phase7_incident_observations l ON l.observation_revision_id=o.current_revision_id WHERE o.scope_type=? AND o.scope_id=? ORDER BY l.incident_id, s.observation_id`).all(input.scope.type, input.scope.id) as Array<Record<string, unknown>>;
     for (const row of rows) {
       const signature = decodeSignatureRow(row);
-      if (signature.normalized_signature === input.signatures.normalized_signature
-        && signature.structural_signature === input.signatures.structural_signature
-        && signature.provider === input.provider
-        && signature.runtime === input.runtime
-        && signature.runtime_major === input.runtime_major) {
-        return { observation_id: signature.observation_id, incident: this.getIncidentRequired(String(row.incident_id)) };
-      }
+      if (signature.normalized_signature === input.signatures.normalized_signature && signature.structural_signature === input.signatures.structural_signature && signature.provider === input.provider && signature.runtime === input.runtime && signature.runtime_major === input.runtime_major) return { observation_id: signature.observation_id, incident: this.getIncidentRequired(String(row.incident_id)) };
     }
     return null;
   }
-
   getObservation(observationId: string): FailureObservation | null {
-    const row = this.database.query("SELECT * FROM phase7_observations WHERE observation_id=?").get(observationId) as Record<string, unknown> | null;
+    const row = this.#database.query("SELECT * FROM phase7_observations WHERE observation_id=?").get(observationId) as Record<string, unknown> | null;
     if (!row) return null;
     try {
-      const observation = parseFailureObservation(JSON.parse(String(row.payload_json)), revisionId => {
-        const predecessor = this.database.query("SELECT payload_json FROM phase7_observation_revisions WHERE revision_id=?").get(revisionId) as { payload_json: string } | null;
-        return predecessor ? JSON.parse(predecessor.payload_json) : null;
-      });
-      const revisionRow = this.database.query("SELECT payload_json FROM phase7_observation_revisions WHERE revision_id=?").get(observation.revision_id) as { payload_json: string } | null;
-      if (!revisionRow || revisionRow.payload_json !== row.payload_json) throw new Error("tampered");
-      if (observation.observation_id !== row.observation_id || observation.revision_id !== row.current_revision_id || observation.revision !== row.current_revision || observation.canonical_hash !== row.canonical_hash || observation.scope.type !== row.scope_type || observation.scope.id !== row.scope_id) throw new Error("tampered");
+      const observation = this.readObservationRevision(String(row.current_revision_id), new Set());
+      if (observation.observation_id !== row.observation_id || observation.revision_id !== row.current_revision_id || observation.revision !== row.current_revision || observation.canonical_hash !== row.canonical_hash || observation.scope.type !== row.scope_type || observation.scope.id !== row.scope_id || JSON.stringify(observation) !== row.payload_json) throw new Error("tampered");
       return observation;
     } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
   }
-
   getObservationByRevision(revisionId: string): FailureObservation | null {
-    const row = this.database.query("SELECT observation_id FROM phase7_observation_revisions WHERE revision_id=?").get(revisionId) as { observation_id: string } | null;
-    return row ? this.getObservation(row.observation_id) : null;
+    const exists = this.#database.query("SELECT 1 AS present FROM phase7_observation_revisions WHERE revision_id=?").get(revisionId);
+    if (!exists) return null;
+    try { return this.readObservationRevision(revisionId, new Set()); } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
   }
-
   getIncident(incidentId: string): Incident | null {
-    const row = this.database.query("SELECT * FROM phase7_incidents WHERE incident_id=?").get(incidentId) as Record<string, unknown> | null;
+    const row = this.#database.query("SELECT * FROM phase7_incidents WHERE incident_id=?").get(incidentId) as Record<string, unknown> | null;
     if (!row) return null;
     try {
       const incident = parseIncident(JSON.parse(String(row.payload_json)));
       if (incident.incident_id !== row.incident_id || incident.revision !== row.current_revision || incident.revision_hash !== row.current_revision_hash || incident.scope.type !== row.scope_type || incident.scope.id !== row.scope_id || incident.status !== row.status) throw new Error("tampered");
-      const revisions = this.database.query("SELECT * FROM phase7_incident_revisions WHERE incident_id=? ORDER BY revision").all(incidentId) as Array<Record<string, unknown>>;
+      const revisionRows = this.#database.query("SELECT * FROM phase7_incident_revisions WHERE incident_id=? ORDER BY revision").all(incidentId) as Array<Record<string, unknown>>;
+      if (revisionRows.length !== incident.revision || revisionRows.length === 0) throw new Error("tampered");
       let previous: Incident | null = null;
-      for (const revisionRow of revisions) {
-        const revision = parseIncident(JSON.parse(String(revisionRow.payload_json)));
-        if (revision.incident_id !== incidentId || revision.revision !== revisionRow.revision || revision.revision_hash !== revisionRow.revision_hash || revision.previous_revision_hash !== revisionRow.previous_revision_hash || revision.scope.type !== revisionRow.scope_type || revision.scope.id !== revisionRow.scope_id || (previous && revision.previous_revision_hash !== previous.revision_hash)) throw new Error("tampered");
+      for (let index = 0; index < revisionRows.length; index += 1) {
+        const revisionRow = revisionRows[index]!; const revision = parseIncident(JSON.parse(String(revisionRow.payload_json)));
+        if (revision.revision !== index + 1 || revision.incident_id !== incidentId || revision.revision !== revisionRow.revision || revision.revision_hash !== revisionRow.revision_hash || revision.previous_revision_hash !== revisionRow.previous_revision_hash || revision.scope.type !== revisionRow.scope_type || revision.scope.id !== revisionRow.scope_id || (index === 0 && revision.previous_revision_hash !== null) || (previous && revision.previous_revision_hash !== previous.revision_hash)) throw new Error("tampered");
         previous = revision;
       }
       if (!previous || previous.revision_hash !== incident.revision_hash) throw new Error("tampered");
-      const links = this.database.query("SELECT observation_revision_id FROM phase7_incident_observations WHERE incident_id=? ORDER BY observation_revision_id").all(incidentId) as Array<{ observation_revision_id: string }>;
+      const links = this.#database.query("SELECT observation_revision_id FROM phase7_incident_observations WHERE incident_id=? ORDER BY observation_revision_id").all(incidentId) as Array<{ observation_revision_id: string }>;
       if (links.length !== incident.observation_ids.length || links.some(link => !incident.observation_ids.includes(link.observation_revision_id))) throw new Error("tampered");
-      for (const link of links) {
-        const observationRow = this.database.query("SELECT observation_id FROM phase7_observation_revisions WHERE revision_id=?").get(link.observation_revision_id) as { observation_id: string } | null;
-        const observation = observationRow ? this.getObservation(observationRow.observation_id) : null;
-        if (!observation || !samePhase7Scope(observation.scope, incident.scope)) throw new Error("tampered");
-      }
+      for (const link of links) { const observation = this.getObservationByRevision(link.observation_revision_id); if (!observation || !samePhase7Scope(observation.scope, incident.scope)) throw new Error("tampered"); }
       return incident;
-    } catch (error) {
-      if (error instanceof Error && error.message === "PHASE7_PERSISTENCE_TAMPERED") throw error;
-      throw new Error("PHASE7_PERSISTENCE_TAMPERED");
-    }
+    } catch (error) { if (error instanceof Error && error.message === "PHASE7_PERSISTENCE_TAMPERED") throw error; throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
   }
-
-  listIncidents(scope: Phase7Scope): Incident[] {
-    const rows = this.database.query("SELECT incident_id FROM phase7_incidents WHERE scope_type=? AND scope_id=? ORDER BY incident_id").all(scope.type, scope.id) as Array<{ incident_id: string }>;
-    return rows.map(row => this.getIncidentRequired(row.incident_id));
-  }
-
-  appendIncident(incidentInput: Incident, eventType: string, payload: Record<string, unknown>): Incident {
-    const incident = parseIncident(incidentInput);
-    return this.transaction(() => {
-      const current = this.getIncidentRequired(incident.incident_id);
-      if (incident.revision !== current.revision + 1 || incident.previous_revision_hash !== current.revision_hash || !samePhase7Scope(incident.scope, current.scope)) throw new Error("PHASE7_INCIDENT_REVISION_CONFLICT");
-      this.insertIncidentRevision(incident);
-      this.database.query("UPDATE phase7_incidents SET current_revision=?, current_revision_hash=?, status=?, payload_json=? WHERE incident_id=? AND current_revision=?")
-        .run(incident.revision, incident.revision_hash, incident.status, JSON.stringify(incident), incident.incident_id, current.revision);
-      for (const observationId of incident.observation_ids.filter(id => !current.observation_ids.includes(id))) {
-        this.database.query("INSERT INTO phase7_incident_observations (incident_id, observation_revision_id, linked_at) VALUES (?, ?, ?)").run(incident.incident_id, observationId, incident.change.at);
-      }
-      this.appendAudit(incident.incident_id, eventType, payload, incident.change.at);
-      return this.getIncidentRequired(incident.incident_id);
-    });
-  }
-
-  saveRecord(kind: IncidentRecordKind, input: { record_id: string; incident_id: string; scope_id: string; occurred_at: string; payload: Record<string, unknown> }): PersistedIncidentRecord {
-    assertSecretSafe(input);
-    const table = recordTables[kind];
-    const payloadHash = canonicalSha256(input.payload);
-    return this.transaction(() => {
-      const existing = this.database.query(`SELECT * FROM ${table} WHERE record_id=?`).get(input.record_id) as Record<string, unknown> | null;
-      if (existing) {
-        const decoded = decodeRecord(existing);
-        if (decoded.payload_hash !== payloadHash) throw new Error("PHASE7_RECORD_IDEMPOTENCY_CONFLICT");
-        return decoded;
-      }
-      const incident = this.getIncidentRequired(input.incident_id);
-      if (incident.scope.id !== input.scope_id) throw new Error("PHASE7_RECORD_SCOPE_MISMATCH");
-      this.database.query(`INSERT INTO ${table} (record_id, incident_id, scope_id, occurred_at, payload_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?)`)
-        .run(input.record_id, input.incident_id, input.scope_id, input.occurred_at, payloadHash, JSON.stringify(input.payload));
-      this.appendAudit(input.incident_id, kind, { record_id: input.record_id, payload_hash: payloadHash }, input.occurred_at);
-      return { ...input, payload_hash: payloadHash };
-    });
-  }
-
+  listIncidents(scope: Phase7Scope): Incident[] { return (this.#database.query("SELECT incident_id FROM phase7_incidents WHERE scope_type=? AND scope_id=? ORDER BY incident_id").all(scope.type, scope.id) as Array<{ incident_id: string }>).map(row => this.getIncidentRequired(row.incident_id)); }
   records(kind: IncidentRecordKind, incidentId: string): PersistedIncidentRecord[] {
-    const rows = this.database.query(`SELECT * FROM ${recordTables[kind]} WHERE incident_id=? ORDER BY occurred_at, record_id`).all(incidentId) as Array<Record<string, unknown>>;
-    return rows.map(row => {
-      const value = decodeRecord(row);
-      if (this.getIncidentRequired(incidentId).scope.id !== value.scope_id) throw new Error("PHASE7_PERSISTENCE_TAMPERED");
-      return value;
-    });
-  }
-
-  auditEvents(incidentId: string): Array<Record<string, unknown>> {
-    const rows = this.database.query("SELECT * FROM phase7_audit_events WHERE incident_id=? ORDER BY sequence").all(incidentId) as Array<Record<string, unknown>>;
-    return rows.map(row => {
-      try {
-        const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
-        if (canonicalSha256(payload) !== row.payload_hash || payload.event_id !== row.event_id || payload.incident_id !== row.incident_id || payload.sequence !== row.sequence || payload.event_type !== row.event_type || payload.occurred_at !== row.occurred_at) throw new Error("tampered");
-        return payload;
-      } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
-    });
-  }
-
-  relations(incidentId: string): IncidentRelation[] {
-    const rows = this.database.query("SELECT payload_json, payload_hash FROM phase7_incident_relations WHERE incident_id=? OR related_incident_id=? ORDER BY relation_id").all(incidentId, incidentId) as Array<{ payload_json: string; payload_hash: string }>;
-    return rows.map(row => {
-      const payload = JSON.parse(row.payload_json) as IncidentRelation;
-      if (canonicalSha256(payload) !== row.payload_hash) throw new Error("PHASE7_PERSISTENCE_TAMPERED");
-      return payload;
-    });
-  }
-
-  timeline(incidentId: string): Array<Record<string, unknown>> {
-    return this.auditEvents(incidentId);
-  }
-  provenance(incidentId: string): Record<string, unknown> {
+    if (!(INCIDENT_RECORD_KINDS as readonly string[]).includes(kind)) throw new Error("PHASE7_RECORD_KIND_INVALID");
     const incident = this.getIncidentRequired(incidentId);
-    return { incident_id: incidentId, revision_hash: incident.revision_hash, observation_revision_ids: incident.observation_ids, audit_event_ids: this.auditEvents(incidentId).map(event => event.event_id) };
+    const rows = this.#database.query(`SELECT * FROM ${recordTables[kind]} WHERE incident_id=? ORDER BY occurred_at, record_id`).all(incidentId) as Array<Record<string, unknown>>;
+    return rows.map(row => this.decodeRecordRow(kind, row, incident));
   }
-  health(): Record<string, unknown> {
-    const integrity = this.database.query("PRAGMA integrity_check").get() as Record<string, unknown>;
-    const journal = this.database.query("PRAGMA journal_mode").get() as Record<string, unknown>;
-    return { status: Object.values(integrity)[0] === "ok" ? "HEALTHY" : "DEGRADED", journal_mode: String(Object.values(journal)[0]).toLowerCase(), incidents: Number((this.database.query("SELECT COUNT(*) AS count FROM phase7_incidents").get() as { count: number }).count) };
+  getReproductionManifest(manifestId: string): ReproductionManifest | null {
+    const row = this.#database.query("SELECT * FROM phase7_reproduction_manifests WHERE record_id=?").get(manifestId) as Record<string, unknown> | null;
+    if (!row) return null;
+    const incident = this.getIncidentRequired(String(row.incident_id));
+    return this.decodeRecordRow("REPRODUCTION_MANIFEST", row, incident).payload as unknown as ReproductionManifest;
   }
+  auditEvents(incidentId: string): Array<Record<string, unknown>> {
+    return (this.#database.query("SELECT * FROM phase7_audit_events WHERE incident_id=? ORDER BY sequence").all(incidentId) as Array<Record<string, unknown>>).map(row => { try { const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>; if (canonicalSha256(payload) !== row.payload_hash || payload.event_id !== row.event_id || payload.incident_id !== row.incident_id || payload.sequence !== row.sequence || payload.event_type !== row.event_type || payload.occurred_at !== row.occurred_at) throw new Error("tampered"); return payload; } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); } });
+  }
+  relations(incidentId: string): IncidentRelation[] {
+    this.getIncidentRequired(incidentId);
+    const rows = this.#database.query("SELECT * FROM phase7_incident_relations WHERE incident_id=? OR related_incident_id=? ORDER BY relation_id").all(incidentId, incidentId) as Array<Record<string, unknown>>;
+    return rows.map(row => { try { const payload = JSON.parse(String(row.payload_json)) as IncidentRelation; if (Object.keys(payload).sort().join(",") !== "created_at,incident_id,reason,related_incident_id,relation_id,relation_type,scope" || canonicalSha256(payload) !== row.payload_hash || payload.relation_id !== row.relation_id || payload.incident_id !== row.incident_id || payload.related_incident_id !== row.related_incident_id || payload.relation_type !== row.relation_type || payload.relation_type !== "POSSIBLE_DUPLICATE" || ![payload.incident_id, payload.related_incident_id].includes(incidentId)) throw new Error("tampered"); const left = this.getIncidentRequired(payload.incident_id); const right = this.getIncidentRequired(payload.related_incident_id); if (left.incident_id === right.incident_id || !samePhase7Scope(left.scope, right.scope) || !samePhase7Scope(left.scope, payload.scope)) throw new Error("tampered"); return payload; } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); } });
+  }
+  getMemoryWriteBatch(batchId: string, expectedHash?: string): MemoryWriteBatch | null {
+    const row = this.#database.query("SELECT * FROM phase7_memory_write_batches WHERE batch_id=?").get(batchId) as Record<string, unknown> | null;
+    if (!row) return null;
+    try { const batch = memoryWriteBatchSchema.parse(JSON.parse(String(row.payload_json))); const { batch_hash, ...payload } = batch; assertMemoryBatchRecords(batch.records); if (canonicalSha256(payload) !== batch_hash || JSON.stringify(batch) !== row.payload_json || (expectedHash && expectedHash !== batch_hash) || batch.batch_id !== row.batch_id || batch.incident_id !== row.incident_id || batch.scope.id !== row.scope_id || batch.closure_revision_hash !== row.closure_revision_hash || batch.batch_hash !== row.batch_hash) throw new Error("tampered"); const closureRow = this.#database.query("SELECT * FROM phase7_incident_revisions WHERE incident_id=? AND revision_hash=?").get(batch.incident_id, batch.closure_revision_hash) as Record<string, unknown> | null; if (!closureRow) throw new Error("tampered"); const closure = parseIncident(JSON.parse(String(closureRow.payload_json))); if (closure.status !== "CLOSED" || closure.incident_id !== batch.incident_id || closure.revision_hash !== batch.closure_revision_hash || closure.revision_hash !== closureRow.revision_hash || closure.scope.type !== closureRow.scope_type || closure.scope.id !== closureRow.scope_id || !samePhase7Scope(closure.scope, batch.scope)) throw new Error("tampered"); this.getIncidentRequired(batch.incident_id); return batch; } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
+  }
+  timeline(incidentId: string): Array<Record<string, unknown>> { return this.auditEvents(incidentId); }
+  provenance(incidentId: string): Record<string, unknown> { const incident = this.getIncidentRequired(incidentId); return { incident_id: incidentId, revision_hash: incident.revision_hash, observation_revision_ids: incident.observation_ids, audit_event_ids: this.auditEvents(incidentId).map(event => event.event_id) }; }
+  health(): Record<string, unknown> { const integrity = this.#database.query("PRAGMA integrity_check").get() as Record<string, unknown>; const journal = this.#database.query("PRAGMA journal_mode").get() as Record<string, unknown>; return { status: Object.values(integrity)[0] === "ok" ? "HEALTHY" : "DEGRADED", journal_mode: String(Object.values(journal)[0]).toLowerCase(), incidents: Number((this.#database.query("SELECT COUNT(*) AS count FROM phase7_incidents").get() as { count: number }).count) }; }
 
-  private insertObservation(observation: FailureObservation): void {
-    const parsed = parseFailureObservation(observation);
-    this.database.query("INSERT INTO phase7_observation_revisions (revision_id, observation_id, revision, previous_revision_id, previous_observation_hash, scope_type, scope_id, canonical_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(parsed.revision_id, parsed.observation_id, parsed.revision, parsed.previous_revision_id, parsed.previous_observation_hash, parsed.scope.type, parsed.scope.id, parsed.canonical_hash, JSON.stringify(parsed));
-    this.database.query("INSERT INTO phase7_observations (observation_id, current_revision_id, current_revision, scope_type, scope_id, canonical_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(parsed.observation_id, parsed.revision_id, parsed.revision, parsed.scope.type, parsed.scope.id, parsed.canonical_hash, JSON.stringify(parsed));
+  private readObservationRevision(revisionId: string, visiting: Set<string>): FailureObservation {
+    if (visiting.has(revisionId)) throw new Error("tampered"); visiting.add(revisionId);
+    const row = this.#database.query("SELECT * FROM phase7_observation_revisions WHERE revision_id=?").get(revisionId) as Record<string, unknown> | null;
+    if (!row) throw new Error("tampered");
+    const observation = parseFailureObservation(JSON.parse(String(row.payload_json)), predecessorId => this.readObservationRevision(predecessorId, visiting));
+    visiting.delete(revisionId);
+    if (observation.revision_id !== revisionId || observation.revision_id !== row.revision_id || observation.observation_id !== row.observation_id || observation.revision !== row.revision || observation.previous_revision_id !== row.previous_revision_id || observation.previous_observation_hash !== row.previous_observation_hash || observation.scope.type !== row.scope_type || observation.scope.id !== row.scope_id || observation.canonical_hash !== row.canonical_hash) throw new Error("tampered");
+    return observation;
   }
-  private insertSignature(input: IngestionPersistenceInput): void {
-    const payload = { ...input.signatures, provider: input.provider, runtime: input.runtime, runtime_major: input.runtime_major, scope: input.observation.scope };
-    this.database.query("INSERT INTO phase7_signatures (observation_id, scope_type, scope_id, normalized_signature, structural_signature, exact_hash, environment_fingerprint, provider, runtime, runtime_major, payload_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(input.observation.observation_id, input.observation.scope.type, input.observation.scope.id, input.signatures.normalized_signature, input.signatures.structural_signature, input.signatures.exact_hash, input.signatures.environment_fingerprint, input.provider, input.runtime, input.runtime_major, canonicalSha256(payload), JSON.stringify(payload));
+  private decodeRecordRow(kind: IncidentRecordKind, row: Record<string, unknown>, incident: Incident): PersistedIncidentRecord {
+    try {
+      const envelope = incidentRecordEnvelopeSchema.parse(JSON.parse(String(row.payload_json))) as IncidentRecordEnvelope;
+      if (canonicalSha256(envelope) !== row.payload_hash || JSON.stringify(envelope) !== row.payload_json || envelope.record_type !== kind || envelope.record_id !== row.record_id || envelope.incident_id !== row.incident_id || envelope.scope.id !== row.scope_id || envelope.occurred_at !== row.occurred_at || envelope.incident_id !== incident.incident_id || !samePhase7Scope(envelope.scope, incident.scope)) throw new Error("tampered");
+      let manifest: ReproductionManifest | undefined;
+      if (kind === "REPRODUCTION") { const manifestId = (envelope.data as { manifest_id?: string }).manifest_id; if (!manifestId) throw new Error("tampered"); manifest = this.getRecordData("REPRODUCTION_MANIFEST", manifestId) as unknown as ReproductionManifest; }
+      const data = validateIncidentRecordData(kind, envelope.data, manifest);
+      if (recordIdentity(kind, data) !== envelope.record_id) throw new Error("tampered");
+      return { record_id: envelope.record_id, incident_id: envelope.incident_id, scope_id: envelope.scope.id, occurred_at: envelope.occurred_at, payload_hash: String(row.payload_hash), payload: data };
+    } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
   }
-  private insertIncident(incident: Incident): void {
-    const parsed = parseIncident(incident);
-    this.insertIncidentRevision(parsed);
-    this.database.query("INSERT INTO phase7_incidents (incident_id, current_revision, current_revision_hash, scope_type, scope_id, status, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(parsed.incident_id, parsed.revision, parsed.revision_hash, parsed.scope.type, parsed.scope.id, parsed.status, JSON.stringify(parsed));
-  }
-  private insertIncidentRevision(incident: Incident): void {
-    this.database.query("INSERT INTO phase7_incident_revisions (incident_id, revision, revision_hash, previous_revision_hash, scope_type, scope_id, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(incident.incident_id, incident.revision, incident.revision_hash, incident.previous_revision_hash, incident.scope.type, incident.scope.id, JSON.stringify(incident));
-  }
-  private insertRelation(relation: IncidentRelation): void {
-    const payloadHash = canonicalSha256(relation);
-    this.database.query("INSERT INTO phase7_incident_relations (relation_id, incident_id, related_incident_id, relation_type, payload_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(relation.relation_id, relation.incident_id, relation.related_incident_id, relation.relation_type, payloadHash, JSON.stringify(relation));
-  }
-  private appendAudit(incidentId: string, eventType: string, payload: Record<string, unknown>, occurredAt: string): void {
-    const sequence = Number((this.database.query("SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM phase7_audit_events WHERE incident_id=?").get(incidentId) as { next: number }).next);
-    const event = { event_id: `audit:${canonicalSha256({ incident_id: incidentId, sequence, event_type: eventType }).slice(7, 39)}`, incident_id: incidentId, sequence, event_type: eventType, occurred_at: occurredAt, payload };
-    this.database.query("INSERT INTO phase7_audit_events (event_id, incident_id, sequence, event_type, occurred_at, payload_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(event.event_id, incidentId, sequence, eventType, occurredAt, canonicalSha256(event), JSON.stringify(event));
-  }
-  private existingIngestion(sourceEventId: string, sourceHash: string): IngestionPersistenceResult | null {
-    const existing = this.database.query("SELECT * FROM phase7_ingestions WHERE source_event_id=?").get(sourceEventId) as Record<string, unknown> | null;
-    if (!existing) return null;
-    if (existing.source_hash !== sourceHash) throw new Error("PHASE7_INGESTION_IDEMPOTENCY_CONFLICT");
-    const stored = parseHashedPayload<IngestionPersistenceResult>(String(existing.payload_json), "result_hash");
-    if (stored.observation_id !== existing.observation_id || stored.incident_id !== existing.incident_id || stored.result_hash !== existing.result_hash || stored.created !== true || stored.duplicate !== false) throw new Error("PHASE7_PERSISTENCE_TAMPERED");
-    return { ...stored, created: false, duplicate: true };
+  private getRecordData(kind: IncidentRecordKind, recordId: string): Record<string, unknown> {
+    const row = this.#database.query(`SELECT * FROM ${recordTables[kind]} WHERE record_id=?`).get(recordId) as Record<string, unknown> | null;
+    if (!row) throw new Error("PHASE7_PERSISTENCE_TAMPERED"); const incident = this.getIncidentRequired(String(row.incident_id)); return this.decodeRecordRow(kind, row, incident).payload;
   }
   private getIncidentRequired(incidentId: string): Incident { return this.getIncident(incidentId) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); }
 }
 
-function decodeRecord(row: Record<string, unknown>): PersistedIncidentRecord {
-  try {
-    const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
-    if (canonicalSha256(payload) !== row.payload_hash) throw new Error("tampered");
-    return { record_id: String(row.record_id), incident_id: String(row.incident_id), scope_id: String(row.scope_id), occurred_at: String(row.occurred_at), payload_hash: String(row.payload_hash), payload };
-  } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
+export class Phase7RegistryWriter {
+  readonly #database: Database; readonly #registry: SqliteIncidentRegistry;
+  constructor(token: symbol, database: Database, registry: SqliteIncidentRegistry) { if (token !== writerToken) throw new Error("PHASE7_INTERNAL_WRITER_FORBIDDEN"); this.#database = database; this.#registry = registry; }
+  transaction<T>(operation: () => T): T { return this.#database.transaction(operation).immediate(); }
+  ingest(input: IngestionPersistenceInput): IngestionPersistenceResult {
+    const duplicate = this.existingIngestion(input.source_event_id, input.source_hash); if (duplicate) return duplicate;
+    const observation = parseFailureObservation(input.observation); const incident = parseIncident(input.incident);
+    if (input.relation) { const related = this.#registry.getIncident(input.relation.related_incident_id); if (input.correlation !== "POSSIBLE_DUPLICATE" || input.relation.incident_id !== incident.incident_id || input.relation.related_incident_id === incident.incident_id || !related || !samePhase7Scope(related.scope, incident.scope) || !samePhase7Scope(input.relation.scope, incident.scope)) throw new Error("PHASE7_RELATION_SCOPE_MISMATCH"); } else if (input.correlation === "POSSIBLE_DUPLICATE") throw new Error("PHASE7_RELATION_REQUIRED");
+    if (!samePhase7Scope(observation.scope, incident.scope) || !incident.observation_ids.includes(observation.revision_id)) throw new Error("PHASE7_INGESTION_SCOPE_MISMATCH");
+    return this.transaction(() => { const raced = this.existingIngestion(input.source_event_id, input.source_hash); if (raced) return raced; this.insertObservation(observation); this.insertSignature(input, observation); if (input.correlation === "AUTO_CORRELATED") this.updateIncidentProjection(incident); else this.insertIncident(incident); this.#database.query("INSERT INTO phase7_incident_observations (incident_id, observation_revision_id, linked_at) VALUES (?, ?, ?)").run(incident.incident_id, observation.revision_id, observation.observed_at); if (input.relation) this.insertRelation(input.relation); this.appendAudit(incident.incident_id, "OBSERVATION_INGESTED", { observation_id: observation.observation_id, source_event_id: input.source_event_id }, observation.observed_at); this.appendAudit(incident.incident_id, input.relation ? "INCIDENT_RELATED" : "INCIDENT_OPENED", { correlation: input.correlation, related_incident_id: input.relation?.related_incident_id ?? null }, observation.observed_at); const base = { created: true, duplicate: false, observation_id: observation.observation_id, incident_id: incident.incident_id, correlation: input.correlation }; const result: IngestionPersistenceResult = { ...base, result_hash: canonicalSha256(base) }; this.#database.query("INSERT INTO phase7_ingestions (source_event_id, source_hash, observation_id, incident_id, result_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?)").run(input.source_event_id, input.source_hash, result.observation_id, result.incident_id, result.result_hash, JSON.stringify(result)); return result; });
+  }
+  appendObservationRevision(revisionInput: FailureObservation): FailureObservation { const revision = parseFailureObservation(revisionInput, id => this.#registry.getObservationByRevision(id)); const current = this.#registry.getObservation(revision.observation_id) ?? fail("PHASE7_OBSERVATION_NOT_FOUND"); if (revision.revision !== current.revision + 1 || revision.previous_revision_id !== current.revision_id || revision.previous_observation_hash !== current.canonical_hash || !samePhase7Scope(revision.scope, current.scope)) throw new Error("PHASE7_OBSERVATION_REVISION_CONFLICT"); return this.transaction(() => { this.insertObservationRevision(revision); this.#database.query("UPDATE phase7_observations SET current_revision_id=?, current_revision=?, canonical_hash=?, payload_json=? WHERE observation_id=? AND current_revision=?").run(revision.revision_id, revision.revision, revision.canonical_hash, JSON.stringify(revision), revision.observation_id, current.revision); return this.#registry.getObservation(revision.observation_id)!; }); }
+  saveTriage(record: Record<string, unknown>): PersistedIncidentRecord { return this.saveTypedRecord("TRIAGE", record, String(record.record_id), String(record.incident_id), record.scope as Phase7Scope, String(record.at)); }
+  saveContainment(record: Record<string, unknown>): PersistedIncidentRecord { const parsed = validateIncidentRecordData("CONTAINMENT", record); const latestTriage = this.#registry.records("TRIAGE", String(parsed.incident_id)).at(-1)?.payload; const a5 = latestTriage?.required_approval === "A5"; const approved = parsed.approved_by as { type?: string; id?: string } | null; const lowAutonomy = ["A0", "A1", "A2"].includes(String(parsed.autonomy)); const validApproval = approved !== null && (approved.type === "human" || /(^|:)security(?=:|$)/.test(String(approved.id))); if (parsed.state === "EXECUTED" && (parsed.reversible !== true || !lowAutonomy || (a5 && !validApproval))) throw new Error("PHASE7_CONTAINMENT_TRANSITION_INVALID"); if (a5 && parsed.required_approval !== "A5") throw new Error("PHASE7_CONTAINMENT_A5_REQUIRED"); return this.saveTypedRecord("CONTAINMENT", parsed, String(parsed.record_id), String(parsed.incident_id), parsed.scope as Phase7Scope, String(parsed.at)); }
+  persistReproductionManifest(manifestInput: ReproductionManifest): PersistedIncidentRecord { const manifest = parseReproductionManifest(manifestInput); const incident = this.#registry.getIncident(manifest.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); if (!samePhase7Scope(incident.scope, manifest.scope) || !this.incidentHasSignature(incident, manifest.expected_signature)) throw new Error("REPRODUCTION_MANIFEST_AUTHORITY_MISMATCH"); return this.saveTypedRecord("REPRODUCTION_MANIFEST", manifest as unknown as Record<string, unknown>, manifest.manifest_id, manifest.incident_id, manifest.scope, manifest.created_at); }
+  recordReproduction(resultInput: ReproductionResult, nextInput: Incident, actor: { at: string }): Incident { const result = parseReproductionResult(resultInput, this.getManifest(resultInput.manifest_id)); const current = this.#registry.getIncident(result.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); const next = parseIncident(nextInput); const expectedState = result.classification === "REPRODUCIBLE" ? "REPRODUCIBLE" : result.classification === "INTERMITTENT" ? "INTERMITTENT" : "NON_REPRODUCIBLE"; if (next.reproduction.state !== expectedState || JSON.stringify(next.reproduction.evidence_refs) !== JSON.stringify(result.attempts.map(item => item.evidence_ref))) throw new Error("REPRODUCTION_INCIDENT_TRANSITION_MISMATCH"); return this.transaction(() => { this.saveTypedRecord("REPRODUCTION", result as unknown as Record<string, unknown>, result.result_id, result.incident_id, result.scope, actor.at); return this.appendRevision(current, next, "REPRODUCTION_RECORDED", { result_id: result.result_id, classification: result.classification }); }); }
+  appendHypothesis(nextInput: Incident, hypothesisId: string): Incident { const next = parseIncident(nextInput); const current = this.#registry.getIncident(next.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); if (!next.hypotheses.some(item => item.hypothesis_id === hypothesisId) || next.hypotheses.length !== current.hypotheses.length + 1) throw new Error("PHASE7_HYPOTHESIS_TRANSITION_INVALID"); return this.appendRevision(current, next, "HYPOTHESIS_ADDED", { hypothesis_id: hypothesisId }); }
+  recordExperiment(record: Record<string, unknown>, nextInput: Incident): Incident { const next = parseIncident(nextInput); const current = this.#registry.getIncident(next.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); const parsed = validateIncidentRecordData("HYPOTHESIS_EVIDENCE", record); const hypothesis = next.hypotheses.find(item => item.hypothesis_id === parsed.hypothesis_id); const expected = parsed.outcome === "SUPPORTS" ? "SUPPORTED" : "REJECTED"; if (!hypothesis || hypothesis.status !== expected) throw new Error("PHASE7_EXPERIMENT_TRANSITION_INVALID"); return this.transaction(() => { this.saveTypedRecord("HYPOTHESIS_EVIDENCE", parsed, String(parsed.experiment_id), next.incident_id, next.scope, String(parsed.at)); return this.appendRevision(current, next, "EXPERIMENT_RECORDED", { experiment_id: parsed.experiment_id, outcome: parsed.outcome }); }); }
+  recordRootCause(record: Record<string, unknown>, nextInput: Incident): Incident { const next = parseIncident(nextInput); const current = this.#registry.getIncident(next.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); const parsed = validateIncidentRecordData("ROOT_CAUSE", record); if (next.root_cause.state !== "CONFIRMED" || next.root_cause.adjudication_id !== parsed.adjudication_id || JSON.stringify(next.root_cause) !== JSON.stringify(parsed.root_cause)) throw new Error("PHASE7_ROOT_CAUSE_TRANSITION_INVALID"); return this.transaction(() => { this.saveTypedRecord("ROOT_CAUSE", parsed, String(parsed.adjudication_id), next.incident_id, next.scope, String(parsed.at)); return this.appendRevision(current, next, "ROOT_CAUSE_CONFIRMED", { adjudication_id: parsed.adjudication_id }); }); }
+  saveRemediation(record: RemediationProposalRecord): PersistedIncidentRecord { return this.saveTypedRecord("REMEDIATION", record as unknown as Record<string, unknown>, record.proposal_id, record.incident_id, record.scope, record.at); }
+  saveRegression(record: RegressionResultRecord): PersistedIncidentRecord { this.assertRemediationBinding(record.incident_id, record.remediation_id, record.plan_hash, record.patch_hash); return this.saveTypedRecord("REGRESSION", record as unknown as Record<string, unknown>, record.regression_id, record.incident_id, record.scope, record.at); }
+  saveReview(record: ReviewVerdictRecord): PersistedIncidentRecord { const proposal = this.assertRemediationBinding(record.incident_id, record.proposal_id, record.plan_hash, record.patch_hash); if (proposal.evidence_refs.some(ref => !record.evidence_refs.includes(ref))) throw new Error("REMEDIATION_REVIEW_EVIDENCE_MISMATCH"); return this.saveTypedRecord("REVIEW", record as unknown as Record<string, unknown>, record.review_id, record.incident_id, record.scope, record.at); }
+  closeIncident(nextInput: Incident, playbookInput: PlaybookCandidate, lineageId: string): Incident { const next = parseIncident(nextInput); const current = this.#registry.getIncident(next.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); const playbook = parsePlaybookCandidate(playbookInput); const lineage = this.validClosureLineage(next.incident_id).find(item => item.proposal.proposal_id === lineageId); if (!lineage || next.status !== "CLOSED" || next.root_cause.state !== "CONFIRMED" || next.reproduction.state !== "REPRODUCIBLE" || playbook.source_incident_id !== next.incident_id || playbook.trigger_signature !== next.revision_hash || playbook.title !== lineage.proposal.summary || JSON.stringify(playbook.steps) !== JSON.stringify(lineage.proposal.steps)) throw new Error("INCIDENT_CLOSE_REMEDIATION_LINEAGE_REQUIRED"); return this.transaction(() => { const value = this.appendRevision(current, next, "INCIDENT_CLOSED", { remediation_id: lineageId, production_repair_claimed: false }); this.saveTypedRecord("PLAYBOOK", playbook as unknown as Record<string, unknown>, playbook.candidate_id, next.incident_id, next.scope, playbook.created_at); return value; }); }
+  reopenIncident(nextInput: Incident): Incident { const next = parseIncident(nextInput); const current = this.#registry.getIncident(next.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); if (current.status !== "CLOSED" || next.status !== "OPEN" || next.stage !== "INVESTIGATING") throw new Error("PHASE7_REOPEN_TRANSITION_INVALID"); return this.appendRevision(current, next, "INCIDENT_REOPENED", { reason: next.change.reason }); }
+  saveMemoryWriteBatch(batchInput: MemoryWriteBatch): MemoryWriteBatch { const batch = memoryWriteBatchSchema.parse(batchInput); assertMemoryBatchRecords(batch.records); const { batch_hash, ...payload } = batch; if (canonicalSha256(payload) !== batch_hash) throw new Error("PHASE7_MEMORY_BATCH_HASH_MISMATCH"); const incident = this.#registry.getIncident(batch.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); if (!samePhase7Scope(batch.scope, incident.scope) || batch.closure_revision_hash !== incident.revision_hash || incident.status !== "CLOSED") throw new Error("PHASE7_MEMORY_BATCH_CLOSURE_MISMATCH"); return this.transaction(() => { const existing = this.#registry.getMemoryWriteBatch(batch.batch_id, batch.batch_hash); if (existing) return existing; this.#database.query("INSERT INTO phase7_memory_write_batches (batch_id, incident_id, scope_id, closure_revision_hash, batch_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?)").run(batch.batch_id, batch.incident_id, batch.scope.id, batch.closure_revision_hash, batch.batch_hash, JSON.stringify(batch)); return this.#registry.getMemoryWriteBatch(batch.batch_id, batch.batch_hash)!; }); }
+
+  private validClosureLineage(incidentId: string): Array<{ proposal: RemediationProposalRecord }> { const proposals = this.#registry.records("REMEDIATION", incidentId).map(item => item.payload as unknown as RemediationProposalRecord); const regressions = this.#registry.records("REGRESSION", incidentId).map(item => item.payload as unknown as RegressionResultRecord); const reviews = this.#registry.records("REVIEW", incidentId).map(item => item.payload as unknown as ReviewVerdictRecord); return proposals.filter(proposal => regressions.some(item => item.remediation_id === proposal.proposal_id && item.plan_hash === proposal.plan_hash && item.patch_hash === proposal.patch_hash && item.phase === "BEFORE" && item.result === "FAIL") && regressions.some(item => item.remediation_id === proposal.proposal_id && item.plan_hash === proposal.plan_hash && item.patch_hash === proposal.patch_hash && item.phase === "AFTER" && item.result === "PASS") && reviews.some(item => item.proposal_id === proposal.proposal_id && item.plan_hash === proposal.plan_hash && item.patch_hash === proposal.patch_hash && item.verdict === "APPROVED" && item.independent)).map(proposal => ({ proposal })); }
+  private assertRemediationBinding(incidentId: string, proposalId: string, planHash: string, patchHash: string): RemediationProposalRecord { const proposal = this.#registry.records("REMEDIATION", incidentId).find(item => item.record_id === proposalId)?.payload as unknown as RemediationProposalRecord | undefined; if (!proposal || proposal.plan_hash !== planHash || proposal.patch_hash !== patchHash) throw new Error("REMEDIATION_LINEAGE_MISMATCH"); return proposal; }
+  private incidentHasSignature(incident: Incident, signature: string): boolean { for (const revisionId of incident.observation_ids) { const observation = this.#registry.getObservationByRevision(revisionId); if (!observation) continue; const row = this.#database.query("SELECT normalized_signature, payload_json, payload_hash FROM phase7_signatures WHERE observation_id=?").get(observation.observation_id) as Record<string, unknown> | null; if (row) { const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>; if (canonicalSha256(payload) !== row.payload_hash) throw new Error("PHASE7_PERSISTENCE_TAMPERED"); if (row.normalized_signature === signature && payload.normalized_signature === signature) return true; } } return false; }
+  private getManifest(manifestId: string): ReproductionManifest { return this.#registry.getReproductionManifest(manifestId) ?? fail("REPRODUCTION_MANIFEST_NOT_FOUND"); }
+  private saveTypedRecord(kind: IncidentRecordKind, dataInput: Record<string, unknown>, recordId: string, incidentId: string, scope: Phase7Scope, occurredAt: string): PersistedIncidentRecord { assertSecretSafe(dataInput); const incident = this.#registry.getIncident(incidentId) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); if (!samePhase7Scope(incident.scope, scope)) throw new Error("PHASE7_RECORD_SCOPE_MISMATCH"); let manifest: ReproductionManifest | undefined; if (kind === "REPRODUCTION") manifest = this.getManifest(String(dataInput.manifest_id)); const data = validateIncidentRecordData(kind, dataInput, manifest); if (recordIdentity(kind, data) !== recordId) throw new Error("PHASE7_RECORD_IDENTITY_INVALID"); const envelope: IncidentRecordEnvelope = { schema_version: 1, record_type: kind, record_id: recordId, incident_id: incidentId, scope, occurred_at: occurredAt, data }; const payloadHash = canonicalSha256(envelope); return this.transaction(() => { const table = recordTables[kind]; const existing = this.#database.query(`SELECT * FROM ${table} WHERE record_id=?`).get(recordId) as Record<string, unknown> | null; if (existing) { const decoded = this.#registry.records(kind, incidentId).find(item => item.record_id === recordId); if (!decoded || decoded.payload_hash !== payloadHash) throw new Error("PHASE7_RECORD_IDEMPOTENCY_CONFLICT"); return decoded; } this.#database.query(`INSERT INTO ${table} (record_id, incident_id, scope_id, occurred_at, payload_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?)`).run(recordId, incidentId, scope.id, occurredAt, payloadHash, JSON.stringify(envelope)); this.appendAudit(incidentId, kind, { record_id: recordId, payload_hash: payloadHash }, occurredAt); return this.#registry.records(kind, incidentId).find(item => item.record_id === recordId)!; }); }
+  private appendRevision(current: Incident, next: Incident, eventType: string, payload: Record<string, unknown>): Incident { if (next.revision !== current.revision + 1 || next.previous_revision_hash !== current.revision_hash || !samePhase7Scope(next.scope, current.scope)) throw new Error("PHASE7_INCIDENT_REVISION_CONFLICT"); return this.transaction(() => { this.insertIncidentRevision(next); this.#database.query("UPDATE phase7_incidents SET current_revision=?, current_revision_hash=?, status=?, payload_json=? WHERE incident_id=? AND current_revision=?").run(next.revision, next.revision_hash, next.status, JSON.stringify(next), next.incident_id, current.revision); for (const observationId of next.observation_ids.filter(id => !current.observation_ids.includes(id))) this.#database.query("INSERT INTO phase7_incident_observations (incident_id, observation_revision_id, linked_at) VALUES (?, ?, ?)").run(next.incident_id, observationId, next.change.at); this.appendAudit(next.incident_id, eventType, payload, next.change.at); return this.#registry.getIncident(next.incident_id)!; }); }
+  private insertObservation(observation: FailureObservation): void { this.insertObservationRevision(observation); this.#database.query("INSERT INTO phase7_observations (observation_id, current_revision_id, current_revision, scope_type, scope_id, canonical_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(observation.observation_id, observation.revision_id, observation.revision, observation.scope.type, observation.scope.id, observation.canonical_hash, JSON.stringify(observation)); }
+  private insertObservationRevision(observation: FailureObservation): void { this.#database.query("INSERT INTO phase7_observation_revisions (revision_id, observation_id, revision, previous_revision_id, previous_observation_hash, scope_type, scope_id, canonical_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(observation.revision_id, observation.observation_id, observation.revision, observation.previous_revision_id, observation.previous_observation_hash, observation.scope.type, observation.scope.id, observation.canonical_hash, JSON.stringify(observation)); }
+  private insertSignature(input: IngestionPersistenceInput, observation: FailureObservation): void { const payload = { ...input.signatures, provider: input.provider, runtime: input.runtime, runtime_major: input.runtime_major, scope: observation.scope }; this.#database.query("INSERT INTO phase7_signatures (observation_id, scope_type, scope_id, normalized_signature, structural_signature, exact_hash, environment_fingerprint, provider, runtime, runtime_major, payload_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(observation.observation_id, observation.scope.type, observation.scope.id, input.signatures.normalized_signature, input.signatures.structural_signature, input.signatures.exact_hash, input.signatures.environment_fingerprint, input.provider, input.runtime, input.runtime_major, canonicalSha256(payload), JSON.stringify(payload)); }
+  private insertIncident(incident: Incident): void { this.insertIncidentRevision(incident); this.#database.query("INSERT INTO phase7_incidents (incident_id, current_revision, current_revision_hash, scope_type, scope_id, status, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(incident.incident_id, incident.revision, incident.revision_hash, incident.scope.type, incident.scope.id, incident.status, JSON.stringify(incident)); }
+  private updateIncidentProjection(incident: Incident): void { const current = this.#registry.getIncident(incident.incident_id) ?? fail("PHASE7_INCIDENT_NOT_FOUND"); if (incident.revision !== current.revision + 1 || incident.previous_revision_hash !== current.revision_hash) throw new Error("PHASE7_INCIDENT_REVISION_CONFLICT"); this.insertIncidentRevision(incident); this.#database.query("UPDATE phase7_incidents SET current_revision=?, current_revision_hash=?, status=?, payload_json=? WHERE incident_id=? AND current_revision=?").run(incident.revision, incident.revision_hash, incident.status, JSON.stringify(incident), incident.incident_id, current.revision); }
+  private insertIncidentRevision(incident: Incident): void { this.#database.query("INSERT INTO phase7_incident_revisions (incident_id, revision, revision_hash, previous_revision_hash, scope_type, scope_id, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(incident.incident_id, incident.revision, incident.revision_hash, incident.previous_revision_hash, incident.scope.type, incident.scope.id, JSON.stringify(incident)); }
+  private insertRelation(relation: IncidentRelation): void { this.#database.query("INSERT INTO phase7_incident_relations (relation_id, incident_id, related_incident_id, relation_type, payload_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?)").run(relation.relation_id, relation.incident_id, relation.related_incident_id, relation.relation_type, canonicalSha256(relation), JSON.stringify(relation)); }
+  private appendAudit(incidentId: string, eventType: string, payload: Record<string, unknown>, occurredAt: string): void { const sequence = Number((this.#database.query("SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM phase7_audit_events WHERE incident_id=?").get(incidentId) as { next: number }).next); const event = { event_id: `audit:${canonicalSha256({ incident_id: incidentId, sequence, event_type: eventType }).slice(7, 39)}`, incident_id: incidentId, sequence, event_type: eventType, occurred_at: occurredAt, payload }; this.#database.query("INSERT INTO phase7_audit_events (event_id, incident_id, sequence, event_type, occurred_at, payload_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(event.event_id, incidentId, sequence, eventType, occurredAt, canonicalSha256(event), JSON.stringify(event)); }
+  private existingIngestion(sourceEventId: string, sourceHash: string): IngestionPersistenceResult | null { const existing = this.#database.query("SELECT * FROM phase7_ingestions WHERE source_event_id=?").get(sourceEventId) as Record<string, unknown> | null; if (!existing) return null; if (existing.source_hash !== sourceHash) throw new Error("PHASE7_INGESTION_IDEMPOTENCY_CONFLICT"); const stored = parseHashedPayload<IngestionPersistenceResult>(String(existing.payload_json), "result_hash"); if (stored.observation_id !== existing.observation_id || stored.incident_id !== existing.incident_id || stored.result_hash !== existing.result_hash || stored.created !== true || stored.duplicate !== false) throw new Error("PHASE7_PERSISTENCE_TAMPERED"); return { ...stored, created: false, duplicate: true }; }
 }
-function decodeSignatureRow(row: Record<string, unknown>): {
-  observation_id: string; normalized_signature: string; structural_signature: string; provider: string; runtime: string; runtime_major: number;
-} {
-  try {
-    const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
-    const scope = payload.scope as { type?: unknown; id?: unknown };
-    if (canonicalSha256(payload) !== row.payload_hash
-      || payload.normalized_signature !== row.normalized_signature
-      || payload.structural_signature !== row.structural_signature
-      || payload.exact_hash !== row.exact_hash
-      || payload.environment_fingerprint !== row.environment_fingerprint
-      || payload.provider !== row.provider
-      || payload.runtime !== row.runtime
-      || payload.runtime_major !== row.runtime_major
-      || scope.type !== row.scope_type || scope.id !== row.scope_id
-      || row.scope_type !== row.observation_scope_type || row.scope_id !== row.observation_scope_id
-      || typeof row.observation_id !== "string" || typeof row.incident_id !== "string") throw new Error("tampered");
-    for (const hash of [payload.normalized_signature, payload.structural_signature, payload.exact_hash, payload.environment_fingerprint]) {
-      if (typeof hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(hash)) throw new Error("tampered");
-    }
-    if (typeof payload.provider !== "string" || typeof payload.runtime !== "string" || !Number.isSafeInteger(payload.runtime_major)) throw new Error("tampered");
-    return { observation_id: row.observation_id, normalized_signature: payload.normalized_signature as string, structural_signature: payload.structural_signature as string, provider: payload.provider, runtime: payload.runtime, runtime_major: payload.runtime_major as number };
-  } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
-}
-function parseHashedPayload<T extends object>(json: string, hashKey: keyof T): T {
-  try {
-    const value = JSON.parse(json) as T;
-    const { [hashKey]: hash, ...payload } = value;
-    if (canonicalSha256(payload) !== hash) throw new Error("tampered");
-    return value;
-  } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); }
-}
-function assertSecretSafe(value: unknown): void {
-  try { assertNoStructuredPhase1Secret(value); assertNoPhase1Secret(JSON.stringify(value), "Phase 7 incident record"); }
-  catch { throw new Error("PHASE7_RECORD_SECRET_REJECTED"); }
-}
+
+export function getPhase7RegistryWriter(registry: SqliteIncidentRegistry): Phase7RegistryWriter { return writers.get(registry) ?? fail("PHASE7_INTERNAL_WRITER_NOT_FOUND"); }
+
+function decodeSignatureRow(row: Record<string, unknown>): { observation_id: string; normalized_signature: string; structural_signature: string; provider: string; runtime: string; runtime_major: number } { try { const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>; const scope = payload.scope as { type?: unknown; id?: unknown }; if (canonicalSha256(payload) !== row.payload_hash || payload.normalized_signature !== row.normalized_signature || payload.structural_signature !== row.structural_signature || payload.exact_hash !== row.exact_hash || payload.environment_fingerprint !== row.environment_fingerprint || payload.provider !== row.provider || payload.runtime !== row.runtime || payload.runtime_major !== row.runtime_major || scope.type !== row.scope_type || scope.id !== row.scope_id || row.scope_type !== row.observation_scope_type || row.scope_id !== row.observation_scope_id || typeof row.observation_id !== "string" || typeof row.incident_id !== "string") throw new Error("tampered"); for (const hash of [payload.normalized_signature, payload.structural_signature, payload.exact_hash, payload.environment_fingerprint]) if (typeof hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(hash)) throw new Error("tampered"); if (typeof payload.provider !== "string" || typeof payload.runtime !== "string" || !Number.isSafeInteger(payload.runtime_major)) throw new Error("tampered"); return { observation_id: row.observation_id, normalized_signature: payload.normalized_signature as string, structural_signature: payload.structural_signature as string, provider: payload.provider, runtime: payload.runtime, runtime_major: payload.runtime_major as number }; } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); } }
+function parseHashedPayload<T extends object>(json: string, hashKey: keyof T): T { try { const value = JSON.parse(json) as T; const { [hashKey]: hash, ...payload } = value; if (canonicalSha256(payload) !== hash) throw new Error("tampered"); return value; } catch { throw new Error("PHASE7_PERSISTENCE_TAMPERED"); } }
+function assertSecretSafe(value: unknown): void { try { assertNoStructuredPhase1Secret(value); assertNoPhase1Secret(JSON.stringify(value), "Phase 7 incident record"); } catch { throw new Error("PHASE7_RECORD_SECRET_REJECTED"); } }
 function fail(message: string): never { throw new Error(message); }

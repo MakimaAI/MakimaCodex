@@ -1,17 +1,13 @@
-import { mkdirSync, readFileSync } from "node:fs";
-import { extname, join, resolve } from "node:path";
+import { mkdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { SqliteOperationsStore } from "../oef/operations";
 import { SqliteMemoryStore } from "../oef/phase6";
 import {
   IncidentIntelligenceService,
   SqliteIncidentRegistry,
   SqlitePhase6IncidentMemoryWriter,
-  collectPhase2Failure,
   runPhase7AcceptanceDemo,
-  type ConfirmRootCauseInput,
   type Phase7Scope,
-  type TriagePriority,
-  type TriageSeverity,
 } from "../oef/phase7";
 
 interface ParsedArgs { positionals: string[]; options: Map<string, string | true>; json: boolean }
@@ -27,6 +23,7 @@ export async function cmdOefPhase7(group: string, args: string[]): Promise<numbe
       print(report, parsed.json);
       return report.status === "PASS" ? 0 : 1;
     }
+    if (["ingest", "triage", "root-cause", "close", "reopen", "containment"].includes(command)) throw new Error("PHASE7_AUTHORIZATION_REQUIRED");
     const home = resolve(option(parsed, "home") ?? join(process.cwd(), ".opencodex", "incidents"));
     mkdirSync(home, { recursive: true });
     const registry = new SqliteIncidentRegistry({ databasePath: join(home, "incidents.sqlite") });
@@ -51,24 +48,13 @@ export async function cmdOefPhase7(group: string, args: string[]): Promise<numbe
 }
 
 async function incidentCommand(command: string, parsed: ParsedArgs, registry: SqliteIncidentRegistry, service: IncidentIntelligenceService): Promise<unknown> {
-  if (command === "help") return { commands: ["ingest", "list", "show", "timeline", "triage", "root-cause", "close", "reopen", "provenance", "explain", "health", "demo"], json_supported: true, foundation_only: true };
-  if (command === "ingest") return service.ingest(collectPhase2Failure(parseDataFile(required(parsed, "file"))));
+  if (command === "help") return { read_commands: ["list", "show", "timeline", "provenance", "explain", "health", "demo"], blocked_mutations: ["ingest", "triage", "root-cause", "close", "reopen", "containment"], json_supported: true, foundation_only: true };
   if (command === "list") return registry.listIncidents(parseScope(required(parsed, "scope")));
   if (command === "show") return registry.getIncident(positional(parsed, 1, "incident id")) ?? fail("PHASE7_INCIDENT_NOT_FOUND");
   if (command === "timeline") return registry.timeline(positional(parsed, 1, "incident id"));
   if (command === "provenance") return registry.provenance(positional(parsed, 1, "incident id"));
   if (command === "explain") return service.explain(positional(parsed, 1, "incident id"));
   if (command === "health") return registry.health();
-  if (command === "triage") return service.triage(positional(parsed, 1, "incident id"), {
-    severity: enumOption(parsed, "severity", ["LOW", "MEDIUM", "HIGH", "CRITICAL"], "MEDIUM") as TriageSeverity,
-    priority: enumOption(parsed, "priority", ["P0", "P1", "P2", "P3"], "P2") as TriagePriority,
-    confidence: numberOption(parsed, "confidence", 0.8),
-    actor: { type: "human", id: option(parsed, "actor") ?? "human:local-owner" },
-    at: new Date().toISOString(),
-  });
-  if (command === "root-cause") return service.confirmRootCause(positional(parsed, 1, "incident id"), parseDataFile(required(parsed, "file")) as ConfirmRootCauseInput, { at: new Date().toISOString() });
-  if (command === "close") return service.close(positional(parsed, 1, "incident id"), { actor: { type: "human", id: option(parsed, "actor") ?? "human:local-owner" }, reason: required(parsed, "reason"), at: new Date().toISOString() });
-  if (command === "reopen") return service.reopen(positional(parsed, 1, "incident id"), { actor: { type: "human", id: option(parsed, "actor") ?? "human:local-owner" }, reason: required(parsed, "reason"), at: new Date().toISOString() });
   if (["research", "reproduce", "minimize", "repair", "deploy", "plugins", "critic"].includes(command)) throw new Error("PHASE7_FOUNDATION_COMMAND_UNSUPPORTED");
   throw new Error("PHASE7_COMMAND_UNKNOWN");
 }
@@ -96,12 +82,6 @@ function parseScope(value: string): Phase7Scope {
   if (!['ATTEMPT','TASK','REPOSITORY','PROJECT','USER','ROLE','MODEL','PROVIDER','ORGANIZATION','GLOBAL'].includes(type)) throw new Error("PHASE7_SCOPE_INVALID");
   return { type: type as Phase7Scope["type"], id: value.slice(separator + 1) };
 }
-function parseDataFile(pathInput: string): unknown {
-  const path = resolve(pathInput); const source = readFileSync(path, "utf8");
-  return extname(path).toLowerCase() === ".json" ? JSON.parse(source) : Bun.YAML.parse(source);
-}
-function enumOption(parsed: ParsedArgs, key: string, allowed: string[], fallback: string): string { const value = (option(parsed, key) ?? fallback).toUpperCase(); return allowed.includes(value) ? value : fail(`PHASE7_${key.toUpperCase()}_INVALID`); }
-function numberOption(parsed: ParsedArgs, key: string, fallback: number): number { const raw = option(parsed, key); if (!raw) return fallback; const value = Number(raw); return Number.isFinite(value) ? value : fail(`PHASE7_${key.toUpperCase()}_INVALID`); }
 function option(parsed: ParsedArgs, key: string): string | undefined { const value = parsed.options.get(key); return typeof value === "string" ? value : undefined; }
 function required(parsed: ParsedArgs, key: string): string { return option(parsed, key) ?? fail(`Missing required option --${key}`); }
 function positional(parsed: ParsedArgs, index: number, label: string): string { return parsed.positionals[index] ?? fail(`Missing ${label}`); }

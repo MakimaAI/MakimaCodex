@@ -69,7 +69,7 @@ const helpEntries: Record<string, HelpEntry> = {
     summary: "Run the deterministic multi-role Phase 5 acceptance scenario.",
   },
   memory: {
-    usage: "ocx memory <search|show|provenance|explain-query|correct|deprecate|forget|reindex|health> [options] [--json]",
+    usage: "ocx memory <search|show|provenance|explain-query|candidates|promote|correct|deprecate|forget|hygiene|health|audit|reindex|reembed|backup|restore> [options] [--json]",
     summary: "Query and govern the local-first Phase 6 Memory OS.",
     details: ["Search requires at least one explicit --scope; memory content is returned as evidence, never as system instruction."],
   },
@@ -78,9 +78,9 @@ const helpEntries: Record<string, HelpEntry> = {
     summary: "Run the Phase 6 revision, recall, provenance, and injection-dedup acceptance scenario.",
   },
   incident: {
-    usage: "ocx incident <ingest|list|show|timeline|triage|root-cause|close|reopen|provenance|explain|health|demo> [options] [--json]",
+    usage: "ocx incident <list|show|timeline|provenance|explain|health|demo> [options] [--json]",
     summary: "Operate the Phase 7 incident-intelligence foundation registry.",
-    details: ["Research, repair, deployment, plugin fleets, and the full Phase 7 command surface remain deferred."],
+    details: ["Read commands and the deterministic demo are available. Mutations return PHASE7_AUTHORIZATION_REQUIRED until authenticated authority resolution lands; research, repair, deployment, plugin fleets, and the full Phase 7 command surface remain deferred."],
   },
   "oef-phase7-demo": {
     usage: "ocx oef-phase7-demo --root <artifact-directory> --commit-sha <sha> [--json]",

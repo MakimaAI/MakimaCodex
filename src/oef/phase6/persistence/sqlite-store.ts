@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { canonicalSha256 } from "../../phase1/core/contract/task-contract";
 import {
   assertMemoryPersistenceSafe,
   assertMemoryRecordIntegrity,
@@ -15,6 +16,17 @@ import {
   type MemoryStatus,
 } from "../core/domain";
 import type { LexicalMemoryQuery, MemoryMetadataQuery, MemoryRecordStore, MemoryRetrievalStore, MemorySearchHit } from "../storage/ports";
+import {
+  memoryCandidateSchema,
+  memoryIngestionJobSchema,
+  type MemoryCandidate,
+  type MemoryIngestionJob,
+} from "../ingestion/pipeline";
+import {
+  assertMemoryArtifactReceiptsAuthentic,
+  type MemoryDeletionJob,
+  type VerifiedMemoryArtifactReceipt,
+} from "../governance/operations";
 
 export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStore {
   private readonly database: Database;
@@ -22,8 +34,10 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
   constructor(options: { databasePath: string }) {
     this.database = new Database(options.databasePath, { create: true, strict: true });
     this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
-    const migration = readFileSync(join(import.meta.dir, "migrations", "001_memory_core.sql"), "utf8");
-    this.database.exec(migration);
+    const migrationRoot = join(import.meta.dir, "migrations");
+    for (const file of readdirSync(migrationRoot).filter(file => /^\d+_.+\.sql$/.test(file)).sort()) {
+      this.database.exec(readFileSync(join(migrationRoot, file), "utf8"));
+    }
   }
 
   close(): void { this.database.close(); }
@@ -39,6 +53,7 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
     this.transaction(() => {
       const tombstone = this.database.query("SELECT memory_id FROM memory_tombstones WHERE memory_id=?").get(record.memory_id);
       if (tombstone) throw new Error("MEMORY_ID_TOMBSTONED");
+      this.assertNoDeletedRelationTargets(record);
       const existing = this.database.query("SELECT current_revision_id, payload_json FROM memory_records WHERE memory_id=?").get(record.memory_id) as { current_revision_id: string; payload_json: string } | null;
       if (existing) {
         const current = decodeRecord(existing.payload_json);
@@ -55,6 +70,7 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
     this.transaction(() => {
       const tombstone = this.database.query("SELECT memory_id FROM memory_tombstones WHERE memory_id=?").get(revision.memory_id);
       if (tombstone) throw new Error("MEMORY_ID_TOMBSTONED");
+      this.assertNoDeletedRelationTargets(revision);
       const current = this.database.query("SELECT current_revision_number, current_revision_id FROM memory_records WHERE memory_id=?").get(revision.memory_id) as { current_revision_number: number; current_revision_id: string } | null;
       if (!current || current.current_revision_number !== expectedRevision || revision.revision_number !== expectedRevision + 1 || revision.previous_revision_id !== current.current_revision_id) {
         throw new Error("MEMORY_REVISION_CONFLICT");
@@ -139,6 +155,7 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
   }
 
   link(relation: MemoryRelation): void {
+    this.assertReferencesNotFenced([relation.from_memory_id, relation.to_memory_id]);
     if (!this.get(relation.from_memory_id) || !this.get(relation.to_memory_id)) throw new Error("MEMORY_RELATION_RECORD_NOT_FOUND");
     this.database.query("INSERT OR IGNORE INTO memory_relations (relation_id, relation_type, from_memory_id, to_memory_id, created_at, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
       .run(relation.relation_id, relation.type, relation.from_memory_id, relation.to_memory_id, relation.created_at, JSON.stringify(relation));
@@ -283,6 +300,150 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
       .run(pack.pack_id, pack.query_id, pack.pack_hash, createdAt, JSON.stringify(pack));
   }
 
+  enqueueIngestionJob(job: MemoryIngestionJob): { job: MemoryIngestionJob; deduplicated: boolean } {
+    const parsed = memoryIngestionJobSchema.parse(job);
+    assertMemoryPersistenceSafe(parsed);
+    return this.transaction(() => {
+      const existing = this.database.query("SELECT payload_json FROM memory_jobs WHERE json_extract(payload_json, '$.idempotency_key')=?")
+        .get(parsed.idempotency_key) as { payload_json: string } | null;
+      if (existing) {
+        const current = memoryIngestionJobSchema.parse(JSON.parse(existing.payload_json));
+        if (current.event_hash !== parsed.event_hash) throw new Error("MEMORY_JOB_IDEMPOTENCY_CONFLICT");
+        return { job: current, deduplicated: true };
+      }
+      this.database.query("INSERT INTO memory_jobs (job_id, status, priority, payload_json) VALUES (?, ?, ?, ?)")
+        .run(parsed.job_id, parsed.status, parsed.priority, JSON.stringify(parsed));
+      return { job: parsed, deduplicated: false };
+    });
+  }
+
+  inspectIngestionJob(jobId: string): MemoryIngestionJob | null {
+    const row = this.database.query("SELECT payload_json FROM memory_jobs WHERE job_id=?").get(jobId) as { payload_json: string } | null;
+    return row ? memoryIngestionJobSchema.parse(JSON.parse(row.payload_json)) : null;
+  }
+
+  claimIngestionJob(input: { worker_id: string; now: string; lease_expires_at: string }): MemoryIngestionJob | null {
+    assertMemoryPersistenceSafe(input);
+    return this.transaction(() => {
+      const now = Date.parse(input.now);
+      const rows = this.database.query("SELECT payload_json FROM memory_jobs WHERE status IN ('QUEUED', 'RETRY', 'LEASED') ORDER BY priority DESC, job_id")
+        .all() as Array<{ payload_json: string }>;
+      const eligible = rows
+        .map(row => memoryIngestionJobSchema.parse(JSON.parse(row.payload_json)))
+        .filter(job => (job.status === "LEASED"
+          ? job.lease_expires_at !== null && Date.parse(job.lease_expires_at) <= now
+          : Date.parse(job.next_attempt_at) <= now))
+        .sort((left, right) => right.priority - left.priority || left.created_at.localeCompare(right.created_at) || left.job_id.localeCompare(right.job_id))[0];
+      if (!eligible) return null;
+      const leased = memoryIngestionJobSchema.parse({
+        ...eligible,
+        status: "LEASED",
+        attempt_count: eligible.attempt_count + 1,
+        lease_owner: input.worker_id,
+        lease_token: `${eligible.job_id}:lease-${eligible.attempt_count + 1}`,
+        lease_expires_at: input.lease_expires_at,
+        updated_at: input.now,
+      });
+      this.persistMemoryJob(leased);
+      const attemptId = `${leased.job_id}:attempt-${leased.attempt_count}`;
+      this.database.query("INSERT OR REPLACE INTO memory_job_attempts (attempt_id, job_id, payload_json) VALUES (?, ?, ?)")
+        .run(attemptId, leased.job_id, JSON.stringify({
+          attempt_id: attemptId,
+          job_id: leased.job_id,
+          attempt_number: leased.attempt_count,
+          worker_id: input.worker_id,
+          status: "LEASED",
+          started_at: input.now,
+          lease_expires_at: input.lease_expires_at,
+        }));
+      return leased;
+    });
+  }
+
+  completeIngestionJob(input: { job_id: string; worker_id: string; lease_token: string; at: string; output_memory_ids: string[] }): MemoryIngestionJob {
+    assertMemoryPersistenceSafe(input);
+    return this.transaction(() => {
+      const current = this.requireLeasedJob(input.job_id, input.worker_id, input.lease_token, input.at);
+      const completed = memoryIngestionJobSchema.parse({
+        ...current,
+        status: "COMPLETED",
+        lease_owner: null,
+        lease_token: null,
+        lease_expires_at: null,
+        output_memory_ids: [...new Set(input.output_memory_ids)],
+        updated_at: input.at,
+      });
+      this.persistMemoryJob(completed);
+      this.finishJobAttempt(completed, "COMPLETED", input.at, null);
+      return completed;
+    });
+  }
+
+  failIngestionJob(input: { job_id: string; worker_id: string; lease_token: string; at: string; error: { code: string; message: string } }): MemoryIngestionJob {
+    assertMemoryPersistenceSafe(input);
+    return this.transaction(() => {
+      const current = this.requireLeasedJob(input.job_id, input.worker_id, input.lease_token, input.at);
+      const status = current.attempt_count >= current.max_attempts ? "DEAD_LETTER" : "RETRY";
+      const failed = memoryIngestionJobSchema.parse({
+        ...current,
+        status,
+        lease_owner: null,
+        lease_token: null,
+        lease_expires_at: null,
+        next_attempt_at: input.at,
+        last_error: input.error,
+        updated_at: input.at,
+      });
+      this.persistMemoryJob(failed);
+      this.finishJobAttempt(failed, status, input.at, input.error);
+      return failed;
+    });
+  }
+
+  saveMemoryCandidate(candidate: MemoryCandidate): { candidate: MemoryCandidate; deduplicated: boolean } {
+    const parsed = memoryCandidateSchema.parse(candidate);
+    assertMemoryPersistenceSafe(parsed);
+    return this.transaction(() => {
+      const existing = this.database.query("SELECT payload_json FROM memory_candidates WHERE idempotency_key=? OR candidate_id=? ORDER BY candidate_id LIMIT 1")
+        .get(parsed.idempotency_key, parsed.candidate_id) as { payload_json: string } | null;
+      if (existing) {
+        const current = memoryCandidateSchema.parse(JSON.parse(existing.payload_json));
+        if (current.idempotency_key !== parsed.idempotency_key || canonicalCandidate(current) !== canonicalCandidate(parsed)) {
+          throw new Error("MEMORY_CANDIDATE_IDEMPOTENCY_CONFLICT");
+        }
+        return { candidate: current, deduplicated: true };
+      }
+      this.database.query("INSERT INTO memory_candidates (candidate_id, idempotency_key, status, payload_json) VALUES (?, ?, ?, ?)")
+        .run(parsed.candidate_id, parsed.idempotency_key, parsed.status, JSON.stringify(parsed));
+      return { candidate: parsed, deduplicated: false };
+    });
+  }
+
+  getMemoryCandidate(candidateId: string): MemoryCandidate | null {
+    const row = this.database.query("SELECT payload_json FROM memory_candidates WHERE candidate_id=?").get(candidateId) as { payload_json: string } | null;
+    return row ? memoryCandidateSchema.parse(JSON.parse(row.payload_json)) : null;
+  }
+
+  listMemoryCandidates(status?: MemoryCandidate["status"]): MemoryCandidate[] {
+    const rows = status
+      ? this.database.query("SELECT payload_json FROM memory_candidates WHERE status=? ORDER BY candidate_id").all(status)
+      : this.database.query("SELECT payload_json FROM memory_candidates ORDER BY candidate_id").all();
+    return (rows as Array<{ payload_json: string }>).map(row => memoryCandidateSchema.parse(JSON.parse(row.payload_json)));
+  }
+
+  decideMemoryCandidate(candidate: MemoryCandidate): void {
+    const parsed = memoryCandidateSchema.parse(candidate);
+    assertMemoryPersistenceSafe(parsed);
+    this.transaction(() => {
+      const current = this.getMemoryCandidate(parsed.candidate_id);
+      if (!current) throw new Error("MEMORY_CANDIDATE_NOT_FOUND");
+      if (current.status !== "CANDIDATE") throw new Error("MEMORY_CANDIDATE_ALREADY_DECIDED");
+      if (parsed.status === "CANDIDATE" || !parsed.decided_at || !parsed.decided_by) throw new Error("MEMORY_CANDIDATE_DECISION_INVALID");
+      this.database.query("UPDATE memory_candidates SET status=?, payload_json=? WHERE candidate_id=? AND status='CANDIDATE'")
+        .run(parsed.status, JSON.stringify(parsed), parsed.candidate_id);
+    });
+  }
+
   reindexLexical(): { indexed_revisions: number } {
     return this.transaction(() => {
       this.database.exec("DELETE FROM memory_fts;");
@@ -298,10 +459,21 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
     });
   }
 
-  forget(memoryId: string, input: { mode: "SOFT_FORGET" | "HARD_DELETE" | "LEGAL_DELETE" | "SECRET_PURGE"; reason: string; at: string }): void {
+  forget(memoryId: string, input: { mode: "SOFT_FORGET" | "HARD_DELETE" | "LEGAL_DELETE" | "SECRET_PURGE"; reason: string; at: string; deletion_receipt?: { job_id: string; receipt_hash: string } }): void {
     assertMemoryPersistenceSafe(input);
     if (!input.reason.trim() || input.reason.length > 500 || !Number.isFinite(Date.parse(input.at))) throw new Error("MEMORY_FORGET_COMMAND_INVALID");
-    if (input.mode === "LEGAL_DELETE" || input.mode === "SECRET_PURGE") throw new Error("MEMORY_DELETE_MODE_NOT_IMPLEMENTED");
+    if (input.mode === "LEGAL_DELETE" || input.mode === "SECRET_PURGE") {
+      const receipt = input.deletion_receipt;
+      const job = receipt ? this.getDeletionJob(receipt.job_id) : null;
+      const expectedReceipts = job ? [...job.artifact_receipts].sort((a, b) => a.reference.localeCompare(b.reference)) : [];
+      const receiptRefs = new Set(expectedReceipts.map(value => value.reference));
+      const expectedHash = job ? canonicalSha256({ memory_ids: job.memory_ids, revision_ids: job.revision_ids, artifact_receipts: expectedReceipts }) : "";
+      if (!receipt || !job || job.status !== "ARTIFACTS_VERIFIED" || job.receipt_hash !== receipt.receipt_hash || job.receipt_hash !== expectedHash
+        || !job.memory_ids.includes(memoryId) || expectedReceipts.some(value => !["PURGED", "VERIFIED_ABSENT"].includes(value.status))
+        || receiptRefs.size !== job.artifact_refs.length || job.artifact_refs.some(reference => !receiptRefs.has(reference))) {
+        throw new Error("MEMORY_DELETE_ARTIFACT_RECEIPT_REQUIRED");
+      }
+    }
     const current = this.get(memoryId);
     if (!current) throw new Error("MEMORY_NOT_FOUND");
     this.transaction(() => {
@@ -327,12 +499,168 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
           this.database.query("DELETE FROM memory_conflicts WHERE conflict_id=?").run(conflict.conflict_id);
         }
         this.database.query("DELETE FROM memory_fts WHERE memory_id=?").run(memoryId);
+        this.database.query("DELETE FROM memory_vector_entries WHERE memory_id=?").run(memoryId);
+        for (const table of ["memory_candidates", "memory_feedback", "memory_jobs", "memory_job_attempts"] as const) {
+          const id = table === "memory_candidates" ? "candidate_id"
+            : table === "memory_feedback" ? "feedback_id"
+              : table === "memory_jobs" ? "job_id" : "attempt_id";
+          const rows = this.database.query(`SELECT ${id} AS id, payload_json FROM ${table}`).all() as Array<{ id: string; payload_json: string }>;
+          for (const row of rows) if (payloadContainsExactReference(row.payload_json, new Set([memoryId, ...revisions.map(revision => revision.revision_id)]))) {
+            this.database.query(`DELETE FROM ${table} WHERE ${id}=?`).run(row.id);
+          }
+        }
         this.database.query("DELETE FROM memory_records WHERE memory_id=?").run(memoryId);
         this.database.query("DELETE FROM memory_revisions WHERE memory_id=?").run(memoryId);
       }
       this.database.query("INSERT OR REPLACE INTO memory_tombstones (memory_id, deleted_at, reason, mode, content_retained) VALUES (?, ?, ?, ?, ?)")
         .run(memoryId, input.at, input.reason, input.mode, input.mode === "SOFT_FORGET" ? 1 : 0);
     });
+  }
+
+  planMemoryDeletion(memoryId: string): { memory_ids: string[]; revision_ids: string[]; artifact_refs: string[] } {
+    if (!this.get(memoryId)) throw new Error("MEMORY_NOT_FOUND");
+    const records = this.listCurrentRecords();
+    const selected = new Set([memoryId]);
+    const revisionIds = new Set<string>();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      revisionIds.clear();
+      for (const selectedId of selected) {
+        const rows = this.database.query("SELECT revision_id FROM memory_revisions WHERE memory_id=?").all(selectedId) as Array<{ revision_id: string }>;
+        for (const row of rows) revisionIds.add(row.revision_id);
+      }
+      for (const record of records) {
+        if (selected.has(record.memory_id)) continue;
+        if (record.relations.derived_from.some(reference => selected.has(reference) || revisionIds.has(reference))) {
+          selected.add(record.memory_id); changed = true;
+        }
+      }
+    }
+    revisionIds.clear();
+    const artifactRefs = new Set<string>();
+    for (const selectedId of selected) {
+      const rows = this.database.query("SELECT revision_id, payload_json FROM memory_revisions WHERE memory_id=? ORDER BY revision_number").all(selectedId) as Array<{ revision_id: string; payload_json: string }>;
+      for (const row of rows) {
+        revisionIds.add(row.revision_id);
+        const revision = decodeRecord(row.payload_json);
+        for (const reference of revision.provenance.source_refs) if (reference.startsWith("artifact:")) artifactRefs.add(reference);
+      }
+    }
+    return { memory_ids: [...selected].sort(), revision_ids: [...revisionIds].sort(), artifact_refs: [...artifactRefs].sort() };
+  }
+
+  prepareDeletionJob(job: MemoryDeletionJob): void {
+    assertMemoryPersistenceSafe(job);
+    if (job.status !== "PREPARED" || job.receipt_hash !== null || job.artifact_receipts.length !== 0 || job.canonical_deleted.length !== 0) throw new Error("MEMORY_DELETION_JOB_INVALID");
+    this.transaction(() => {
+      const currentPlan = this.planMemoryDeletion(job.root_memory_id);
+      if (JSON.stringify(currentPlan) !== JSON.stringify({ memory_ids: job.memory_ids, revision_ids: job.revision_ids, artifact_refs: job.artifact_refs })) throw new Error("MEMORY_DELETION_PLAN_CHANGED");
+      const existing = this.getDeletionJob(job.job_id);
+      if (existing) {
+        if (JSON.stringify({ ...existing, updated_at: job.updated_at }) !== JSON.stringify({ ...job, updated_at: job.updated_at })) throw new Error("MEMORY_DELETION_JOB_IMMUTABLE");
+        return;
+      }
+      this.persistDeletionJob(job, false);
+      const insert = this.database.query("INSERT INTO memory_deletion_fences (reference_id, job_id, status, created_at) VALUES (?, ?, 'ACTIVE', ?)");
+      for (const reference of [...job.memory_ids, ...job.revision_ids]) {
+        const fence = this.database.query("SELECT job_id FROM memory_deletion_fences WHERE reference_id=?").get(reference) as { job_id: string } | null;
+        if (fence && fence.job_id !== job.job_id) throw new Error("MEMORY_DELETION_FENCE_CONFLICT");
+        if (!fence) insert.run(reference, job.job_id, job.created_at);
+      }
+    });
+  }
+
+  verifyDeletionArtifacts(jobId: string, receipts: VerifiedMemoryArtifactReceipt[], at: string): MemoryDeletionJob {
+    const job = this.getDeletionJob(jobId) ?? failMemory("MEMORY_DELETION_JOB_NOT_FOUND");
+    if (!["PREPARED", "FAILED"].includes(job.status)) throw new Error("MEMORY_DELETION_JOB_TRANSITION_INVALID");
+    assertMemoryArtifactReceiptsAuthentic(jobId, receipts);
+    const sorted = [...receipts].sort((a, b) => a.reference.localeCompare(b.reference));
+    const refs = new Set(sorted.map(receipt => receipt.reference));
+    if (sorted.length !== job.artifact_refs.length || refs.size !== job.artifact_refs.length || job.artifact_refs.some(reference => !refs.has(reference))
+      || sorted.some(receipt => !["PURGED", "VERIFIED_ABSENT"].includes(receipt.status))) throw new Error("MEMORY_DELETE_ARTIFACT_RECEIPTS_INCOMPLETE");
+    const persistedReceipts = sorted.map(({ reference, status }) => ({
+      reference, status: status as "PURGED" | "VERIFIED_ABSENT",
+    }));
+    const receiptHash = canonicalSha256({ memory_ids: job.memory_ids, revision_ids: job.revision_ids, artifact_receipts: persistedReceipts });
+    const next: MemoryDeletionJob = { ...job, artifact_receipts: persistedReceipts, receipt_hash: receiptHash, status: "ARTIFACTS_VERIFIED", last_error: null, updated_at: at };
+    this.persistDeletionJob(next, true); return next;
+  }
+
+  resumeVerifiedDeletionJob(jobId: string, at: string): MemoryDeletionJob {
+    const job = this.getDeletionJob(jobId) ?? failMemory("MEMORY_DELETION_JOB_NOT_FOUND");
+    if (job.status !== "FAILED" || !job.receipt_hash) throw new Error("MEMORY_DELETION_JOB_TRANSITION_INVALID");
+    const refs = new Set(job.artifact_receipts.map(receipt => receipt.reference));
+    if (job.artifact_receipts.length !== job.artifact_refs.length || refs.size !== job.artifact_refs.length
+      || job.artifact_refs.some(reference => !refs.has(reference))) throw new Error("MEMORY_DELETE_ARTIFACT_RECEIPTS_INCOMPLETE");
+    const expectedHash = canonicalSha256({
+      memory_ids: job.memory_ids,
+      revision_ids: job.revision_ids,
+      artifact_receipts: [...job.artifact_receipts].sort((a, b) => a.reference.localeCompare(b.reference)),
+    });
+    if (expectedHash !== job.receipt_hash) throw new Error("MEMORY_DELETE_ARTIFACT_RECEIPT_REQUIRED");
+    const next: MemoryDeletionJob = { ...job, status: "ARTIFACTS_VERIFIED", last_error: null, updated_at: at };
+    this.persistDeletionJob(next, true); return next;
+  }
+
+  recordDeletionProgress(jobId: string, memoryId: string, at: string): MemoryDeletionJob {
+    const job = this.getDeletionJob(jobId) ?? failMemory("MEMORY_DELETION_JOB_NOT_FOUND");
+    if (job.status !== "ARTIFACTS_VERIFIED" || !job.memory_ids.includes(memoryId)) throw new Error("MEMORY_DELETION_JOB_TRANSITION_INVALID");
+    const next = { ...job, canonical_deleted: [...new Set([...job.canonical_deleted, memoryId])].sort(), updated_at: at };
+    this.persistDeletionJob(next, true); return next;
+  }
+
+  assertDeletionClosureComplete(jobId: string): void {
+    const job = this.getDeletionJob(jobId) ?? failMemory("MEMORY_DELETION_JOB_NOT_FOUND");
+    const references = new Set([...job.memory_ids, ...job.revision_ids]);
+    for (const record of this.listCurrentRecords()) {
+      if (record.relations.derived_from.some(reference => references.has(reference))) throw new Error("MEMORY_DELETION_CLOSURE_CHANGED");
+    }
+    if (job.memory_ids.some(memoryId => this.get(memoryId))) throw new Error("MEMORY_DELETION_CLOSURE_INCOMPLETE");
+  }
+
+  completeDeletionJob(jobId: string, at: string): MemoryDeletionJob {
+    const job = this.getDeletionJob(jobId) ?? failMemory("MEMORY_DELETION_JOB_NOT_FOUND");
+    if (job.status !== "ARTIFACTS_VERIFIED" || job.canonical_deleted.length !== job.memory_ids.length) throw new Error("MEMORY_DELETION_JOB_TRANSITION_INVALID");
+    const next: MemoryDeletionJob = { ...job, status: "COMPLETED", updated_at: at };
+    this.transaction(() => {
+      this.persistDeletionJob(next, true);
+      this.database.query("UPDATE memory_deletion_fences SET status='COMPLETED' WHERE job_id=?").run(jobId);
+    });
+    return next;
+  }
+
+  failDeletionJob(jobId: string, error: string, at: string): void {
+    const job = this.getDeletionJob(jobId);
+    if (!job || job.status === "COMPLETED") return;
+    this.persistDeletionJob({ ...job, status: "FAILED", last_error: error, updated_at: at }, true);
+  }
+
+  getDeletionJob(jobId: string): MemoryDeletionJob | null {
+    const row = this.database.query("SELECT payload_json FROM memory_deletion_jobs WHERE job_id=?").get(jobId) as { payload_json: string } | null;
+    return row ? JSON.parse(row.payload_json) as MemoryDeletionJob : null;
+  }
+
+  getTombstone(memoryId: string): { memory_id: string; deleted_at: string; reason: string; mode: string; content_retained: boolean } | null {
+    const row = this.database.query("SELECT memory_id, deleted_at, reason, mode, content_retained FROM memory_tombstones WHERE memory_id=?").get(memoryId) as {
+      memory_id: string; deleted_at: string; reason: string; mode: string; content_retained: number;
+    } | null;
+    return row ? { ...row, content_retained: row.content_retained === 1 } : null;
+  }
+
+  listCurrentRecords(): MemoryRecord[] {
+    return (this.database.query("SELECT payload_json FROM memory_records ORDER BY memory_id").all() as Array<{ payload_json: string }>)
+      .map(row => decodeRecord(row.payload_json));
+  }
+
+  saveHealthSnapshot(snapshot: Record<string, unknown>): void {
+    assertMemoryPersistenceSafe(snapshot);
+    const observedAt = typeof snapshot.at === "string" && Number.isFinite(Date.parse(snapshot.at))
+      ? new Date(snapshot.at).toISOString()
+      : new Date().toISOString();
+    const snapshotId = `memory-health:${observedAt.replace(/[^0-9]/g, "")}`;
+    this.database.query("INSERT OR REPLACE INTO memory_health_snapshots (snapshot_id, observed_at, payload_json) VALUES (?, ?, ?)")
+      .run(snapshotId, observedAt, JSON.stringify(snapshot));
   }
 
   health(): Record<string, unknown> {
@@ -344,8 +672,15 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
     let integrityFailures = 0;
     let projectionFailures = 0;
     let lexicalFailures = 0;
+    let provenanceFailures = 0;
     const payloads = this.database.query("SELECT payload_json FROM memory_revisions").all() as Array<{ payload_json: string }>;
-    for (const row of payloads) { try { decodeRecord(row.payload_json); } catch { integrityFailures += 1; } }
+    for (const row of payloads) {
+      try {
+        const revision = decodeRecord(row.payload_json);
+        const projectedRefs = (this.database.query("SELECT source_ref FROM memory_provenance WHERE revision_id=? ORDER BY source_ref").all(revision.revision_id) as Array<{ source_ref: string }>).map(value => value.source_ref);
+        if (JSON.stringify(projectedRefs) !== JSON.stringify([...revision.provenance.source_refs].sort())) provenanceFailures += 1;
+      } catch { integrityFailures += 1; }
+    }
     const currentRows = this.database.query(`SELECT memory_id, current_revision_id, current_revision_number, layer, kind, lifecycle_status,
       trust_level, trust_rank, confidence, sensitivity, sensitivity_rank, valid_from, valid_until, payload_json FROM memory_records ORDER BY memory_id`).all() as Array<Record<string, string | number | null>>;
     for (const row of currentRows) {
@@ -371,7 +706,7 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
       } catch { integrityFailures += 1; }
     }
     return {
-      canonical_store: Object.values(integrity ?? {})[0] === "ok" && integrityFailures === 0 && projectionFailures === 0 ? "HEALTHY" : "DEGRADED",
+      canonical_store: Object.values(integrity ?? {})[0] === "ok" && integrityFailures === 0 && projectionFailures === 0 && provenanceFailures === 0 ? "HEALTHY" : "DEGRADED",
       lexical_index: lexicalFailures === 0 && fts.count === canonical.count ? "HEALTHY" : "DEGRADED",
       canonical_records: canonical.count,
       revisions: revisions.count,
@@ -380,6 +715,7 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
       integrity_failures: integrityFailures,
       projection_failures: projectionFailures,
       lexical_failures: lexicalFailures,
+      provenance_failures: provenanceFailures,
     };
   }
 
@@ -403,6 +739,55 @@ export class SqliteMemoryStore implements MemoryRecordStore, MemoryRetrievalStor
     for (const source of record.provenance.source_refs) provenanceInsert.run(record.revision_id, source);
     this.database.query("INSERT INTO memory_fts (revision_id, memory_id, summary, structured_json) VALUES (?, ?, ?, ?)")
       .run(record.revision_id, record.memory_id, record.content.summary, JSON.stringify(record.content.structured ?? {}));
+  }
+
+  private persistMemoryJob(job: MemoryIngestionJob): void {
+    this.database.query("UPDATE memory_jobs SET status=?, priority=?, payload_json=? WHERE job_id=?")
+      .run(job.status, job.priority, JSON.stringify(job), job.job_id);
+  }
+
+  private persistDeletionJob(job: MemoryDeletionJob, update: boolean): void {
+    if (update) {
+      this.database.query("UPDATE memory_deletion_jobs SET status=?, receipt_hash=?, updated_at=?, payload_json=? WHERE job_id=?")
+        .run(job.status, job.receipt_hash, job.updated_at, JSON.stringify(job), job.job_id);
+    } else {
+      this.database.query("INSERT INTO memory_deletion_jobs (job_id, root_memory_id, status, receipt_hash, created_at, updated_at, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(job.job_id, job.root_memory_id, job.status, job.receipt_hash, job.created_at, job.updated_at, JSON.stringify(job));
+    }
+  }
+
+  private assertNoDeletedRelationTargets(record: MemoryRecord): void {
+    this.assertReferencesNotFenced([...record.relations.derived_from, ...record.relations.supersedes, ...record.relations.contradicts]);
+  }
+
+  private assertReferencesNotFenced(references: string[]): void {
+    for (const reference of references) {
+      if (this.database.query("SELECT 1 FROM memory_deletion_fences WHERE reference_id=?").get(reference)
+        || this.database.query("SELECT 1 FROM memory_tombstones WHERE memory_id=? AND mode IN ('LEGAL_DELETE','SECRET_PURGE')").get(reference)) {
+        throw new Error("MEMORY_RELATION_TARGET_DELETION_PENDING");
+      }
+    }
+  }
+
+  private requireLeasedJob(jobId: string, workerId: string, leaseToken: string, at: string): MemoryIngestionJob {
+    const current = this.inspectIngestionJob(jobId);
+    if (!current) throw new Error("MEMORY_JOB_NOT_FOUND");
+    if (current.status !== "LEASED" || current.lease_owner !== workerId || current.lease_token !== leaseToken) throw new Error("MEMORY_JOB_LEASE_MISMATCH");
+    if (!current.lease_expires_at || Date.parse(current.lease_expires_at) <= Date.parse(at)) throw new Error("MEMORY_JOB_LEASE_EXPIRED");
+    return current;
+  }
+
+  private finishJobAttempt(job: MemoryIngestionJob, status: string, at: string, error: { code: string; message: string } | null): void {
+    const attemptId = `${job.job_id}:attempt-${job.attempt_count}`;
+    this.database.query("INSERT OR REPLACE INTO memory_job_attempts (attempt_id, job_id, payload_json) VALUES (?, ?, ?)")
+      .run(attemptId, job.job_id, JSON.stringify({
+        attempt_id: attemptId,
+        job_id: job.job_id,
+        attempt_number: job.attempt_count,
+        status,
+        finished_at: at,
+        error,
+      }));
   }
 
   private searchCurrent(query: MemoryMetadataQuery, ftsQuery: string | null): MemorySearchHit[] {
@@ -487,3 +872,10 @@ function buildFtsQuery(text: string): string {
     .map(token => `"${token.replaceAll('"', '""')}"`)
     .join(" OR ");
 }
+
+function canonicalCandidate(candidate: MemoryCandidate): string {
+  const { status: _status, promoted_memory_id: _memoryId, decided_at: _decidedAt, decided_by: _decidedBy, ...proposal } = candidate;
+  return JSON.stringify(proposal);
+}
+
+function failMemory(message: string): never { throw new Error(message); }

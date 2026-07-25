@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS phase7_incident_relations (
 
 CREATE TABLE IF NOT EXISTS phase7_triage_records (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS phase7_containment_records (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS phase7_reproduction_manifests (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS phase7_reproduction_results (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS phase7_hypothesis_evidence (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS phase7_root_causes (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
@@ -96,6 +97,7 @@ CREATE TABLE IF NOT EXISTS phase7_remediation_proposals (record_id TEXT PRIMARY 
 CREATE TABLE IF NOT EXISTS phase7_regression_results (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS phase7_review_verdicts (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS phase7_playbook_candidates (record_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS phase7_memory_write_batches (batch_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, scope_id TEXT NOT NULL, closure_revision_hash TEXT NOT NULL, batch_hash TEXT NOT NULL, payload_json TEXT NOT NULL);
 
 CREATE TRIGGER IF NOT EXISTS phase7_observation_revision_update_block BEFORE UPDATE ON phase7_observation_revisions BEGIN SELECT RAISE(ABORT, 'phase7 observation revisions are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS phase7_observation_revision_delete_block BEFORE DELETE ON phase7_observation_revisions BEGIN SELECT RAISE(ABORT, 'phase7 observation revisions are append-only'); END;
@@ -116,6 +118,8 @@ CREATE TRIGGER IF NOT EXISTS phase7_triage_update_block BEFORE UPDATE ON phase7_
 CREATE TRIGGER IF NOT EXISTS phase7_triage_delete_block BEFORE DELETE ON phase7_triage_records BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS phase7_containment_update_block BEFORE UPDATE ON phase7_containment_records BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS phase7_containment_delete_block BEFORE DELETE ON phase7_containment_records BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS phase7_reproduction_manifest_update_block BEFORE UPDATE ON phase7_reproduction_manifests BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS phase7_reproduction_manifest_delete_block BEFORE DELETE ON phase7_reproduction_manifests BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS phase7_reproduction_update_block BEFORE UPDATE ON phase7_reproduction_results BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS phase7_reproduction_delete_block BEFORE DELETE ON phase7_reproduction_results BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS phase7_hypothesis_update_block BEFORE UPDATE ON phase7_hypothesis_evidence BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
@@ -130,3 +134,5 @@ CREATE TRIGGER IF NOT EXISTS phase7_review_update_block BEFORE UPDATE ON phase7_
 CREATE TRIGGER IF NOT EXISTS phase7_review_delete_block BEFORE DELETE ON phase7_review_verdicts BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS phase7_playbook_update_block BEFORE UPDATE ON phase7_playbook_candidates BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS phase7_playbook_delete_block BEFORE DELETE ON phase7_playbook_candidates BEGIN SELECT RAISE(ABORT, 'phase7 records are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS phase7_memory_batch_update_block BEFORE UPDATE ON phase7_memory_write_batches BEGIN SELECT RAISE(ABORT, 'phase7 memory batches are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS phase7_memory_batch_delete_block BEFORE DELETE ON phase7_memory_write_batches BEGIN SELECT RAISE(ABORT, 'phase7 memory batches are immutable'); END;

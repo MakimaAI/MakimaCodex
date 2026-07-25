@@ -8,6 +8,7 @@ import { SqlitePhase6IncidentMemoryWriter } from "../application/memory-writer";
 import { IncidentIntelligenceService } from "../application/service";
 import { collectPhase2Failure } from "../ingestion/phase2-failure-collector";
 import { SqliteIncidentRegistry } from "../persistence/sqlite-store";
+import { createDeterministicPhase2ReplayAdapter, LocalReproductionEvidenceStore } from "../reproduction/manifest";
 
 export interface Phase7AcceptanceReport {
   status: "PASS";
@@ -38,9 +39,11 @@ export async function runPhase7AcceptanceDemo(options: { root: string; commitSha
   const operations = new SqliteOperationsStore({ databasePath: operationsPath });
   const memoryStore = new SqliteMemoryStore({ databasePath: memoryPath });
   try {
-    const writer = new SqlitePhase6IncidentMemoryWriter(memoryStore);
-    const service = new IncidentIntelligenceService({ registry, operations, memoryWriter: writer });
     const first = collectPhase2Failure(phase2Envelope("event:phase7-demo-403-one", "2026-07-24T10:00:00.000Z", options.commitSha));
+    const writer = new SqlitePhase6IncidentMemoryWriter(memoryStore);
+    const evidenceStore = new LocalReproductionEvidenceStore();
+    const adapter = createDeterministicPhase2ReplayAdapter({ outcomes: [true, true, true, true, true], expected_signature: first.signatures.normalized_signature, scope: first.observation.scope as { type: "REPOSITORY"; id: string }, evidence_store: evidenceStore });
+    const service = new IncidentIntelligenceService({ registry, operations, memoryWriter: writer, reproductionAdapter: adapter, evidenceResolver: evidenceStore });
     const resolution = await service.runFoundationResolution(first, { at: "2026-07-24T10:10:00.000Z" });
     const incidentId = String(resolution.incident_id);
     const closed = registry.getIncident(incidentId)!;
@@ -141,8 +144,9 @@ function resetIncidentRegistry(path: string): void {
     const tables = [
       "phase7_ingestions", "phase7_audit_events", "phase7_incident_relations", "phase7_incident_observations",
       "phase7_signatures", "phase7_observation_revisions", "phase7_observations", "phase7_incident_revisions", "phase7_incidents",
-      "phase7_triage_records", "phase7_containment_records", "phase7_reproduction_results", "phase7_hypothesis_evidence",
+      "phase7_triage_records", "phase7_containment_records", "phase7_reproduction_manifests", "phase7_reproduction_results", "phase7_hypothesis_evidence",
       "phase7_root_causes", "phase7_remediation_proposals", "phase7_regression_results", "phase7_review_verdicts", "phase7_playbook_candidates",
+      "phase7_memory_write_batches",
     ];
     database.exec("PRAGMA foreign_keys=OFF");
     for (const table of tables) database.exec(`DELETE FROM "${table}"`);
