@@ -7,3 +7,5 @@ export * from "./evolution-policy";
 export * from "./phase1";
 export * from "./phase2";
 export * as phase6 from "./phase6";
+export * as operations from "./operations";
+export * as phase7 from "./phase7";

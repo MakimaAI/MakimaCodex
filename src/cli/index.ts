@@ -610,6 +610,12 @@ switch (command) {
     process.exitCode = await cmdOefPhase6(command, args.slice(1));
     break;
   }
+  case "incident":
+  case "oef-phase7-demo": {
+    const { cmdOefPhase7 } = await import("./oef-phase7");
+    process.exitCode = await cmdOefPhase7(command, args.slice(1));
+    break;
+  }
   case "__subagent-bridge-mcp": {
     const { runSubagentBridgeMcpServer } = await import("../subagent-bridge/mcp");
     await runSubagentBridgeMcpServer();
